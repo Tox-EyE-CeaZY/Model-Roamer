@@ -36,8 +36,10 @@ const DEFS: &[Def] = &[
         "task_kind": {"type": "string", "description": "plan | core | refactor | review | docs | design | frontend | creative | research | backend | api | data | infra | scripts | tests | general"},
         "model": {"type": "string", "description": "Optional model for that agent"},
         "workspace": {"type": "string", "enum": ["worktree", "shared", "scratch"], "description": "worktree (default when the project has a git repo): its own branch and folder; shared: the project folder itself (read-only work, research); scratch: an empty folder"},
-        "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"}
+        "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"},
+        "allow_limited": {"type": "boolean", "description": "Open the thread even though that agent is out of usage right now (it waits for the reset). Default false: you're told who has room instead."}
     }), &["title", "instructions"]) },
+    Def { name: "agent_status", roles: LEAD, desc: "Each agent's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
     Def { name: "send_message", roles: LEAD, desc: "Send a message to a thread (answers, review notes, new instructions). The thread's agent gets a turn to act on it.", schema: || obj(json!({
         "thread_id": {"type": "string"}, "text": {"type": "string"}
     }), &["thread_id", "text"]) },
@@ -102,6 +104,9 @@ const DEFS: &[Def] = &[
     }), &["artifact", "folder"]) },
     Def { name: "post_update", roles: ALL, desc: "Show a short progress line on your thread without ending your turn (e.g. 'Tests pass, writing docs').", schema: || obj(json!({
         "text": {"type": "string"}
+    }), &["text"]) },
+    Def { name: "message_lead", roles: &["worker", "review"], desc: "Write to the project's lead without ending your turn: ask for more work or a decision, report something it should act on (a blocker, a finding, a need for another agent), or ask for help. The lead is woken, can answer you with send_message, and may open more threads. Keep working on what you can meanwhile.", schema: || obj(json!({
+        "text": {"type": "string"}, "kind": {"type": "string", "enum": ["question", "report", "request"]}
     }), &["text"]) },
     Def { name: "set_title", roles: ALL, desc: "Name your chat or thread so the person can find it in a list: lead with the verb of their goal, 3 to 6 words, sentence case, in their words (e.g. 'Fix Safari export button'). Call it after the first exchange and again when the goal changes. Lead: pass thread_id to name a worker's thread.", schema: || obj(json!({
         "title": {"type": "string"}, "thread_id": {"type": "string"}
@@ -180,8 +185,13 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     };
     tracing::info!(thread = %tid, tool = name, "tool call");
     match name {
+        "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
+            let want = a("agent").to_lowercase();
+            if !want.is_empty() && want != "auto" && core.is_limited(&want) && args["allow_limited"] != true {
+                bail!("{want} is out of usage right now, so nothing was opened. Pick another agent or use agent \"auto\", or pass allow_limited to queue it for the reset.\n\n{}", runner::fleet_now(core));
+            }
             let deps: Vec<String> = args["depends_on"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
             let t = runner::create_worker(
                 core,
@@ -217,7 +227,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "list_threads" => {
             let p = need_project()?;
             let filter = a("status");
-            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, merged, task_kind, updated_at FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
             let rows: Vec<Value> = rows
                 .into_iter()
                 .filter(|r| match filter.as_str() {
@@ -249,7 +259,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             let p = need_project()?;
             Ok(runner::overview(core, &p))
         }
-        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind")).map(|(agent, why)| format!("{agent}: {why}")).unwrap_or_else(|| "No agent is available right now.".into())),
+        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind")).map(|(agent, why)| format!("{agent}: {why}\n\n{}", runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
         "reassign_thread" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
@@ -375,6 +385,18 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             core.bus.emit("progress", project.as_deref(), Some(&tid), json!({ "text": a("text") }));
             Ok("Shown.".into())
         }
+        "message_lead" => {
+            let p = need_project()?;
+            let lead = core.lead_thread(&p)?;
+            let text = a("text");
+            if text.trim().is_empty() {
+                bail!("Say what you want the lead to know or do.");
+            }
+            let kind = if a("kind").is_empty() { "report".to_string() } else { a("kind") };
+            let body = runner::wake_tag("worker-message", &caller, &format!("This thread wrote to you ({kind}):\n{}", clip(&text, 4000)));
+            runner::post(core, lead["id"].as_str().unwrap_or(""), "wake", "Model Roamer", &body, json!({ "from_thread": tid }), true)?;
+            Ok("Sent to the lead. Carry on with what you can; its answer arrives as a new message here.".into())
+        }
         "set_title" => {
             let target = if a("thread_id").is_empty() || a("thread_id") == tid {
                 caller.clone()
@@ -499,14 +521,18 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
 
 fn thread_line(t: &Value) -> String {
     format!(
-        "{} · \"{}\" · {} · {}{}{}{}",
+        "{} · \"{}\" · {} · {}{}{}{}{}",
         t["id"].as_str().unwrap_or(""),
         t["title"].as_str().unwrap_or(""),
         t["agent"].as_str().unwrap_or(""),
         t["status"].as_str().unwrap_or(""),
         t["status_note"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" ({s})")).unwrap_or_default(),
         t["branch"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" · branch {s}")).unwrap_or_default(),
-        if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else { "" }
+        if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else { "" },
+        match (t["context"]["used"].as_i64(), t["context"]["window"].as_i64()) {
+            (Some(u), Some(w)) if w > 0 => format!(" · context {}%{}", u * 100 / w, if u * 100 / w >= 80 { " (near compacting)" } else { "" }),
+            _ => String::new(),
+        }
     )
 }
 

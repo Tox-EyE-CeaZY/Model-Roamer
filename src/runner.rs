@@ -82,7 +82,7 @@ pub fn wake_lead(core: &CoreRef, project: &str, body: &str, meta: Value) {
     }
 }
 
-fn wake_tag(reason: &str, t: &Value, body: &str) -> String {
+pub fn wake_tag(reason: &str, t: &Value, body: &str) -> String {
     format!(
         "<wake reason=\"{reason}\" thread=\"{}\" title=\"{}\" agent=\"{}\" status=\"{}\" at=\"{}\">\n{}\n</wake>",
         t["id"].as_str().unwrap_or(""),
@@ -115,6 +115,8 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
         bail!("A thread needs a title and instructions.");
     }
     let kind = if w.task_kind.is_empty() { "general".to_string() } else { w.task_kind.to_lowercase() };
+    let (buddy_agent, buddy_model, buddy) = if w.agent.starts_with("buddy:") { core.pick_agent(&w.agent, &w.model)? } else { (String::new(), String::new(), None) };
+    let w = if buddy.is_some() { NewWorker { agent: buddy_agent, model: buddy_model, ..w } } else { w };
     let agent = if w.agent.is_empty() || w.agent == "auto" {
         route(core, Some(project), &kind).map(|(a, _)| a).ok_or_else(|| anyhow!("No agent is installed, signed in and within its limits. Open Agents to set one up."))?
     } else {
@@ -141,11 +143,14 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 'agent')",
         &[&id, &pid_s, &w.parent, &w.kind, &w.title.trim(), &agent, &model, &status, &kind, &w.instructions, &w.criteria, &ws, &deps, &now],
     )?;
+    if let Some(b) = &buddy {
+        core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
+    }
     let t = core.thread(&id)?;
     core.bus.emit("thread", Some(&pid_s), Some(&id), t.clone());
-    let first = if w.kind == "review" { "Start the review." } else { "Start on your task (it's in your instructions under \"The task\")." };
+    let first = kickoff_text(&w);
     let pending = status == "idle";
-    post(core, &id, "user", "Lead", first, json!({ "kickoff": true }), false)?;
+    post(core, &id, "user", "Lead", &first, json!({ "kickoff": true }), false)?;
     core.db.exec("UPDATE messages SET pending = 1 WHERE thread_id = ?1", &[&id])?;
     if pending {
         schedule(core, &id);
@@ -153,7 +158,32 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     core.thread(&id)
 }
 
+/// The thread's first message: the brief the lead wrote, so the person (and the agent) read the same thing.
+fn kickoff_text(w: &NewWorker) -> String {
+    let mut s = String::new();
+    let ins = w.instructions.trim();
+    if w.kind == "review" {
+        s.push_str("Start the review.");
+        if !ins.is_empty() {
+            s.push_str("\n\n");
+            s.push_str(ins);
+        }
+    } else if ins.is_empty() {
+        s.push_str("Start on your task.");
+    } else {
+        s.push_str(ins);
+    }
+    let crit = w.criteria.trim();
+    if !crit.is_empty() {
+        s.push_str("\n\n**Done when:**\n");
+        s.push_str(crit);
+    }
+    s
+}
+
 pub fn create_chat(core: &CoreRef, agent: &str, model: &str, title: &str, folder: &str) -> Result<Value> {
+    let (agent, model, buddy) = core.pick_agent(agent, model)?;
+    let (agent, model) = (agent.as_str(), model.as_str());
     if core.adapter(agent).is_none() {
         bail!("Unknown agent {agent}");
     }
@@ -166,6 +196,9 @@ pub fn create_chat(core: &CoreRef, agent: &str, model: &str, title: &str, folder
         "INSERT INTO threads(id, project_id, kind, title, agent, model, status, workspace, created_at, updated_at) VALUES (?1, NULL, 'chat', ?2, ?3, ?4, 'idle', ?5, ?6, ?6)",
         &[&id, &title, &agent, &model, &ws, &now],
     )?;
+    if let Some(b) = &buddy {
+        core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
+    }
     let t = core.thread(&id)?;
     core.bus.emit("thread", None, Some(&id), t.clone());
     Ok(t)
@@ -210,6 +243,40 @@ pub fn route(core: &CoreRef, project: Option<&str>, kind: &str) -> Option<(Strin
         }
     }
     None
+}
+
+/// Every agent's state right now, for the lead: ready, out of usage (and until when), signed out, how much of its
+/// 5-hour and weekly allowance is used, and how busy it is.
+pub fn fleet_now(core: &CoreRef) -> String {
+    let pct = |w: &Value| w["used"].as_f64().map(|u| format!("{}%", (u * 100.0).round()));
+    let quotas = core.quotas();
+    let mut out = vec![];
+    for st in core.cached_status() {
+        let id = st["id"].as_str().unwrap_or("");
+        if st["config"]["enabled"] == false {
+            continue;
+        }
+        let state = if st["installed"] == false {
+            "not installed".to_string()
+        } else if st["auth"]["signed_in"] == "no" {
+            "not signed in".to_string()
+        } else if core.is_limited(id) {
+            let lim = core.limit_of(id);
+            format!("OUT OF USAGE ({}){}", window_name(lim["window"].as_str().unwrap_or("")).trim_start_matches("its "), reset_label(lim["until"].as_i64()).map(|w| format!(", resets around {w}")).unwrap_or_default())
+        } else {
+            "ready".to_string()
+        };
+        let q = quotas.iter().find(|q| q["id"] == id);
+        let used = q.map(|q| match (pct(&q["five_hour"]), pct(&q["weekly"])) {
+            (Some(a), Some(b)) => format!(" · 5-hour {a} used, weekly {b} used"),
+            (Some(a), None) => format!(" · 5-hour {a} used"),
+            _ => String::new(),
+        });
+        let busy = core.db.scalar_i64("SELECT COUNT(*) FROM threads WHERE agent = ?1 AND status IN ('working','queued')", &[&id]).unwrap_or(0);
+        let max = core.agent_cfg(id)["max_parallel"].as_i64().unwrap_or(2);
+        out.push(format!("- {id}: {state}{} · {busy} of {max} running", used.unwrap_or_default()));
+    }
+    if out.is_empty() { "No agents are set up.".into() } else { out.join("\n") }
 }
 
 /// "the 5-hour limit", "the weekly limit", "its usage limit"
@@ -523,6 +590,48 @@ fn format_inputs(msgs: &[Value]) -> String {
     out.trim().to_string()
 }
 
+/// Keep how full the agent's context is, and when it last compacted, on the thread (shown beside it).
+fn record_context(core: &CoreRef, thread: &str, agent: &str, session: Option<&str>, fresh: bool, seen: Option<(i64, i64)>, compacted: &[(String, i64)]) {
+    let Ok(t) = core.thread(thread) else { return };
+    let mut c = if fresh || !t["context"].is_object() { json!({}) } else { t["context"].clone() };
+    let mut compactions = c["compactions"].as_i64().unwrap_or(0);
+    let now = util::now_ms();
+    if let Some((used, window)) = seen {
+        c["used"] = json!(used);
+        if window > 0 {
+            c["window"] = json!(window);
+        }
+    }
+    if agent == "codex" {
+        if let Some(x) = session.and_then(crate::quota::codex_context) {
+            c["used"] = x["used"].clone();
+            c["window"] = x["window"].clone();
+            let total = x["compactions"].as_i64().unwrap_or(0);
+            if total > compactions {
+                c["compacted_at"] = json!(now);
+                c["trigger"] = json!("auto");
+            }
+            compactions = compactions.max(total);
+        }
+    }
+    if let Some((trigger, before)) = compacted.last() {
+        compactions += compacted.len() as i64;
+        c["compacted_at"] = json!(now);
+        c["trigger"] = json!(trigger);
+        c["before"] = json!(before);
+    }
+    c["compactions"] = json!(compactions);
+    c["agent"] = json!(agent);
+    c["at"] = json!(now);
+    if c["used"].as_i64().unwrap_or(0) == 0 && c["window"].is_null() {
+        return; // this agent doesn't say
+    }
+    let _ = core.db.exec("UPDATE threads SET context = ?1 WHERE id = ?2", &[&c.to_string(), &thread]);
+    if let Ok(t) = core.thread(thread) {
+        core.bus.emit("thread", t["project_id"].as_str(), Some(thread), t.clone());
+    }
+}
+
 /// The conversation so far, for an agent that starts fresh on an old thread (reassigned, or its session was lost).
 fn recap(core: &CoreRef, thread: &str, exclude: &[String]) -> String {
     let rows = core
@@ -723,6 +832,8 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     let mut usage = (0i64, 0i64, 0i64, 0f64);
     let mut limit: Option<(Option<i64>, String)> = None;
     let mut new_session: Option<String> = None;
+    let mut ctx_seen: Option<(i64, i64)> = None; // (used, window) as the agent reported it
+    let mut compacted: Vec<(String, i64)> = vec![];
     let mut exit: Option<i32> = None;
     let mut cancelled = false;
     let mut timed_out = None;
@@ -793,6 +904,14 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                         }
                         AgentEvent::Raw(r) => raw.push(r),
                         AgentEvent::Quota(q) => core.set_quota(&agent, &q),
+                        AgentEvent::Context { used, window } => {
+                            let w = if window > 0 { window } else { ctx_seen.map(|c| c.1).unwrap_or(0) };
+                            ctx_seen = Some((if used > 0 { used } else { ctx_seen.map(|c| c.0).unwrap_or(0) }, w));
+                        }
+                        AgentEvent::Compacted { trigger, before } => {
+                            add_activity(core, &t, &turn_id, "info", "Compacted", &format!("The conversation was compacted to make room ({trigger}{}).", if before > 0 { format!(", {before} tokens before") } else { String::new() }));
+                            compacted.push((trigger, before));
+                        }
                     }
                 }
             }
@@ -878,6 +997,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     if let Some(sid) = &new_session {
         core.set_thread(thread, &json!({ "session_id": sid, "session_agent": agent }))?;
     }
+    record_context(core, thread, &agent, new_session.as_deref().or(session.as_deref()), session.is_none(), ctx_seen, &compacted);
     {
         // the usage this turn spent, read fresh for the status bar
         let (c2, a2) = (core.clone(), agent.clone());
@@ -921,7 +1041,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                         Some(a) => format!("It was moved to {a} automatically."),
                         None => "The person was asked whether to move it to another agent or wait for the reset; it is paused until they answer or the limit resets. Reassign it yourself only if they ask.".into(),
                     };
-                    wake_lead(core, p, &wake_tag("agent-limit", &t2, &format!("{} is out of usage. {what}", adapter.info().name)), json!({ "thread": thread }));
+                    wake_lead(core, p, &wake_tag("agent-limit", &t2, &format!("{} is out of usage. {what} Plan around it: don't route new work to {} until it resets.\n\nAgents right now:\n{}", adapter.info().name, adapter.info().name, fleet_now(core))), json!({ "thread": thread }));
                 }
             }
             if moved.is_some() {
@@ -991,7 +1111,9 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                 None => ("idle".to_string(), String::new()),
             };
             core.set_status(thread, &st_new, &note_new)?;
-            if is_worker && !clean.trim().is_empty() {
+            // buddies: the other half of the pair takes over, unless this turn said it is finished
+            let handed = if !clean.trim().is_empty() && !matches!(st_new.as_str(), "done" | "blocked") { buddy_handoff(core, thread, &clean)? } else { false };
+            if is_worker && !clean.trim().is_empty() && !handed {
                 if let Some(p) = &pid {
                     let t2 = core.thread(thread)?;
                     wake_lead(core, p, &wake_tag(if t["kind"] == "review" { "review-done" } else { "thread-reply" }, &t2, &clean), json!({ "thread": thread }));
@@ -999,6 +1121,66 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// Marker an agent ends its reply with when the pair's work is complete.
+pub const BUDDY_DONE: &str = "[[done]]";
+
+/// After a buddy thread's turn: pass the reply to the other agent and let it take its turn, or stop when the work is
+/// done or the turns are used up. True when the other agent was handed the thread.
+fn buddy_handoff(core: &CoreRef, thread: &str, reply: &str) -> Result<bool> {
+    let t = core.thread(thread)?;
+    let mut b = t["buddy"].clone();
+    if !b.is_object() {
+        return Ok(false);
+    }
+    let Some(def) = core.buddy_def(b["id"].as_str().unwrap_or("")) else {
+        note(core, thread, "This buddy pair was removed from settings, so it carries on as one agent.");
+        core.db.exec("UPDATE threads SET buddy = NULL WHERE id = ?1", &[&thread])?;
+        return Ok(false);
+    };
+    let side = if b["side"] == "b" { "b" } else { "a" };
+    let other = if side == "a" { "b" } else { "a" };
+    // keep this side's CLI session, so it picks up where it left off when it's its turn again
+    b["sessions"][side] = json!({ "id": t["session_id"], "agent": t["session_agent"] });
+    let turns = b["turns"].as_i64().unwrap_or(0) + 1;
+    b["turns"] = json!(turns);
+    let max = def["max_turns"].as_i64().unwrap_or(4).clamp(2, 20);
+    let finished = reply.to_lowercase().contains(BUDDY_DONE);
+    if finished || turns >= max {
+        core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &thread])?;
+        note(core, thread, &if finished { format!("{} says the work is done. The pair stops here.", def["name"].as_str().unwrap_or("The pair")) } else { format!("The pair used its {max} turns, so it stops here. Write to it to go another round.") });
+        core.bus.emit("thread", t["project_id"].as_str(), Some(thread), core.thread(thread)?);
+        return Ok(false);
+    }
+    let od = &def[other];
+    let o_agent = od["agent"].as_str().unwrap_or("").to_string();
+    let o_model = od["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).unwrap_or_else(|| core.agent_cfg(&o_agent)["model"].as_str().unwrap_or("").to_string());
+    let (sid, sag) = (b["sessions"][other]["id"].as_str().unwrap_or("").to_string(), b["sessions"][other]["agent"].as_str().unwrap_or("").to_string());
+    b["side"] = json!(other);
+    core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &thread])?;
+    core.set_thread(thread, &json!({ "agent": o_agent, "model": o_model, "session_id": sid, "session_agent": sag }))?;
+    let name = |a: &str| core.adapter(a).map(|x| x.info().name).unwrap_or_else(|| a.to_string());
+    let from = name(def[side]["agent"].as_str().unwrap_or(""));
+    let body = format!(
+        "{from} finished their turn (turn {turns} of {max}). What they said:\n\n{}\n\n---\nYour turn, {}. {}",
+        clip(reply.replace(BUDDY_DONE, "").trim(), 8000),
+        name(&o_agent),
+        od["role"].as_str().unwrap_or("")
+    );
+    post(core, thread, "user", &format!("Buddy · {from}"), &body, json!({ "buddy": true, "from": side }), true)?;
+    Ok(true)
+}
+
+/// A person wrote to a buddy thread: the pair gets its full turns again.
+pub fn buddy_reset(core: &CoreRef, thread: &str) {
+    if let Ok(t) = core.thread(thread) {
+        if t["buddy"].is_object() {
+            let mut b = t["buddy"].clone();
+            b["turns"] = json!(0);
+            let _ = core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &thread]);
         }
     }
 }
@@ -1022,7 +1204,11 @@ pub async fn cancel(core: &CoreRef, thread: &str, status: &str, reason: &str) {
     if let Some(tx) = tx {
         let _ = tx.send(true);
     }
-    let verb = if status == "paused" { "Paused" } else { "Stopped" };
+    let verb = match status {
+        "paused" => "Paused",
+        "idle" => "Interrupted",
+        _ => "Stopped",
+    };
     note(core, thread, &if reason.is_empty() { format!("{verb}.") } else { format!("{verb}: {reason}") });
 }
 
@@ -1292,7 +1478,7 @@ pub fn recover(core: &CoreRef) {
 pub async fn watch_limits(core: CoreRef) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
-        let limited = core.db.all("SELECT id, agent FROM threads WHERE status = 'limited' AND deleted_at IS NULL", &[]).unwrap_or_default();
+        let limited = core.db.all("SELECT id, agent, project_id FROM threads WHERE status = 'limited' AND deleted_at IS NULL", &[]).unwrap_or_default();
         for t in limited {
             let agent = t["agent"].as_str().unwrap_or("");
             if !core.is_limited(agent) {
@@ -1307,6 +1493,11 @@ pub async fn watch_limits(core: CoreRef) {
                 }
                 let _ = core.set_status(id, "idle", "");
                 note(&core, id, &format!("{agent}'s usage limit has reset. Picking up again."));
+                if let (Some(pid), Ok(th)) = (t["project_id"].as_str(), core.thread(id)) {
+                    if th["kind"] != "lead" {
+                        wake_lead(&core, pid, &wake_tag("agent-available", &th, &format!("{agent}'s usage limit has reset; this thread is picking up again.")), json!({}));
+                    }
+                }
                 schedule(&core, id);
             }
         }

@@ -326,9 +326,21 @@ export async function palette(initial = '') {
     if (q.trim().length >= 2) {
       try {
         const r = await get('search?q=' + encodeURIComponent(q));
+        // where a thread opens: a chat on its own, anything in a project beside that project's chat
+        const open = (t, msg) => {
+          try {
+            if (msg) sessionStorage.setItem('mr-jump', msg + '|' + Date.now());
+          } catch { /* fine */ }
+          if (t.kind === 'chat' || !t.project_id) return go('#/t/' + (t.id || t.thread_id));
+          go('#/p/' + t.project_id + (t.kind === 'lead' ? '' : '?t=' + (t.id || t.thread_id)));
+        };
+        const clean = (x) => (x || '').replace(/\s+/g, ' ').trim();
+        const where = (t) => (t.kind === 'chat' ? 'chat' : projectOf(t.project_id)?.name || 'thread') + (t.kind === 'lead' ? ' · project chat' : '');
         found = [
-          ...r.threads.map((t) => ({ label: t.title, sub: t.kind === 'chat' ? 'chat' : projectOf(t.project_id)?.name || 'thread', icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => openThread(t.id) })),
-          ...r.messages.slice(0, 8).map((m) => ({ label: m.snippet.replace(/\s+/g, ' ').trim(), sub: m.title, icon: 'hash', run: () => openThread(m.thread_id) })),
+          ...r.projects.map((p) => ({ label: p.name, sub: clean(p.snippet) || 'project', icon: 'board', run: () => go('#/p/' + p.id) })),
+          ...r.threads.map((t) => ({ label: t.title, sub: clean(t.snippet) || where(t), icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => open(t) })),
+          ...r.messages.slice(0, 12).map((m) => ({ label: clean(m.snippet), sub: `${m.role === 'agent' ? 'agent' : m.author || 'you'} · ${where(m)}`, icon: 'hash', run: () => open(m, m.id) })),
+          ...r.artifacts.map((a) => ({ label: a.title, sub: clean(a.description) || a.kind + (projectOf(a.project_id) ? ' · ' + projectOf(a.project_id).name : ''), icon: 'artifact', run: () => go('#/a/' + a.id) })),
           ...r.memory.slice(0, 6).map((m) => ({ label: m.name, sub: m.description || 'memory', icon: 'memory', run: () => go('#/memory?open=' + m.id) })),
         ];
       } catch { /* offline: actions still work */ }

@@ -110,6 +110,10 @@ impl AgentAdapter for Claude {
         let mut out = vec![];
         match v["type"].as_str().unwrap_or("") {
             "system" => {
+                if v["subtype"] == "compact_boundary" {
+                    let m = &v["compact_metadata"];
+                    out.push(AgentEvent::Compacted { trigger: s(&m["trigger"]), before: m["pre_tokens"].as_i64().unwrap_or(0) });
+                }
                 if let Some(id) = v["session_id"].as_str() {
                     if st["sid"].as_str() != Some(id) {
                         st["sid"] = json!(id);
@@ -126,6 +130,13 @@ impl AgentAdapter for Claude {
             "assistant" => {
                 if !v["parent_tool_use_id"].is_null() {
                     return out; // a subagent's inner messages: the tool result says what came of them
+                }
+                // what this request sent is what the context holds now
+                let u = &v["message"]["usage"];
+                let used = u["input_tokens"].as_i64().unwrap_or(0) + u["cache_read_input_tokens"].as_i64().unwrap_or(0) + u["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                if used > 0 {
+                    st["ctx"] = json!(used);
+                    out.push(AgentEvent::Context { used, window: st["window"].as_i64().unwrap_or(0) });
                 }
                 for c in v["message"]["content"].as_array().cloned().unwrap_or_default() {
                     match c["type"].as_str().unwrap_or("") {
@@ -188,6 +199,10 @@ impl AgentAdapter for Claude {
                 }
             }
             "result" => {
+                // the model's window, from the per-model totals
+                if let Some(w) = v["modelUsage"].as_object().and_then(|m| m.values().filter_map(|x| x["contextWindow"].as_i64()).max()) {
+                    out.push(AgentEvent::Context { used: st["ctx"].as_i64().unwrap_or(0), window: w });
+                }
                 let u = &v["usage"];
                 out.push(AgentEvent::Usage {
                     input: u["input_tokens"].as_i64().unwrap_or(0) + u["cache_creation_input_tokens"].as_i64().unwrap_or(0),

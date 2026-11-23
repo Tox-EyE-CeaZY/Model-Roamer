@@ -56,6 +56,8 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/threads/{id}/diff", get(thread_diff))
         .route("/api/threads/{id}/merge", post(thread_merge))
         .route("/api/threads/{id}/pr", post(thread_pr))
+        .route("/api/messages/{id}", axum::routing::patch(patch_message).delete(delete_message))
+        .route("/api/messages/{id}/now", post(message_now))
         .route("/api/decisions/{id}", post(answer_decision))
         .route("/api/search", get(search))
         // memory
@@ -605,7 +607,14 @@ async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(
         }
     }
     // another agent (a chat's picker): its CLI can't resume the old one's session, so the next turn starts fresh
-    if let Some(a) = b["agent"].as_str().filter(|a| !a.is_empty() && Some(*a) != t["agent"].as_str()) {
+    if let Some(a0) = b["agent"].as_str().filter(|a| !a.is_empty() && (a.starts_with("buddy:") || Some(*a) != t["agent"].as_str() || t["buddy"].is_object())) {
+        // a buddy pair (two agents taking turns) or a single agent
+        let (a_s, m_s, pair) = core.pick_agent(a0, b["model"].as_str().unwrap_or("")).map_err(|e| bad(e.to_string()))?;
+        let a = a_s.as_str();
+        core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&pair.as_ref().map(|p| p.to_string()), &id])?;
+        if pair.is_some() {
+            f.insert("model".into(), json!(m_s));
+        }
         if core.adapter(a).is_none() {
             return Err(bad(format!("There's no agent called {a}.")));
         }
@@ -677,6 +686,7 @@ async fn send_message(State(core): State<CoreRef>, Path(id): Path<String>, Exten
         Who::Local => "You".to_string(),
         Who::Device(d) => core.db.one("SELECT name FROM devices WHERE id = ?1", &[d]).ok().flatten().and_then(|r| r["name"].as_str().map(|n| format!("You ({n})"))).unwrap_or_else(|| "You".into()),
     };
+    runner::buddy_reset(&core, &id);
     let m = runner::post(&core, &id, "user", &author, &text, json!({ "files": b["files"] }), true)?;
     // the person spoke to a worker directly: the lead should know
     if matches!(t["kind"].as_str(), Some("worker" | "review")) {
@@ -688,6 +698,51 @@ async fn send_message(State(core): State<CoreRef>, Path(id): Path<String>, Exten
         }
     }
     Ok(Json(m))
+}
+
+/// A message the person wrote that the agent hasn't read yet: only those can still be changed or taken back.
+fn waiting_message(core: &CoreRef, id: &str) -> Result<Value, server::ApiErr> {
+    let m = core.db.one("SELECT * FROM messages WHERE id = ?1", &[&id]).ok().flatten().ok_or_else(|| bad("That message isn't there."))?;
+    if m["pending"] != 1 || m["role"] != "user" || m["meta"]["kickoff"] == true {
+        return Err(bad("The agent has already read that message."));
+    }
+    Ok(m)
+}
+
+async fn patch_message(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
+    let m = waiting_message(&core, &id)?;
+    let text = s(&b, "text");
+    if text.is_empty() {
+        return Err(bad("A message can't be empty. Delete it instead."));
+    }
+    // the agent may pick it up between the check and the write: only change it while it's still waiting
+    if core.db.exec("UPDATE messages SET body = ?1 WHERE id = ?2 AND pending = 1", &[&text, &id])? == 0 {
+        return Err(bad("The agent has already read that message."));
+    }
+    let m = core.db.one("SELECT * FROM messages WHERE id = ?1", &[&id])?.unwrap_or(m);
+    let t = core.thread(m["thread_id"].as_str().unwrap_or(""))?;
+    core.bus.emit("message", t["project_id"].as_str(), t["id"].as_str(), m.clone());
+    Ok(Json(m))
+}
+
+async fn delete_message(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let m = waiting_message(&core, &id)?;
+    if core.db.exec("DELETE FROM messages WHERE id = ?1 AND pending = 1", &[&id])? == 0 {
+        return Err(bad("The agent has already read that message."));
+    }
+    let tid = m["thread_id"].as_str().unwrap_or("").to_string();
+    let t = core.thread(&tid)?;
+    core.bus.emit("message", t["project_id"].as_str(), Some(&tid), json!({ "id": id, "deleted": true }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// "Send now": stop what the agent is doing so it reads this message right away (it keeps its session and carries on
+/// from there). Agents can't take a message in the middle of a turn, so this is the closest there is.
+async fn message_now(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let m = waiting_message(&core, &id)?;
+    let tid = m["thread_id"].as_str().unwrap_or("").to_string();
+    runner::cancel(&core, &tid, "idle", "so it can read your message").await;
+    Ok(Json(core.thread(&tid)?))
 }
 
 async fn thread_activity(State(core): State<CoreRef>, Path(id): Path<String>, q: Q) -> R {
@@ -767,17 +822,28 @@ async fn answer_decision(State(core): State<CoreRef>, Path(id): Path<String>, Js
 async fn search(State(core): State<CoreRef>, q: Q) -> R {
     let text = q.get("q").cloned().unwrap_or_default();
     if text.trim().len() < 2 {
-        return Ok(Json(json!({ "threads": [], "messages": [], "memory": [] })));
+        return Ok(Json(json!({ "threads": [], "messages": [], "memory": [], "projects": [], "artifacts": [] })));
     }
     let like = format!("%{}%", text.trim());
-    let threads = core.db.all("SELECT id, title, agent, status, project_id, kind FROM threads WHERE deleted_at IS NULL AND title LIKE ?1 ORDER BY updated_at DESC LIMIT 20", &[&like])?;
-    let messages = core.db.all(
-        "SELECT m.id, m.thread_id, m.author, substr(m.body, max(1, instr(lower(m.body), lower(?2)) - 60), 200) AS snippet, m.created_at, t.title, t.project_id FROM messages m JOIN threads t ON t.id = m.thread_id
-         WHERE t.deleted_at IS NULL AND m.body LIKE ?1 ORDER BY m.created_at DESC LIMIT 30",
+    let snip = |col: &str| format!("substr({col}, max(1, instr(lower({col}), lower(?2)) - 60), 200)");
+    // a thread matches by its title or by the brief it was given
+    let threads = core.db.all(
+        &format!("SELECT id, title, agent, status, project_id, kind, CASE WHEN title LIKE ?1 THEN '' ELSE {} END AS snippet FROM threads WHERE deleted_at IS NULL AND (title LIKE ?1 OR instructions LIKE ?1 OR criteria LIKE ?1) ORDER BY (title LIKE ?1) DESC, updated_at DESC LIMIT 20", snip("instructions")),
         &[&like, &text.trim()],
     )?;
+    // messages in chats, the project chat and every thread of a project
+    let messages = core.db.all(
+        &format!("SELECT m.id, m.thread_id, m.author, m.role, {} AS snippet, m.created_at, t.title, t.project_id, t.kind FROM messages m JOIN threads t ON t.id = m.thread_id
+         WHERE t.deleted_at IS NULL AND m.role != 'wake' AND m.body LIKE ?1 ORDER BY m.created_at DESC LIMIT 40", snip("m.body")),
+        &[&like, &text.trim()],
+    )?;
+    let projects = core.db.all(
+        &format!("SELECT id, name, CASE WHEN name LIKE ?1 THEN '' ELSE {} END AS snippet FROM projects WHERE deleted_at IS NULL AND (name LIKE ?1 OR instructions LIKE ?1 OR folder LIKE ?1 OR repo_url LIKE ?1) ORDER BY updated_at DESC LIMIT 8", snip("instructions")),
+        &[&like, &text.trim()],
+    )?;
+    let artifacts = core.db.all("SELECT id, title, kind, project_id, description FROM artifacts WHERE deleted_at IS NULL AND (title LIKE ?1 OR description LIKE ?1) ORDER BY updated_at DESC LIMIT 10", &[&like])?;
     let mem = memory::search(&core, q.get("project").map(String::as_str), &text).unwrap_or_default();
-    Ok(Json(json!({ "threads": threads, "messages": messages, "memory": mem })))
+    Ok(Json(json!({ "threads": threads, "messages": messages, "memory": mem, "projects": projects, "artifacts": artifacts })))
 }
 
 // ------------------------------------------------------------------------------------------------ memory

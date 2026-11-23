@@ -134,7 +134,7 @@ impl Core {
         }
         config::merge(&mut stored, &patch);
         // lists replace rather than merge
-        for k in ["custom_agents", "lead_fallback"] {
+        for k in ["custom_agents", "lead_fallback", "buddies"] {
             if let Some(v) = patch.get(k) {
                 stored[k] = v.clone();
             }
@@ -159,6 +159,28 @@ impl Core {
         let mut base = json!({ "enabled": true, "model": "", "effort": "", "autonomy": "full", "max_parallel": 2, "path": "", "extra_args": [] });
         config::merge(&mut base, &s["agents"][id]);
         base
+    }
+
+    /// A buddy pair's definition (settings), by id.
+    pub fn buddy_def(&self, id: &str) -> Option<Value> {
+        self.settings()["buddies"].as_array()?.iter().find(|b| b["id"] == id).cloned()
+    }
+
+    /// An agent choice that may name a buddy pair (`buddy:<id>`): the real agent and model to start with, and the
+    /// pair's state to keep on the thread. A plain agent comes back as it is.
+    pub fn pick_agent(&self, agent: &str, model: &str) -> Result<(String, String, Option<Value>)> {
+        let Some(id) = agent.strip_prefix("buddy:") else { return Ok((agent.to_string(), model.to_string(), None)) };
+        let def = self.buddy_def(id).ok_or_else(|| anyhow!("There's no buddy pair called {id}."))?;
+        for side in ["a", "b"] {
+            let a = def[side]["agent"].as_str().unwrap_or("");
+            if self.adapter(a).is_none() {
+                return Err(anyhow!("The buddy pair {} uses {a}, which isn't an agent here.", def["name"].as_str().unwrap_or(id)));
+            }
+        }
+        let side = if def["start"] == "b" { "b" } else { "a" };
+        let a = def[side]["agent"].as_str().unwrap_or("").to_string();
+        let m = def[side]["model"].as_str().filter(|m| !m.is_empty()).map(str::to_string).unwrap_or_else(|| self.agent_cfg(&a)["model"].as_str().unwrap_or("").to_string());
+        Ok((a, m, Some(json!({ "id": id, "name": def["name"], "side": side, "turns": 0, "sessions": {} }))))
     }
 
     // ------------------------------------------------------------------ agents

@@ -18,6 +18,14 @@ export default async function threadView(el, r, ctx) {
 
 const TOOL_ICONS = { shell: 'terminal', 'edit files': 'edit', 'web search': 'globe' };
 
+const COMPACT_AT = 90;
+/** The thread's context fill: {used, window, pct, compactions, ...}, or null when its agent doesn't report it. */
+export function ctxOf(t) {
+  const c = t?.context;
+  if (!c || typeof c !== 'object' || c.agent !== t.agent || !c.window) return null;
+  return { ...c, pct: Math.min(999, Math.round((c.used / c.window) * 100)) };
+}
+
 export async function mountThread(el, id, { full, compact, ctx } = {}) {
   let t;
   try {
@@ -84,7 +92,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         p ? h('a', { href: '#/p/' + p.id, style: { '--ph': p.color } }, h('i', { class: 'sw' }), p.name) : h('a', { href: '#/chats' }, 'Chats'),
         h('span', {}, '/'),
         h('span', {}, t.kind === 'lead' ? 'project chat' : t.kind === 'review' ? 'review' : t.kind === 'chat' ? 'chat' : 'thread')),
-      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t)),
+      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t), buddyChip(), ctxChip()),
       t.status_note ? h('div', { class: 'th-note' }, ic(t.status === 'blocked' || t.status === 'failed' ? 'warn' : 'info', 14), h('span', {}, t.status_note)) : null,
       h('div', { class: 'th-acts' },
         running
@@ -101,6 +109,21 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         h('span', { class: 'grow' }),
         !isPop ? h('button', { class: 'ibtn', title: 'Pop out into its own window (Ctrl+Shift+O)', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 16) }) : null,
         h('button', { class: 'ibtn', title: 'More', onclick: (e) => moreMenu(e.currentTarget), html: icon('more', 16) })));
+  }
+
+  /** Buddy threads: which pair, whose turn it is, and how many turns it has used. */
+  function buddyChip() {
+    const b = t.buddy;
+    if (!b || typeof b !== 'object') return null;
+    const def = (S.settings.buddies || []).find((x) => x.id === b.id);
+    const max = def?.max_turns || 4;
+    return h('span', { class: 'ctx-chip buddy', title: `${b.name || 'Buddies'}: two agents taking turns. Turn ${b.turns || 0} of ${max}.` }, '⇄ ' + (b.name || 'Buddies'), h('small', {}, ` ${b.turns || 0}/${max}`));
+  }
+
+  function ctxChip() {
+    const c = ctxOf(t);
+    if (!c || c.pct < 60) return null;
+    return h('span', { class: 'ctx-chip' + (c.pct >= 85 ? ' hot' : ''), title: `${num(c.used)} of ${num(c.window)} tokens in use. It compacts its conversation on its own around ${COMPACT_AT}%.` }, 'Context ' + c.pct + '%');
   }
 
   async function rename() {
@@ -259,12 +282,25 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       deps.length ? h('section', {}, kicker('Waits for'), deps.map((d) => h('button', { class: 'linkbtn', onclick: () => openThread(d) }, ic('thread', 13), d))) : null,
       t.children?.length ? h('section', {}, kicker('Threads from here'), t.children.map((c) => h('button', { class: 'mini', onclick: () => openThread(c.id) }, h('span', {}, c.title), stamp(c.agent, { small: true }), statusChip(c.status)))) : null,
       t.artifacts?.length ? h('section', {}, kicker('Artifacts'), t.artifacts.map((a) => h('a', { class: 'mini', href: '#/a/' + a.id }, ic('artifact', 13), h('span', {}, a.title), h('small', { class: 'faint' }, a.kind)))) : null,
+      contextSection(),
       h('section', {}, kicker('Usage'),
         h('dl', { class: 'facts' },
           h('dt', {}, 'Turns'), h('dd', {}, u.turns || 0),
           h('dt', {}, 'Tokens'), h('dd', {}, num(u.input || 0) + ' in · ' + num(u.output || 0) + ' out'),
           u.cost ? [h('dt', {}, 'Cost'), h('dd', {}, '$' + Number(u.cost).toFixed(2))] : null)),
     );
+  }
+
+  /** How full the agent's context is, how near it is to compacting, and when it last did. */
+  function contextSection() {
+    const c = ctxOf(t);
+    if (!c) return h('section', {}, kicker('Context'), h('p', { class: 'faint small' }, t.agent === 'antigravity' ? 'Antigravity doesn’t report this.' : 'Shown after the agent’s first reply.'));
+    return h('section', {}, kicker('Context', h('b', { class: 'ctx-pct' + (c.pct >= 85 ? ' hot' : c.pct >= 65 ? ' warm' : '') }, c.pct + '%')),
+      h('div', { class: 'ctx-bar', title: `Compacts on its own around ${COMPACT_AT}%` }, h('i', { style: { width: Math.min(100, c.pct) + '%' } }), h('em', { style: { left: COMPACT_AT + '%' } })),
+      h('dl', { class: 'facts' },
+        h('dt', {}, 'In use'), h('dd', {}, c.window ? `${num(c.used)} of ${num(c.window)} tokens` : num(c.used) + ' tokens'),
+        h('dt', {}, 'Compacts'), h('dd', {}, c.pct >= COMPACT_AT ? 'about to' : `around ${COMPACT_AT}% (~${num(Math.round(c.window * COMPACT_AT / 100))})`),
+        c.compactions ? [h('dt', {}, 'Compacted'), h('dd', {}, `${c.compactions}×` + (c.compacted_at ? `, last ${ago(c.compacted_at)}` + (c.trigger ? ` (${c.trigger})` : '') : ''))] : null));
   }
 
   async function changeFolder(to) {
@@ -369,13 +405,15 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const isAgent = m.role === 'agent';
     const who = isAgent ? meta.agent || t.agent : null;
     const fromLead = !isAgent && /^Lead/.test(m.author);
+    const fromBuddy = !isAgent && meta.buddy;
     const files = (meta.files || []).filter(Boolean);
-    const e = h('article', { class: 'msg ' + (isAgent ? 'agent' : fromLead ? 'lead-msg' : 'you') + (m.pending ? ' pending' : ''), dataset: { id: m.id }, style: isAgent ? { '--ah': agentHue(who) } : null },
+    const e = h('article', { class: 'msg ' + (isAgent ? 'agent' : fromLead ? 'lead-msg' : fromBuddy ? 'lead-msg buddy-msg' : 'you') + (m.pending ? ' pending' : ''), dataset: { id: m.id }, style: isAgent ? { '--ah': agentHue(who) } : null },
       h('header', {},
         isAgent ? stamp(who, { model: meta.model, small: true }) : h('b', { class: 'who' }, m.author || 'You'),
         meta.kickoff ? h('span', { class: 'tag' }, 'kickoff') : null,
         meta.from_thread ? h('button', { class: 'tag link', onclick: () => openThread(meta.from_thread) }, 'from the lead') : null,
         m.pending ? h('span', { class: 'tag' }, 'not read yet') : null,
+        m.pending && !isAgent && !meta.kickoff ? pendingActions(m) : null,
         h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
         h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
       acts?.length ? timeline(acts, steps) : null,
@@ -384,9 +422,25 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     return e;
   }
 
+  /** What you can do with a message the agent hasn't read yet: change it, take it back, or have it read right now. */
+  function pendingActions(m) {
+    const fail = (e) => toast(e.message, { err: true });
+    return h('span', { class: 'msg-pend' },
+      t.running ? h('button', { class: 'btn xs', title: 'Stop what the agent is doing so it reads this now; it carries on from there', onclick: () => post(`messages/${m.id}/now`).catch(fail) }, ic('bolt', 11), 'Send now') : null,
+      h('button', { class: 'ibtn xs', title: 'Edit before it’s read', onclick: async () => {
+        const ta = textarea(m.body);
+        if (!(await dialog({ title: 'Edit message', body: field('Message', ta), ok: 'Save' }))) return;
+        if (ta.value.trim()) patch('messages/' + m.id, { text: ta.value.trim() }).catch(fail);
+      }, html: icon('edit', 12) }),
+      h('button', { class: 'ibtn xs', title: 'Take it back', onclick: () => del('messages/' + m.id).catch(fail), html: icon('trash', 12) }));
+  }
+
   function wakeLabel(reason, m) {
     const map = {
       'worker-replied': 'A worker reported back',
+      'worker-message': 'A thread wrote to you',
+      'agent-limit': 'An agent ran out of usage',
+      'agent-available': 'An agent is available again',
       'worker-finished': 'A worker finished',
       'person-opened-thread': 'You opened a thread',
       'person-messaged-thread': 'You wrote to a worker',
@@ -609,6 +663,11 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
           drawLive();
           break;
         }
+        if (d.deleted) {
+          messages = messages.filter((x) => x.id !== d.id);
+          drawLog();
+          break;
+        }
         if (!messages.some((x) => x.id === d.id)) messages.push(d);
         else messages = messages.map((x) => (x.id === d.id ? d : x));
         if (d.role === 'agent') {
@@ -743,6 +802,21 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   log.replaceChildren(loading('Loading the conversation'));
   await refreshAll();
   toBottom();
+  // arrived from a search hit: bring that message into view
+  try {
+    const [jump, at] = (sessionStorage.getItem('mr-jump') || '').split('|');
+    if (jump) {
+      // a project page mounts several threads: leave the hit for the one that has it, for a few seconds
+      if (Date.now() - +at > 10000) sessionStorage.removeItem('mr-jump');
+      const m = log.querySelector(`[data-id="${CSS.escape(jump)}"]`);
+      if (m) {
+        sessionStorage.removeItem('mr-jump');
+        m.scrollIntoView({ block: 'center' });
+        m.classList.add('found');
+        setTimeout(() => m.classList.remove('found'), 2600);
+      }
+    }
+  } catch { /* fine */ }
   if (!compact) composer.focus();
   if (t.unread) patch('threads/' + id, { unread: 0 }).catch(() => {});
 

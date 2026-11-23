@@ -19,6 +19,11 @@ You were given one task by the lead of the project **{{PROJECT}}**. Your thread 
 If something in the task is unclear, make the most reasonable choice, note it in your reply, and keep going. If you
 truly can't proceed, reply with the specific question; the lead will answer in this thread.
 
+You can also write to the lead while you work, without ending your turn: call `message_lead` to ask for a decision,
+report a blocker or a finding the lead should act on, or ask for more work or another agent to help (for example, a
+design you need from a creative thread, or a test run). The lead can answer you in this thread and may open more
+threads. Keep going on whatever you can in the meantime.
+
 ## The task
 
 {{TASK}}

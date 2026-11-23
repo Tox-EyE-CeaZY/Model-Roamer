@@ -34,6 +34,10 @@ pub enum AgentEvent {
     Usage { input: i64, output: i64, cached: i64, cost: f64 },
     /// The CLI says its final answer is this.
     Final(String),
+    /// How full the agent's context is: tokens in use and the model's window (0 when unknown).
+    Context { used: i64, window: i64 },
+    /// The agent compacted its conversation to make room (`before` tokens, when it said).
+    Compacted { trigger: String, before: i64 },
     /// How much of the plan's windows is used: {"five_hour": {"used": 0..1, "resets_at": ms}, "weekly": {...}}.
     Quota(Value),
     /// A subscription or rate limit was hit; `until` is when it resets (ms), when known.

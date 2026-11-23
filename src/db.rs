@@ -209,6 +209,10 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE limits ADD COLUMN window TEXT NOT NULL DEFAULT ''; ALTER TABLE decisions ADD COLUMN action TEXT;",
     // how this thread shows its steps: '' follows the setting, or collapsed | expanded | hidden
     "ALTER TABLE threads ADD COLUMN steps TEXT NOT NULL DEFAULT '';",
+    // how full the agent's context is and when it compacted: {used, window, compactions, compacted_at, trigger, at}
+    "ALTER TABLE threads ADD COLUMN context TEXT;",
+    // a thread run by buddies (two agents taking turns): {id, name, side, turns, started, sessions: {a, b}}
+    "ALTER TABLE threads ADD COLUMN buddy TEXT;",
 ];
 
 #[derive(Clone)]
@@ -275,7 +279,7 @@ impl Db {
                     ValueRef::Text(t) => {
                         let s = String::from_utf8_lossy(t).into_owned();
                         // JSON columns come back parsed
-                        if (n == "meta" || n == "options" || n == "routing") && (s.starts_with('{') || s.starts_with('[')) {
+                        if (n == "meta" || n == "options" || n == "routing" || n == "context" || n == "buddy") && (s.starts_with('{') || s.starts_with('[')) {
                             serde_json::from_str(&s).unwrap_or(Value::String(s))
                         } else {
                             Value::String(s)

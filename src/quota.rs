@@ -105,9 +105,73 @@ pub fn codex_file(text: &str) -> Option<Value> {
     None
 }
 
+/// How full a Codex session's context is, and how often it compacted: read from its session log. Returns
+/// {"used", "window", "compactions"}.
+pub fn codex_context(session: &str) -> Option<Value> {
+    if session.len() < 8 {
+        return None;
+    }
+    let home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| crate::os::home().join(".codex"));
+    // newest day folders first: sessions/YYYY/MM/DD
+    let mut days = vec![home.join("sessions")];
+    for _ in 0..3 {
+        let mut next = vec![];
+        for d in &days {
+            let mut kids: Vec<PathBuf> = std::fs::read_dir(d).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+            kids.sort();
+            next.extend(kids.into_iter().rev().take(14));
+        }
+        days = next;
+    }
+    for d in days {
+        for e in std::fs::read_dir(&d).ok()?.flatten() {
+            let p = e.path();
+            if p.file_name().is_some_and(|n| n.to_string_lossy().contains(session)) {
+                return codex_context_file(&std::fs::read_to_string(&p).ok()?);
+            }
+        }
+    }
+    None
+}
+
+pub fn codex_context_file(text: &str) -> Option<Value> {
+    let (mut used, mut window, mut compactions) = (0i64, 0i64, 0i64);
+    for line in text.lines() {
+        if line.contains("compacted") {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if v["type"] == "compacted" || v["payload"]["type"] == "compacted" || v["payload"]["type"] == "context_compacted" {
+                    compactions += 1;
+                }
+            }
+        }
+        if line.contains("token_count") && line.contains("model_context_window") {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                let info = &v["payload"]["info"];
+                if let Some(u) = info["last_token_usage"]["total_tokens"].as_i64() {
+                    used = u;
+                }
+                if let Some(w) = info["model_context_window"].as_i64() {
+                    window = w;
+                }
+            }
+        }
+    }
+    (window > 0).then(|| json!({ "used": used, "window": window, "compactions": compactions }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reads_codex_context() {
+        let log = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":1000},"model_context_window":258000}}}"#, "\n",
+            r#"{"type":"compacted","payload":{}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":42000},"model_context_window":258000}}}"#, "\n"
+        );
+        let c = codex_context_file(log).unwrap();
+        assert_eq!((c["used"].as_i64(), c["window"].as_i64(), c["compactions"].as_i64()), (Some(42000), Some(258000), Some(1)));
+    }
     #[test]
     fn reads_usage() {
         let q = claude_parse(&json!({ "five_hour": { "utilization": 38.0, "resets_at": "2026-11-23T07:30:00+00:00" }, "seven_day": { "utilization": 8, "resets_at": null } })).unwrap();

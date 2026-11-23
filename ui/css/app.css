@@ -788,3 +788,21 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
 .sb-p-hot { font: 500 12px var(--f-display); color: var(--hot); }
 .sb-p-foot { font: 500 11.5px var(--f-display); color: var(--faint); border-top: 1px dashed var(--line2); padding-top: 8px; }
 @media (max-width: 900px) { .sb-m-bar { display: none; } }
+
+.msg-pend { display: inline-flex; align-items: center; gap: 4px; }
+.msg.pending { opacity: .85; }
+
+.ctx-chip { font: 700 10px var(--f-mono); letter-spacing: .08em; text-transform: uppercase; padding: 2px 7px; border: 1px solid var(--line); color: var(--dim); }
+.ctx-chip.hot, .ctx-pct.hot { color: var(--hot); border-color: var(--hot); }
+.ctx-pct { font: 700 11px var(--f-mono); margin-left: auto; color: var(--dim); }
+.ctx-pct.warm { color: var(--accent); }
+.ctx-bar { position: relative; height: 6px; margin: 6px 0 10px; background: var(--bg3); }
+.ctx-bar i { display: block; height: 100%; background: var(--accent); }
+.ctx-bar em { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--ink); opacity: .5; }
+
+.msg.found { animation: found 2.6s ease-out; }
+@keyframes found { 0%, 60% { outline: 2px solid var(--accent); outline-offset: 4px; } 100% { outline: 2px solid transparent; outline-offset: 4px; } }
+
+.buddy-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line2); }
+.ctx-chip.buddy { color: var(--accent); border-color: var(--accent); }
+.ctx-chip.buddy small { opacity: .7; }

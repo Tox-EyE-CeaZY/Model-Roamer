@@ -26,6 +26,22 @@ pub fn defaults() -> Value {
             "antigravity": { "enabled": true, "model": "", "effort": "", "autonomy": "full", "max_parallel": 2, "path": "", "extra_args": [] }
         },
         "custom_agents": [],
+        // buddies: two agents that take turns on one thread, each with a role. An agent id with the prefix buddy:
+        // picks one anywhere an agent can be picked.
+        "buddies": [
+            {
+                "id": "builder-reviewer", "name": "Builder + reviewer", "max_turns": 4, "start": "a",
+                "instructions": "One of you builds, the other checks the work and sends it back until it is right. Keep each hand-over short and specific.",
+                "a": { "agent": "claude", "model": "", "role": "Build it: plan, write the code and run it." },
+                "b": { "agent": "codex", "model": "", "role": "Review it: read the changes, run the tests, find bugs and gaps, and say exactly what to fix. Say you are done when it is right." }
+            },
+            {
+                "id": "designer-builder", "name": "Designer + builder", "max_turns": 4, "start": "a",
+                "instructions": "One of you designs, the other builds it. The builder tells the designer what doesn't fit; the designer adjusts until it looks and works right.",
+                "a": { "agent": "antigravity", "model": "", "role": "Design it: the look, layout, copy and any images, with clear specifics for the builder." },
+                "b": { "agent": "claude", "model": "", "role": "Build it faithfully from the design, run it, and send back anything that can't work as designed." }
+            }
+        ],
         "routing": crate::agents::default_routing(),
         "default_lead": "claude",
         "default_lead_model": "opus",

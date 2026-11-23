@@ -9,7 +9,7 @@ import { go } from '../app.js';
 import { openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { runStep } from '../term.js';
-import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
+import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
 
 const TABS = [['agents', 'Agents', 'agents'], ['tools', 'Tools', 'terminal'], ['routing', 'Routing', 'route']];
 
@@ -42,7 +42,19 @@ export default async function agents(el, r) {
 let checkingAll = null;
 async function agentCards(el, openId) {
   const grid = h('div', { class: 'ag-grid' });
-  el.append(grid, h('div', { class: 'ag-custom' }, kicker('Your own agents'), h('p', { class: 'faint small' }, 'Any command-line agent that takes a prompt and prints an answer can join the fleet.'), h('button', { class: 'btn', onclick: () => customDialog() }, ic('plus', 13), 'Add an agent')));
+  const buddyBox = h('div', { class: 'ag-custom' });
+  const drawBuddies = () => buddyBox.replaceChildren(
+    kicker('Buddies', h('small', { class: 'faint' }, 'two agents that take turns on one thread')),
+    h('p', { class: 'faint small' }, 'Pair two agents, give each a role, and pick the pair anywhere you would pick one agent. The first does its part, hands over to the second, and so on until they say it’s done or run out of turns.'),
+    ...(S.settings.buddies || []).map((b) => h('div', { class: 'buddy-row' },
+      h('b', {}, b.name),
+      h('span', { class: 'faint small' }, `${agentName(b.a.agent)} ⇄ ${agentName(b.b.agent)} · ${b.max_turns || 4} turns`),
+      h('span', { class: 'grow' }),
+      h('button', { class: 'btn xs', onclick: () => buddyDialog(b) }, 'Edit'),
+      h('button', { class: 'btn xs danger', onclick: () => setSetting({ buddies: (S.settings.buddies || []).filter((x) => x.id !== b.id) }) }, 'Remove'))),
+    h('button', { class: 'btn', onclick: () => buddyDialog() }, ic('plus', 13), 'Add a pair'));
+  drawBuddies();
+  el.append(grid, buddyBox, h('div', { class: 'ag-custom' }, kicker('Your own agents'), h('p', { class: 'faint small' }, 'Any command-line agent that takes a prompt and prints an answer can join the fleet.'), h('button', { class: 'btn', onclick: () => customDialog() }, ic('plus', 13), 'Add an agent')));
   const draw = () => grid.replaceChildren(...agentList().map((a) => card(a)));
   draw();
   // the app checks every agent when it starts; ask only if none of that has come back (once per visit, never stacked)
@@ -50,7 +62,42 @@ async function agentCards(el, openId) {
     checkingAll = get('agents?refresh=1', { timeout: 90000 }).catch(() => {}).finally(() => (checkingAll = null));
   }
   if (openId) setTimeout(() => document.getElementById('ag-' + openId)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 100);
-  return watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && draw());
+  return watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && (draw(), drawBuddies()));
+}
+
+async function buddyDialog(b) {
+  const edit = !!b;
+  const name = input(b?.name || '', { placeholder: 'Designer + builder' });
+  const brief = textarea(b?.instructions || '', { placeholder: 'What the two of you are for, and how to hand work back and forth' });
+  const side = (k, label) => {
+    const cur = b?.[k] || { agent: k === 'a' ? 'claude' : 'codex', model: '', role: '' };
+    const role = textarea(cur.role, { rows: 3, placeholder: 'What this one does' });
+    const pick = agentModelPicker({ agentId: cur.agent, model: cur.model, buddies: false });
+    return { label, role, pick };
+  };
+  const A = side('a', 'First'), B = side('b', 'Second');
+  const turns = input(String(b?.max_turns || 4), { type: 'number', min: 2, max: 20 });
+  let start = b?.start === 'b' ? 'b' : 'a';
+  const ok = await dialog({
+    title: edit ? 'Edit pair' : 'Add a pair',
+    wide: true,
+    body: h('div', { class: 'dlg-fields' },
+      field('Name', name),
+      field('What it’s for', brief),
+      h('div', { class: 'row2' },
+        ...[A, B].map((x) => h('div', {}, h('b', { class: 'small' }, x.label + ' buddy'), x.pick.el, field('Its role', x.role)))),
+      h('div', { class: 'row2' }, field('Turns in all', turns, 'Each hand-over is one turn; writing to the thread starts the count again.'), field('Starts with', seg([['a', 'First'], ['b', 'Second']], start, (v) => (start = v))))),
+    ok: edit ? 'Save' : 'Add pair',
+    check: () => {
+      if (!name.value.trim()) return 'Give the pair a name.';
+      if (!A.role.value.trim() || !B.role.value.trim()) return 'Give each buddy a role.';
+    },
+  });
+  if (!ok) return;
+  const id = b?.id || name.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-' + Math.random().toString(36).slice(2, 5);
+  const entry = { id, name: name.value.trim(), instructions: brief.value.trim(), max_turns: Math.max(2, Math.min(20, +turns.value || 4)), start, a: { ...A.pick.get(), role: A.role.value.trim() }, b: { ...B.pick.get(), role: B.role.value.trim() } };
+  const rest = (S.settings.buddies || []).filter((x) => x.id !== id);
+  setSetting({ buddies: edit ? (S.settings.buddies || []).map((x) => (x.id === id ? entry : x)) : [...rest, entry] });
 }
 
 function authOf(a) {

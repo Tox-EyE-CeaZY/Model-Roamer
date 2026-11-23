@@ -92,6 +92,9 @@ impl AgentAdapter for Antigravity {
             }
             return vec![AgentEvent::Raw(line.to_string())];
         };
+        if let Some(q) = codex_quota(&v).or_else(|| codex_quota(&v["result"])) {
+            return vec![AgentEvent::Quota(q)];
+        }
         // stream-json: {"event":"step_update","step_update":{...}} while it works, {"event":"result","result":{...}} at the end
         if v["event"] == "step_update" {
             return step_update(&v["step_update"], st);

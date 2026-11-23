@@ -88,6 +88,9 @@ impl AgentAdapter for Codex {
             return if line.trim().is_empty() { vec![] } else { vec![AgentEvent::Raw(line.to_string())] };
         };
         let mut out = vec![];
+        if let Some(q) = codex_quota(&v) {
+            out.push(AgentEvent::Quota(q));
+        }
         let ty = v["type"].as_str().unwrap_or("");
         match ty {
             "thread.started" | "session.created" | "session_configured" => {

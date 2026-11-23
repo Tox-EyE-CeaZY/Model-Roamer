@@ -8,7 +8,7 @@ import { ic } from './common.js';
 
 const CYCLE_MS = 4500;
 
-let data = { threads: [], decisions: [], terms: [], agents: [], update: null };
+let data = { threads: [], decisions: [], terms: [], agents: [], update: null, quotas: [] };
 let items = [];
 let cur = 0;
 let hold = false;
@@ -82,6 +82,7 @@ function drawRight() {
   const needs = data.decisions.length + data.threads.filter((t) => t.status === 'blocked').length;
   const remote = !S.me.local;
   right.replaceChildren(
+    h('div', { class: 'sb-meters' }, ...(data.quotas || []).map(meter)),
     needs ? h('button', { class: 'sb-seg hot', type: 'button', title: 'Jump to what needs you', onclick: () => jumpTo('hot') }, ic('flag', 12), String(needs)) : null,
     h('button', { class: 'sb-seg' + (working ? ' live' : ''), type: 'button', title: working ? `${plural(working, 'thing')} running. Click to see the next` : 'Nothing running', onclick: () => jumpTo('live') }, ic('bolt', 12), String(working)),
     h('span', { class: 'sb-seg' + (live ? '' : ' hot'), title: live ? 'Live updates are connected' : 'Reconnecting…' },
@@ -89,6 +90,57 @@ function drawRight() {
     h('a', { class: 'sb-seg dim', href: '#/settings/about', title: 'About and updates' }, 'v' + (S.version || '')),
   );
   document.documentElement.classList.toggle('busy', working > 0);
+}
+
+// ---------------------------------------------------------- plan usage meters
+const pct = (w) => (w && typeof w.used === 'number' ? Math.round(w.used * 100) : null);
+const resetIn = (ts) => (ts ? `resets ${new Date(ts).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })} (in ${dur(ts - Date.now())})` : '');
+
+/** One harness: its 5-hour use as a bar in its own colour; hover for the 5-hour and weekly detail. */
+function meter(q) {
+  const five = pct(q.five_hour);
+  const limited = q.limit?.active;
+  const fill = limited ? 100 : five ?? 0;
+  const el = h('button', { class: 'sb-meter' + (five == null && !limited ? ' unknown' : '') + (limited || fill >= 90 ? ' hot' : ''), type: 'button', style: { '--ah': q.hue ?? 200 },
+    onclick: () => import('./app.js').then((m) => m.go('#/usage')),
+    onmouseenter: () => showPop(el, q), onmouseleave: hidePop, onfocus: () => showPop(el, q), onblur: hidePop },
+    h('span', { class: 'sb-m-name' }, q.name.split(' ')[0]),
+    h('span', { class: 'sb-m-bar' }, h('i', { style: { width: fill + '%' } })),
+    h('span', { class: 'sb-m-pct' }, limited ? 'OUT' : five == null ? '–' : five + '%'));
+  return el;
+}
+
+let pop = null;
+function hidePop() {
+  pop?.remove();
+  pop = null;
+}
+function showPop(anchor, q) {
+  hidePop();
+  const row = (label, w) => {
+    const p = pct(w);
+    return h('div', { class: 'sb-p-row' },
+      h('span', {}, label),
+      h('span', { class: 'sb-m-bar wide' }, h('i', { style: { width: (p ?? 0) + '%' } })),
+      h('b', {}, p == null ? 'not reported' : p + '%'),
+      w?.resets_at ? h('small', {}, resetIn(w.resets_at)) : null);
+  };
+  const lim = q.limit?.active ? h('div', { class: 'sb-p-hot' }, `Out of usage${q.limit.until ? ', ' + resetIn(q.limit.until) : ''}. ${q.limit.note || ''}`) : null;
+  const unknown = pct(q.five_hour) == null && pct(q.weekly) == null;
+  pop = h('div', { class: 'sb-pop cut', style: { '--ah': q.hue ?? 200 } },
+    h('div', { class: 'sb-p-h' }, h('i', { class: 'sb-p-dot' }), h('b', {}, q.name)),
+    lim,
+    row('5-hour', q.five_hour),
+    row('Weekly', q.weekly),
+    h('div', { class: 'sb-p-foot' },
+      `${plural(q.turns_5h || 0, 'turn')} in the last 5 hours, ${q.turns_7d || 0} this week`,
+      q.at ? ` · reported ${dur(Date.now() - q.at)} ago` : '',
+      unknown ? '. It reports its plan usage during a turn; numbers show after its next one.' : ''));
+  document.body.append(pop);
+  const r = anchor.getBoundingClientRect();
+  const w = pop.offsetWidth;
+  pop.style.left = Math.max(8, Math.min(innerWidth - w - 8, r.left + r.width / 2 - w / 2)) + 'px';
+  pop.style.bottom = innerHeight - r.top + 6 + 'px';
 }
 
 function jumpTo(tone) {
@@ -155,7 +207,7 @@ export function initStatusBar() {
         }
         break;
       }
-      case 'turn': case 'running': case 'thread': case 'decision': case 'agent': case 'limits': case 'setup': case 'update': case 'project': case 'resync':
+      case 'quota': case 'turn': case 'running': case 'thread': case 'decision': case 'agent': case 'limits': case 'setup': case 'update': case 'project': case 'resync':
         refresh();
         break;
     }

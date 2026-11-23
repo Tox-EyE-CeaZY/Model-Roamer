@@ -65,7 +65,7 @@ function windows(el) {
       h('p', { class: 'faint small' }, 'Either way: Ctrl+Shift+O, the pop-out button, or a middle click on a thread card opens it in a window of its own. Each window remembers where it was.')),
     isDesktop ? h('section', { class: 'panel cut' }, kicker('This app'),
       toggle(s.restore_windows !== false, (v) => save({ restore_windows: v }), { label: 'Reopen the windows I had open last time' }),
-      toggle(s.close_to_tray !== false, (v) => save({ close_to_tray: v }), { label: 'Keep running in the tray when I close the window while agents are working or sharing is on' })) : null);
+      toggle(s.close_to_tray !== false, (v) => save({ close_to_tray: v }), { label: 'Keep running in the background (in the tray) when I close the window, so agents and waiting work carry on. Quit from the tray icon.' })) : null);
 }
 
 // ------------------------------------------------------------ GitHub

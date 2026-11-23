@@ -366,6 +366,7 @@ pub fn schedule(core: &CoreRef, thread: &str) {
     let thread = thread.to_string();
     tokio::spawn(async move {
         let mut rx = rx;
+        let mut failed = false;
         loop {
             match runnable(&core, &thread) {
                 Ok(true) => {}
@@ -378,6 +379,7 @@ pub fn schedule(core: &CoreRef, thread: &str) {
                 tracing::error!(thread = %thread, "turn failed: {e:#}");
                 note(&core, &thread, &format!("This turn couldn't run: {e}"));
                 let _ = core.set_status(&thread, "failed", &clip(&e.to_string(), 200));
+                failed = true;
                 break;
             }
             if *rx.borrow() {
@@ -388,8 +390,9 @@ pub fn schedule(core: &CoreRef, thread: &str) {
             r.remove(&thread);
         }
         core.bus.emit("running", None, Some(&thread), json!({ "running": false }));
-        // something may have arrived between the last check and removing ourselves
-        if runnable(&core, &thread).unwrap_or(false) {
+        // something may have arrived between the last check and removing ourselves. Not after a turn that couldn't
+        // start (agent missing, turned off): its message is still waiting, and trying again at once would loop.
+        if !failed && runnable(&core, &thread).unwrap_or(false) {
             schedule(&core, &thread);
         }
     });
@@ -764,7 +767,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                         AgentEvent::ToolUse { id: _, name, input } => {
                             flush_text(core, &t, &turn_id, &mut cur, &mut segments);
                             last_tool_seg = segments.len();
-                            add_activity(core, &t, &turn_id, "tool", &name, &input);
+                            add_activity(core, &t, &turn_id, "tool", name.trim_start_matches("mcp__roamer__"), &input);
                         }
                         AgentEvent::ToolResult { id: _, output, error } => add_activity(core, &t, &turn_id, if error { "error" } else { "result" }, if error { "Tool error" } else { "Result" }, &output),
                         AgentEvent::Usage { input, output, cached, cost } => {
@@ -781,6 +784,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                             errs.push(e);
                         }
                         AgentEvent::Raw(r) => raw.push(r),
+                        AgentEvent::Quota(q) => core.set_quota(&agent, &q),
                     }
                 }
             }

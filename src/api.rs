@@ -311,7 +311,7 @@ async fn activity(State(core): State<CoreRef>) -> R {
             Some(json!({ "id": a["id"], "name": a["info"]["name"], "state": state, "note": a["limit"]["note"] }))
         })
         .collect();
-    Ok(Json(json!({ "threads": threads, "decisions": decisions, "terms": terms, "agents": agents, "update": crate::update::staged_tag() })))
+    Ok(Json(json!({ "threads": threads, "decisions": decisions, "terms": terms, "agents": agents, "update": crate::update::staged_tag(), "quotas": core.quotas() })))
 }
 
 async fn get_settings(State(core): State<CoreRef>) -> R {
@@ -589,6 +589,35 @@ async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(
     // a title the person typed is theirs: agents' set_title leaves it alone from now on
     if f.contains_key("title") {
         f.insert("title_by".into(), json!("person"));
+    }
+    let t = core.thread(&id)?;
+    // another agent (a chat's picker): its CLI can't resume the old one's session, so the next turn starts fresh
+    if let Some(a) = b["agent"].as_str().filter(|a| !a.is_empty() && Some(*a) != t["agent"].as_str()) {
+        if core.adapter(a).is_none() {
+            return Err(bad(format!("There's no agent called {a}.")));
+        }
+        if core.running.lock().map(|r| r.contains_key(&id)).unwrap_or(false) {
+            return Err(bad("Wait for this turn to finish (or stop it) before switching agents."));
+        }
+        f.insert("agent".into(), json!(a));
+        f.insert("session_id".into(), json!(""));
+        f.insert("session_agent".into(), json!(""));
+        if !f.contains_key("model") {
+            f.insert("model".into(), core.agent_cfg(a)["model"].clone());
+        }
+    }
+    // a chat's folder: a path, or "" for a fresh one of its own
+    if let Some(folder) = b["folder"].as_str() {
+        if t["kind"] != "chat" {
+            return Err(bad("Only a chat's folder can be changed here."));
+        }
+        let folder = folder.trim();
+        if !folder.is_empty() && !std::path::Path::new(folder).is_dir() {
+            return Err(bad(format!("{folder} isn't a folder on this machine.")));
+        }
+        f.insert("workspace".into(), json!(if folder.is_empty() { String::new() } else { format!("path:{folder}") }));
+        f.insert("session_id".into(), json!(""));
+        f.insert("session_agent".into(), json!(""));
     }
     Ok(Json(core.set_thread(&id, &Value::Object(f))?))
 }

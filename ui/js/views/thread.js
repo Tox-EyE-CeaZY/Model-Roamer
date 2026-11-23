@@ -4,12 +4,12 @@
 import { h, ago, clock, dayLabel, dur, num, bytes } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen, upload } from '../api.js';
-import { S, agentName, agentHue, project as projectOf } from '../store.js';
+import { S, agentName, agentHue, project as projectOf, rememberChatPick } from '../store.js';
 import { go, openThread } from '../app.js';
 import { isPop, isDesktop, popOut, setTitle, openExternal, native } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
-import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable, pickFolder } from '../common.js';
 import { runStep } from '../term.js';
 
 export default async function threadView(el, r, ctx) {
@@ -248,7 +248,10 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
           t.task_kind ? [h('dt', {}, 'Kind'), h('dd', {}, (S.taskKinds.find((k) => k.id === t.task_kind) || {}).label || t.task_kind)] : null,
           t.branch ? [h('dt', {}, 'Branch'), h('dd', { class: 'mono' }, t.branch)] : null,
           t.base_branch ? [h('dt', {}, 'Into'), h('dd', { class: 'mono' }, t.base_branch)] : null,
-          t.workspace_path ? [h('dt', {}, 'Folder'), h('dd', {}, copyable(t.workspace_path))] : null,
+          t.workspace_path || t.kind === 'chat' ? [h('dt', {}, 'Folder'), h('dd', {}, t.workspace_path ? copyable(t.workspace_path) : h('span', { class: 'faint' }, 'Its own, made with the first message'),
+            t.kind === 'chat' ? h('div', { class: 'row-btns' },
+              h('button', { class: 'btn xs', onclick: () => changeFolder() }, ic('folder', 12), 'Change…'),
+              (t.workspace || '').startsWith('path:') ? h('button', { class: 'btn xs', onclick: () => changeFolder('') }, 'Use its own') : null) : null)] : null,
           [h('dt', {}, 'Started'), h('dd', {}, timeAgo(t.created_at))],
           t.session_id ? [h('dt', {}, 'Session'), h('dd', { class: 'mono faint', title: t.session_id }, t.session_id.slice(0, 12) + '…')] : null)),
       deps.length ? h('section', {}, kicker('Waits for'), deps.map((d) => h('button', { class: 'linkbtn', onclick: () => openThread(d) }, ic('thread', 13), d))) : null,
@@ -260,6 +263,19 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
           h('dt', {}, 'Tokens'), h('dd', {}, num(u.input || 0) + ' in · ' + num(u.output || 0) + ' out'),
           u.cost ? [h('dt', {}, 'Cost'), h('dd', {}, '$' + Number(u.cost).toFixed(2))] : null)),
     );
+  }
+
+  async function changeFolder(to) {
+    const f = to ?? (await pickFolder({ title: 'Folder this chat works in', start: t.workspace_path || '' }));
+    if (f == null) return;
+    try {
+      t = { ...t, ...(await patch('threads/' + id, { folder: f })) };
+      t = await get('threads/' + id);
+      drawSide();
+      toast(f ? `Works in ${f} from the next message` : 'Back to a folder of its own');
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
   }
 
   // ---------------------------------------------------------- decisions
@@ -485,9 +501,25 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       h('div', { class: 'cmp-row' },
         h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn,
         ta, sendBtn),
-      h('div', { class: 'cmp-hint mono' }, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' })));
+      h('div', { class: 'cmp-hint mono' }, t.kind === 'chat' ? chatPicker() : null, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' })));
     setTimeout(grow);
     return { el, ta, focus: () => ta.focus() };
+  }
+  /** A chat's agent and model, changeable any time; the choice carries over to new chats until the app restarts. */
+  function chatPicker() {
+    const p = agentModelPicker({ agentId: t.agent, model: t.model || '', onchange: async (a, m) => {
+      if (!a) return;
+      rememberChatPick(a, m);
+      try {
+        t = { ...t, ...(await patch('threads/' + id, { agent: a, model: m })) };
+        composer.ta.placeholder = placeholderFor();
+        drawHead();
+      } catch (e) {
+        toast(e.message, { err: true });
+      }
+    } });
+    p.el.classList.add('cmp-pick');
+    return p.el;
   }
   function placeholderFor() {
     if (t.kind === 'lead') return `Tell the lead (${agentName(t.agent)}) what you want…`;

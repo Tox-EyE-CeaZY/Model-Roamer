@@ -73,7 +73,7 @@ impl AgentAdapter for Claude {
         }
         a.extend(spec.extra_args.iter().cloned());
         // the prompt goes in on stdin: no quoting trouble, no length cap
-        Ok(Launch { args: a, stdin: Some(spec.prompt.clone()), cwd: Some(spec.cwd.clone()), env: vec![("CLAUDE_CODE_ENTRYPOINT".into(), "model-roamer".into())], pty: false })
+        Ok(Launch { args: a, stdin: Some(spec.prompt.clone()), cwd: Some(spec.cwd.clone()), env: vec![("CLAUDE_CODE_ENTRYPOINT".into(), "model-roamer".into()), ("ENABLE_TOOL_SEARCH".into(), "false".into())], pty: false })
     }
 
     /// Claude Code has no "models" command, but its SDK handshake answers with the model picker's list.
@@ -151,6 +151,16 @@ impl AgentAdapter for Claude {
             }
             "rate_limit_event" => {
                 let info = &v["rate_limit_info"];
+                let mut q = json!({});
+                for (k, name) in [("five_hour", "five_hour"), ("seven_day", "weekly")] {
+                    let w = &info["unifiedWindows"][k];
+                    if let Some(u) = w["utilization"].as_f64() {
+                        q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": w["resetsAt"].as_i64().map(epoch_ms) });
+                    }
+                }
+                if q.as_object().is_some_and(|o| !o.is_empty()) {
+                    out.push(AgentEvent::Quota(q));
+                }
                 if info["status"] == "rejected" {
                     let until = info["resetsAt"].as_i64().map(|t| if t < 10_000_000_000 { t * 1000 } else { t });
                     out.push(AgentEvent::Limit { until, message: format!("Claude {} limit reached", s(&info["rateLimitType"]).replace('_', " ")) });

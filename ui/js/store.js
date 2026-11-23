@@ -108,6 +108,22 @@ export function applyLook() {
   } catch { /* private window */ }
 }
 
+/** The agent and model a new chat starts on: the last one picked while the app has been open, else the primary
+ * (lead) model from Settings. Closing and reopening the app goes back to the primary. */
+export function chatPick() {
+  try {
+    const p = JSON.parse(sessionStorage.getItem('mr-chat-pick') || 'null');
+    if (p?.agent && S.agents[p.agent]) return p;
+  } catch { /* private window */ }
+  const a = S.settings.default_lead || 'claude';
+  return { agent: a, model: S.settings.default_lead_model ?? S.agents[a]?.config?.model ?? '' };
+}
+export function rememberChatPick(agent, model) {
+  try {
+    sessionStorage.setItem('mr-chat-pick', JSON.stringify({ agent, model }));
+  } catch { /* private window */ }
+}
+
 export const agent = (id) => S.agents[id] || { id, info: { id, name: id, hue: 200, models: [] }, config: {} };
 export const agentName = (id) => agent(id).info?.name || id;
 export const agentHue = (id) => agent(id).info?.hue ?? 200;

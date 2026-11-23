@@ -334,6 +334,44 @@ impl Core {
         }
     }
 
+    /// The latest plan usage a CLI reported, kept so the status bar can show it between turns.
+    pub fn set_quota(&self, agent: &str, q: &Value) {
+        let mut v = q.clone();
+        v["at"] = json!(util::now_ms());
+        let _ = self.db.set_setting(&format!("quota.{agent}"), &v);
+        self.bus.emit("quota", None, None, json!({ "agent": agent, "quota": v }));
+    }
+
+    /// Plan usage per agent for the status bar: what the CLI last reported (a window that has since reset reads as
+    /// unused), its turns in the last 5 hours and 7 days, and any limit it is under.
+    pub fn quotas(&self) -> Vec<Value> {
+        let now = util::now_ms();
+        self.adapters()
+            .iter()
+            .filter(|a| self.agent_cfg(&a.id())["enabled"] != false)
+            .map(|a| {
+                let id = a.id();
+                let info = a.info();
+                let mut q = self.db.setting(&format!("quota.{id}"));
+                for w in ["five_hour", "weekly"] {
+                    if q[w]["resets_at"].as_i64().is_some_and(|r| r < now) {
+                        q[w]["used"] = json!(0.0);
+                        q[w]["resets_at"] = Value::Null;
+                    }
+                }
+                let turns = |since: i64| self.db.scalar_i64("SELECT COUNT(*) FROM turns WHERE agent = ?1 AND started_at > ?2", &[&id, &(now - since)]).unwrap_or(0);
+                json!({
+                    "id": id, "name": info.name, "hue": info.hue,
+                    "five_hour": q.get("five_hour").cloned().unwrap_or(Value::Null),
+                    "weekly": q.get("weekly").cloned().unwrap_or(Value::Null),
+                    "at": q.get("at").cloned().unwrap_or(Value::Null),
+                    "turns_5h": turns(5 * 3_600_000), "turns_7d": turns(7 * 86_400_000),
+                    "limit": self.limit_of(&id),
+                })
+            })
+            .collect()
+    }
+
     pub fn is_limited(&self, agent: &str) -> bool {
         self.limit_of(agent)["active"].as_bool().unwrap_or(false)
     }

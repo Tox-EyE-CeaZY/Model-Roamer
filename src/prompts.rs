@@ -146,7 +146,7 @@ pub fn system(core: &Core, c: &Ctx) -> String {
         crate::os::os_name()
     ));
     if role != "lead" && t["title_by"].as_str().unwrap_or("auto") == "auto" {
-        s.push_str("\n**Name this thread now.** Its title is still a placeholder. In this turn, as soon as you know what the person wants, call the Model Roamer tool `set_title` (3 to 6 words, verb first, see \"Naming your thread\"). Do it even for a quick question or a task that asks for nothing else.\n");
+        s.push_str("\n**Name this thread first.** Its title is still a placeholder. Your very first action this turn, before any other tool or any reply, is to call the Model Roamer tool `set_title` (3 to 6 words, verb first, see \"Naming your thread\"). The person sees the new name the moment you set it. Do it even for a quick question.\n");
     }
     s
 }

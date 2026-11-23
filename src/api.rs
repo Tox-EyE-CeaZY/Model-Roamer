@@ -429,6 +429,9 @@ async fn patch_project(State(core): State<CoreRef>, Path(id): Path<String>, Json
         let rs = r.to_string();
         core.db.exec("UPDATE projects SET routing = ?1 WHERE id = ?2", &[&rs, &id])?;
     }
+    if let Some(r) = b.get("efforts").filter(|r| r.is_object()) {
+        core.db.exec("UPDATE projects SET efforts = ?1 WHERE id = ?2", &[&r.to_string(), &id])?;
+    }
     // switching the lead: the lead thread follows on its next turn, with the history
     if b.get("lead_agent").is_some() || b.get("lead_model").is_some() {
         let p = core.project(&id)?;

@@ -308,11 +308,13 @@ async function settingsTab(el, p, onSaved) {
     e.currentTarget.classList.add('on');
   } })));
   const routing = { ...(p.routing || {}) };
-  const routeRows = S.taskKinds.map((k) => h('div', { class: 'route-row' }, h('span', {}, k.label), select([['', `Default (${agentName(S.settings.routing?.[k.id] || 'claude')})`], ...agentOptions()], routing[k.id] || '', (v) => (v ? (routing[k.id] = v) : delete routing[k.id]))));
+  const efforts = { ...(p.efforts || {}) };
+  const EFFORTS = [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max (Claude)']];
+  const routeRows = S.taskKinds.map((k) => h('div', { class: 'route-row' }, h('span', {}, k.label), select([['', `Default (${agentName(S.settings.routing?.[k.id] || 'claude')})`], ...agentOptions()], routing[k.id] || '', (v) => (v ? (routing[k.id] = v) : delete routing[k.id])), select([['', 'Thinking: agent default'], ...EFFORTS], efforts[k.id] || '', (v) => (v ? (efforts[k.id] = v) : delete efforts[k.id]))));
   const save = async () => {
     const { agent: la, model: lm } = lead.get();
     try {
-      const np = await patch('projects/' + p.id, { name: name.value, folder: folder.value.trim(), repo_url: repo.value.trim(), base_branch: base.value.trim(), instructions: instr.value, lead_agent: la, lead_model: lm, color, routing });
+      const np = await patch('projects/' + p.id, { name: name.value, folder: folder.value.trim(), repo_url: repo.value.trim(), base_branch: base.value.trim(), instructions: instr.value, lead_agent: la, lead_model: lm, color, routing, efforts });
       onSaved(np);
       toast('Saved');
     } catch (e) {

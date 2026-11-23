@@ -285,9 +285,11 @@ html.pop #side { display: none; }
 .status-pre { margin: 0; max-height: 220px; overflow: auto; color: var(--dim); }
 .p-settings { max-width: 860px; }
 .routes, .route-grid { display: grid; gap: 4px; }
+.routes .route-row { grid-template-columns: 1fr minmax(160px, 240px) minmax(150px, 190px); }
 .route-row { display: grid; grid-template-columns: 1fr minmax(180px, 260px); gap: 10px; align-items: center; font-size: 13px; padding: 2px 0; }
 .route-grid .route-row { grid-template-columns: 1fr 90px minmax(160px, 240px) 120px; }
 @media (max-width: 760px) { .route-grid .route-row { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { .routes .route-row { grid-template-columns: 1fr 1fr; } .routes .route-row > span { grid-column: 1 / -1; } }
 .save-bar { display: flex; gap: 10px; align-items: center; position: sticky; bottom: 0; padding: 12px 0; background: linear-gradient(transparent, var(--bg) 40%); }
 .fallback { display: flex; flex-wrap: wrap; gap: 8px; }
 .fb-i { display: inline-flex; align-items: center; gap: 6px; font: 700 11px var(--f-mono); color: var(--faint); }

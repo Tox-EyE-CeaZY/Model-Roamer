@@ -789,7 +789,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         session: session.clone(),
         cwd: workspace.clone(),
         model: model.clone(),
-        effort: t["effort"].as_str().filter(|e| !e.is_empty()).or(cfg["effort"].as_str()).unwrap_or("").to_string(),
+        effort: effort_for(&t, project.as_ref(), &agent, &cfg),
         autonomy: Autonomy::parse(cfg["autonomy"].as_str().unwrap_or("full")),
         mcp: Some(mcp.clone()),
         extra_dirs,
@@ -1131,6 +1131,27 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             Ok(())
         }
     }
+}
+
+/// Thinking strength for a turn: the thread's own choice, else the project's setting for this kind of work (when this
+/// agent takes that level), else the agent's own default.
+fn effort_for(t: &Value, project: Option<&Value>, agent: &str, cfg: &Value) -> String {
+    if let Some(e) = t["effort"].as_str().filter(|e| !e.is_empty()) {
+        return e.to_string();
+    }
+    let kind = t["task_kind"].as_str().filter(|k| !k.is_empty()).unwrap_or("general");
+    let routed = project.and_then(|p| p["efforts"][kind].as_str()).filter(|e| !e.is_empty());
+    if let Some(e) = routed {
+        let ok = match agent {
+            "claude" => ["low", "medium", "high", "xhigh", "max"].contains(&e),
+            "codex" | "antigravity" => ["low", "medium", "high", "xhigh"].contains(&e),
+            _ => false,
+        };
+        if ok {
+            return e.to_string();
+        }
+    }
+    cfg["effort"].as_str().unwrap_or("").to_string()
 }
 
 /// What other threads in this project have claimed right now, so an agent knows before it edits (it doesn't have to
@@ -1566,6 +1587,19 @@ pub async fn watch_limits(core: CoreRef) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effort_order_thread_then_project_then_agent() {
+        use serde_json::json;
+        let cfg = json!({ "effort": "low" });
+        let p = json!({ "efforts": { "core": "max", "docs": "medium" } });
+        let t = |k: &str, e: &str| json!({ "task_kind": k, "effort": e });
+        assert_eq!(super::effort_for(&t("core", "high"), Some(&p), "claude", &cfg), "high");
+        assert_eq!(super::effort_for(&t("core", ""), Some(&p), "claude", &cfg), "max");
+        // codex has no max: fall back to the agent's own setting
+        assert_eq!(super::effort_for(&t("core", ""), Some(&p), "codex", &cfg), "low");
+        assert_eq!(super::effort_for(&t("docs", ""), Some(&p), "codex", &cfg), "medium");
+        assert_eq!(super::effort_for(&t("tests", ""), Some(&p), "claude", &cfg), "low");
+    }
     #[test]
     fn names_limit_windows() {
         assert_eq!(crate::agents::limit_window("You've hit your weekly limit · resets Mon 9am"), "weekly");

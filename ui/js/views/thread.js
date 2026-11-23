@@ -146,6 +146,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     showMenu([
       { label: 'Rename…', icon: 'edit', run: rename },
       { label: t.pinned ? 'Unpin' : 'Pin', icon: 'pin', run: async () => ((t = { ...t, ...(await patch('threads/' + id, { pinned: t.pinned ? 0 : 1 })) }), drawHead()) },
+      t.kind !== 'chat' && !t.buddy ? { label: 'Model and thinking…', icon: 'settings', run: modelDialog } : null,
       { label: 'Hand to another agent…', icon: 'agents', run: reassign },
       isWorker || t.kind === 'chat' ? { label: 'Ask for a review…', icon: 'eye', run: review, disabled: t.kind === 'chat' } : null,
       { label: 'Start a fresh session', icon: 'refresh', title: 'The agent forgets its session; the next turn gets a recap of this thread instead', run: () => act('new_session').then(() => toast('The next turn starts a fresh session with a recap')) },
@@ -157,6 +158,27 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       { sep: true },
       t.kind !== 'lead' ? { label: 'Delete thread', icon: 'trash', danger: true, run: remove } : null,
     ], r.right, r.bottom + 4, { anchor });
+  }
+
+  /** Change this thread's model and how hard it thinks; it applies from the next turn. */
+  async function modelDialog() {
+    const pick = agentModelPicker({ agentId: t.agent, model: t.model || '', effort: t.effort || '' });
+    pick.el.querySelector('select')?.setAttribute('disabled', '');
+    const ok = await dialog({
+      title: 'Model and thinking',
+      text: `How ${agentName(t.agent)} works on this thread, from its next turn. To use another agent, hand the thread over instead.`,
+      body: h('div', { class: 'dlg-fields' }, field('Model and thinking strength', pick.el)),
+      ok: 'Save',
+    });
+    if (!ok) return;
+    const { model, effort } = pick.get();
+    try {
+      t = { ...t, ...(await patch('threads/' + id, { model, effort })) };
+      drawHead();
+      toast('Saved. It applies from the next turn.', { ms: 2200 });
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
   }
 
   async function act(action, extra = {}) {
@@ -601,11 +623,11 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   }
 
   function chatPicker() {
-    const p = agentModelPicker({ agentId: t.agent, model: t.model || '', onchange: async (a, m) => {
+    const p = agentModelPicker({ agentId: t.agent, model: t.model || '', effort: t.effort || '', onchange: async (a, m, e) => {
       if (!a) return;
-      rememberChatPick(a, m);
+      rememberChatPick(a, m, e);
       try {
-        t = { ...t, ...(await patch('threads/' + id, { agent: a, model: m })) };
+        t = { ...t, ...(await patch('threads/' + id, { agent: a, model: m, effort: e })) };
         composer.ta.placeholder = placeholderFor();
         drawHead();
       } catch (e) {

@@ -103,6 +103,8 @@ pub struct NewWorker {
     pub agent: String,
     pub task_kind: String,
     pub model: String,
+    /// Thinking strength for this thread ("" = the agent's setting)
+    pub effort: String,
     pub workspace: String,
     pub depends_on: Vec<String>,
     pub parent: Option<String>,
@@ -145,6 +147,9 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     )?;
     if let Some(b) = &buddy {
         core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
+    }
+    if !w.effort.is_empty() && buddy.is_none() {
+        core.db.exec("UPDATE threads SET effort = ?1 WHERE id = ?2", &[&w.effort, &id])?;
     }
     let t = core.thread(&id)?;
     core.bus.emit("thread", Some(&pid_s), Some(&id), t.clone());
@@ -781,7 +786,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         session: session.clone(),
         cwd: workspace.clone(),
         model: model.clone(),
-        effort: cfg["effort"].as_str().unwrap_or("").to_string(),
+        effort: t["effort"].as_str().filter(|e| !e.is_empty()).or(cfg["effort"].as_str()).unwrap_or("").to_string(),
         autonomy: Autonomy::parse(cfg["autonomy"].as_str().unwrap_or("full")),
         mcp: Some(mcp.clone()),
         extra_dirs,
@@ -1387,6 +1392,7 @@ pub async fn request_review(core: &CoreRef, target: &Value, agent: &str, focus: 
             agent: reviewer,
             task_kind: "review".into(),
             model: String::new(),
+            effort: String::new(),
             workspace: ws,
             depends_on: vec![],
             parent: Some(lead_thread.to_string()),

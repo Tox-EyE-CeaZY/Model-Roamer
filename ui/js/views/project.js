@@ -241,9 +241,9 @@ export async function newThreadDialog(projectId) {
     check: async () => {
       if (!title.value.trim()) return 'Give it a title.';
       if (!instr.value.trim()) return 'Say what the agent should do.';
-      const { agent: a, model: m } = pick.get();
+      const { agent: a, model: m, effort: ef } = pick.get();
       try {
-        made = await post(`projects/${projectId}/workers`, { title: title.value.trim(), instructions: instr.value, criteria: crit.value, task_kind: kinds.value, agent: a, model: m, workspace: wsv });
+        made = await post(`projects/${projectId}/workers`, { title: title.value.trim(), instructions: instr.value, criteria: crit.value, task_kind: kinds.value, agent: a, model: m, effort: ef, workspace: wsv });
       } catch (e) {
         return e.message;
       }

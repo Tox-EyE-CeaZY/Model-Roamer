@@ -104,22 +104,42 @@ export function agentOptions({ leadOnly, auto, buddies = true } = {}) {
   return auto ? [['', 'Let the router choose'], ...opts, ...pairs] : [...opts, ...pairs];
 }
 
-/** An agent + model pair of selects that keep each other in step. */
-export function agentModelPicker({ agentId, model, leadOnly, auto, onchange }) {
-  let a = agentId, m = model;
-  const mSel = h('span');
+/** How hard a model thinks. The levels come from the CLI's model list when it gives them (they differ per model),
+ * else a common set; "" means the agent's own setting. Agents without a thinking setting get no options. */
+const EFFORT = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
+export function effortOptions(agentId, model, defaultLabel = 'Default thinking') {
+  if (!['claude', 'codex', 'antigravity'].includes(agentId)) return null;
+  const ms = agent(agentId).info?.models || [];
+  const m = ms.find((x) => x.id === model);
+  const lv = m?.efforts?.length ? m.efforts : [...new Set(ms.flatMap((x) => x.efforts || []))];
+  const list = lv.length ? lv : agentId === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high'];
+  return [['', defaultLabel], ...list.map((e) => [e, EFFORT[e] || e])];
+}
+
+/** An agent + model (+ thinking strength) set of selects that keep each other in step. */
+export function agentModelPicker({ agentId, model, effort = '', leadOnly, auto, onchange }) {
+  let a = agentId, m = model, e = effort;
+  const mSel = h('span'), eSel = h('span');
+  const drawEffort = () => {
+    const o = a ? effortOptions(a, m) : null;
+    if (!o || !o.some(([v]) => v === e)) e = '';
+    eSel.replaceChildren(...(o ? [select(o, e, (v) => ((e = v), onchange?.(a, m, e)))] : []));
+  };
   const drawModels = () => {
     if (!a) return mSel.replaceChildren();
-    mSel.replaceChildren(select(modelOptions(a), m, (v) => ((m = v), onchange?.(a, m))));
+    mSel.replaceChildren(select(modelOptions(a), m, (v) => ((m = v), drawEffort(), onchange?.(a, m, e))));
   };
   const aSel = select(agentOptions({ leadOnly, auto }), a, (v) => {
     a = v;
     m = v && !v.startsWith('buddy:') ? agent(v).config?.model ?? '' : '';
+    e = '';
     drawModels();
-    onchange?.(a, m);
+    drawEffort();
+    onchange?.(a, m, e);
   });
   drawModels();
-  return { el: h('div', { class: 'pick2' }, aSel, mSel), get: () => ({ agent: a, model: m }) };
+  drawEffort();
+  return { el: h('div', { class: 'pick2' }, aSel, mSel, eSel), get: () => ({ agent: a, model: m, effort: e }) };
 }
 
 export function timeAgo(ts) {

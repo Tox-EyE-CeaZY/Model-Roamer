@@ -35,6 +35,7 @@ const DEFS: &[Def] = &[
         "agent": {"type": "string", "description": "claude | codex | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
         "task_kind": {"type": "string", "description": "plan | core | refactor | review | docs | design | frontend | creative | research | backend | api | data | infra | scripts | tests | general"},
         "model": {"type": "string", "description": "Optional model for that agent"},
+        "effort": {"type": "string", "description": "Optional thinking strength for this thread (low | medium | high | xhigh | max, as the model allows). Use lower for simple edits and higher for hard design or debugging; leave empty for the agent's default."},
         "workspace": {"type": "string", "enum": ["worktree", "shared", "scratch"], "description": "worktree (default when the project has a git repo): its own branch and folder; shared: the project folder itself (read-only work, research); scratch: an empty folder"},
         "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"},
         "allow_limited": {"type": "boolean", "description": "Open the thread even though that agent is out of usage right now (it waits for the reset). Default false: you're told who has room instead."}
@@ -209,6 +210,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
                     agent: a("agent"),
                     task_kind: a("task_kind"),
                     model: a("model"),
+                    effort: a("effort"),
                     workspace: a("workspace"),
                     depends_on: deps,
                     parent: Some(tid.clone()),

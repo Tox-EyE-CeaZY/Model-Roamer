@@ -214,6 +214,7 @@ const MIGRATIONS: &[&str] = &[
     // a thread run by buddies (two agents taking turns): {id, name, side, turns, started, sessions: {a, b}}
     "ALTER TABLE threads ADD COLUMN buddy TEXT;",
     "ALTER TABLE threads ADD COLUMN parked_at INTEGER;",
+    "ALTER TABLE threads ADD COLUMN effort TEXT NOT NULL DEFAULT '';",
 ];
 
 #[derive(Clone)]

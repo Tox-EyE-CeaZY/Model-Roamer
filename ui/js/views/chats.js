@@ -65,8 +65,8 @@ export default async function chats(el) {
 /** A new chat opens straight away on the session's model; the first message is typed in the chat itself. */
 export async function newChat() {
   try {
-    const { agent: a, model: m } = chatPick();
-    const made = await post('threads', { agent: a, model: m });
+    const { agent: a, model: m, effort: e } = chatPick();
+    const made = await post('threads', { agent: a, model: m, effort: e || '' });
     openThread(made.id);
     return made;
   } catch (e) {

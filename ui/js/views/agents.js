@@ -9,7 +9,7 @@ import { go } from '../app.js';
 import { openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { runStep } from '../term.js';
-import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
+import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, effortOptions, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
 
 const TABS = [['agents', 'Agents', 'agents'], ['tools', 'Tools', 'terminal'], ['routing', 'Routing', 'route']];
 
@@ -188,14 +188,7 @@ function drawSettings(el, a) {
   const cfg = a.config || {};
   const save = (p) => patch('agents/' + a.id, p).then(() => toast('Saved', { ms: 1200 })).catch((e) => toast(e.message, { err: true }));
   // effort levels come from the CLI's model list when it gives them (they differ per model), else a common set
-  const EFFORT = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
-  const effortsFor = (model) => {
-    const ms = a.info?.models || [];
-    const m = ms.find((x) => x.id === model);
-    const lv = m?.efforts?.length ? m.efforts : [...new Set(ms.flatMap((x) => x.efforts || []))];
-    const list = lv.length ? lv : a.id === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high'];
-    return [['', 'CLI default'], ...list.map((e) => [e, EFFORT[e] || e])];
-  };
+  const effortsFor = (model) => effortOptions(a.id, model, 'CLI default') || [['', 'CLI default']];
   const effortBox = h('span');
   const drawEffort = (model) => effortBox.replaceChildren(select(effortsFor(model), cfg.effort || '', (v) => save({ effort: (cfg.effort = v) })));
   drawEffort(cfg.model || '');

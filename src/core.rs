@@ -456,7 +456,7 @@ impl Core {
     pub fn set_thread(&self, id: &str, fields: &Value) -> Result<Value> {
         let allowed = [
             "title", "agent", "model", "status", "status_note", "task_kind", "instructions", "criteria", "workspace", "branch", "session_id", "session_agent",
-            "resolved", "parked_at", "pinned", "unread", "project_id", "parent_id", "base_branch", "depends_on", "merged", "title_by",
+            "resolved", "parked_at", "effort", "pinned", "unread", "project_id", "parent_id", "base_branch", "depends_on", "merged", "title_by",
         ];
         let obj = fields.as_object().ok_or_else(|| anyhow!("fields must be an object"))?;
         for (k, v) in obj {

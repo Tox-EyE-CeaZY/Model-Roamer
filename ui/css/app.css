@@ -286,8 +286,9 @@ html.pop #side { display: none; }
 .p-settings { max-width: 860px; }
 .routes, .route-grid { display: grid; gap: 4px; }
 .route-row { display: grid; grid-template-columns: 1fr minmax(180px, 260px); gap: 10px; align-items: center; font-size: 13px; padding: 2px 0; }
+.route-row.r3 { grid-template-columns: 1fr minmax(150px, 220px) minmax(110px, 150px); }
 .route-grid .route-row { grid-template-columns: 1fr 90px minmax(160px, 240px) 120px; }
-@media (max-width: 760px) { .route-grid .route-row { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { .route-grid .route-row, .route-row.r3 { grid-template-columns: 1fr 1fr; } }
 .save-bar { display: flex; gap: 10px; align-items: center; position: sticky; bottom: 0; padding: 12px 0; background: linear-gradient(transparent, var(--bg) 40%); }
 .fallback { display: flex; flex-wrap: wrap; gap: 8px; }
 .fb-i { display: inline-flex; align-items: center; gap: 6px; font: 700 11px var(--f-mono); color: var(--faint); }

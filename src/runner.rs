@@ -148,8 +148,9 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     if let Some(b) = &buddy {
         core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
     }
-    if !w.effort.is_empty() && buddy.is_none() {
-        core.db.exec("UPDATE threads SET effort = ?1 WHERE id = ?2", &[&w.effort, &id])?;
+    let effort = if w.effort.is_empty() { route_effort(core, Some(project), &kind, &agent) } else { w.effort.clone() };
+    if !effort.is_empty() && buddy.is_none() {
+        core.db.exec("UPDATE threads SET effort = ?1 WHERE id = ?2", &[&effort, &id])?;
     }
     let t = core.thread(&id)?;
     core.bus.emit("thread", Some(&pid_s), Some(&id), t.clone());
@@ -248,6 +249,21 @@ pub fn route(core: &CoreRef, project: Option<&str>, kind: &str) -> Option<(Strin
         }
     }
     None
+}
+
+/// The thinking strength the routing rules give a kind of task (stored as `effort:<kind>` next to the agent rule,
+/// the project's setting over the global one). It applies only when the thread runs on the agent the rule names,
+/// because the levels differ per agent.
+pub fn route_effort(core: &CoreRef, project: Option<&str>, kind: &str, agent: &str) -> String {
+    let mut routing = core.settings()["routing"].clone();
+    if let Some(p) = project.and_then(|p| core.project(p).ok()) {
+        crate::config::merge(&mut routing, &p["routing"]);
+    }
+    let rule_agent = routing[kind].as_str().or(routing["general"].as_str()).unwrap_or("claude");
+    if rule_agent != agent {
+        return String::new();
+    }
+    routing[format!("effort:{kind}")].as_str().unwrap_or("").to_string()
 }
 
 /// Every agent's state right now, for the lead: ready, out of usage (and until when), signed out, how much of its

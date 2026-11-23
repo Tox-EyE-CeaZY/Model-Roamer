@@ -9,7 +9,7 @@ import { go } from '../app.js';
 import { openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { runStep } from '../term.js';
-import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, effortOptions, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
+import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, effortOptions, routeEffort, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
 
 const TABS = [['agents', 'Agents', 'agents'], ['tools', 'Tools', 'terminal'], ['routing', 'Routing', 'route']];
 
@@ -276,11 +276,15 @@ async function routing(el) {
     const fall = S.settings.lead_fallback || [];
     el.replaceChildren(
       h('section', { class: 'panel cut' }, kicker('Who gets what', h('small', { class: 'faint' }, 'the lead follows this when it opens threads; projects can override it')),
-        h('div', { class: 'route-grid' }, S.taskKinds.map((k) => h('div', { class: 'route-row' },
-          h('span', {}, k.label),
-          h('span', { class: 'mono faint small' }, k.id),
-          select(agentOptions(), rt[k.id] || 'claude', (v) => setSetting({ routing: { [k.id]: v } }).then(() => toast('Saved', { ms: 1000 }))),
-          stamp(rt[k.id] || 'claude', { small: true }))))),
+        h('div', { class: 'route-grid' }, S.taskKinds.map((k) => {
+          const ef = routeEffort(rt[k.id] || 'claude', rt['effort:' + k.id], (v) => setSetting({ routing: { ['effort:' + k.id]: v } }).then(() => toast('Saved', { ms: 1000 })));
+          return h('div', { class: 'route-row' },
+            h('span', {}, k.label),
+            h('span', { class: 'mono faint small' }, k.id),
+            select(agentOptions(), rt[k.id] || 'claude', (v) => { ef.set(v); setSetting({ routing: { [k.id]: v, ['effort:' + k.id]: '' } }).then(() => toast('Saved', { ms: 1000 })); }),
+            ef.el,
+            stamp(rt[k.id] || 'claude', { small: true }));
+        }))),
       h('section', { class: 'panel cut' }, kicker('Leading'),
         field('New projects are led by', select(agentOptions({ leadOnly: true }), S.settings.default_lead, (v) => setSetting({ default_lead: v, default_lead_model: '' }).then(draw))),
         field('With the model', select(modelOptions(S.settings.default_lead || 'claude'), S.settings.default_lead_model || '', (v) => setSetting({ default_lead_model: v }))),

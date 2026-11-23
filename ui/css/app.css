@@ -897,3 +897,11 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
   .plan-w .sb-m-bar.wide { width: 100%; }
   .plan-w { grid-template-columns: 54px minmax(0, 1fr) 66px; }
 }
+
+/* commenting on an artifact */
+.artifact-view { position: relative; }
+.av-tip { position: absolute; z-index: 30; }
+.av-pop { position: absolute; z-index: 31; width: min(330px, calc(100% - 16px)); background: var(--bg2); border: 1px solid var(--line2); padding: 12px; display: grid; gap: 8px; box-shadow: 6px 6px 0 color-mix(in oklch, var(--accent) 30%, transparent); }
+.av-pop textarea { width: 100%; resize: vertical; }
+.av-pop-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.av-quote { margin: 0; padding: 4px 0 4px 10px; border-left: 3px solid var(--accent); color: var(--dim); font-size: 12.5px; max-height: 84px; overflow: auto; white-space: pre-wrap; }

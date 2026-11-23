@@ -9,7 +9,7 @@ import { go, back, openThread } from '../app.js';
 import { popOut, setTitle, openExternal, openOutside, isPop } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
-import { ic, stamp, empty, loading, errorBox, field, input, textarea, select, kicker, askLine } from '../common.js';
+import { ic, stamp, empty, loading, errorBox, field, input, textarea, select, seg, kicker, askLine } from '../common.js';
 
 const KIND_ICON = { html: 'globe', markdown: 'file', image: 'eye', svg: 'brush', text: 'file', pdf: 'file', file: 'download' };
 
@@ -304,6 +304,91 @@ export async function viewer(el, r, ctx) {
   const head = h('div', { class: 'av-head' });
   el.classList.add('artifact-view');
   el.append(head, frame);
+  // ---- comments: select text (or Alt+click a part of a page, or click an image) and send a note about it
+  let pop = null, sendTo = localStorage.getItem('mr-art-comment-to') || 'lead';
+  const closePop = () => (pop?.remove(), (pop = null));
+  function comment({ quote, where, x, y }) {
+    closePop();
+    const to = a.thread_id && sendTo === 'thread' ? 'thread' : 'lead';
+    const note = textarea('', { rows: 3, placeholder: 'What should change, or what do you want to know?' });
+    let dest = to;
+    const send = async () => {
+      const text = note.value.trim();
+      if (!text) return note.focus();
+      const target = dest === 'thread' ? a.thread_id : a.lead_id;
+      if (!target) return toast('There’s nowhere to send this.', { err: true });
+      const lines = [`Comment on the artifact "${a.title}" (version ${a.version}, id ${a.id})${where ? ', ' + where : ''}:`];
+      if (quote) lines.push('', ...quote.split('\n').map((l) => '> ' + l));
+      lines.push('', text);
+      try {
+        await post('threads/' + target + '/messages', { text: lines.join('\n') });
+        localStorage.setItem('mr-art-comment-to', dest);
+        sendTo = dest;
+        closePop();
+        toast(dest === 'thread' ? 'Sent to the thread' : 'Sent to the lead', { action: 'Open', run: () => openThread(target) });
+      } catch (e) {
+        toast(e.message, { err: true });
+      }
+    };
+    note.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closePop();
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send();
+    });
+    pop = h('div', { class: 'av-pop cut' },
+      quote ? h('blockquote', { class: 'av-quote' }, quote.length > 220 ? quote.slice(0, 220) + '…' : quote) : where ? h('div', { class: 'faint small mono' }, where) : null,
+      note,
+      h('div', { class: 'av-pop-row' },
+        a.thread_id ? seg([['lead', 'To the lead'], ['thread', 'To its thread']], dest, (v) => (dest = v)) : h('span', { class: 'faint small' }, 'To the lead'),
+        h('span', { class: 'grow' }),
+        h('button', { class: 'btn sm', onclick: closePop }, 'Cancel'),
+        h('button', { class: 'btn sm primary', onclick: send }, 'Send')));
+    el.append(pop);
+    const box = el.getBoundingClientRect();
+    pop.style.left = Math.max(8, Math.min(x - box.left, box.width - 340)) + 'px';
+    pop.style.top = Math.max(8, Math.min(y - box.top + 8, box.height - 220)) + 'px';
+    note.focus();
+  }
+  // a floating button near the selection, so commenting is one click
+  let tip = null;
+  const closeTip = () => (tip?.remove(), (tip = null));
+  function showTip(x, y, ctx) {
+    closeTip();
+    tip = h('button', { class: 'av-tip btn sm primary', onmousedown: (e) => e.preventDefault(), onclick: () => (closeTip(), comment({ ...ctx, x, y })) }, ic('chat', 13), 'Comment');
+    el.append(tip);
+    const box = el.getBoundingClientRect();
+    tip.style.left = Math.max(8, Math.min(x - box.left, box.width - 110)) + 'px';
+    tip.style.top = Math.max(8, y - box.top + 6) + 'px';
+  }
+  // text shown in the page itself (markdown, plain text)
+  frame.addEventListener('mouseup', () => setTimeout(() => {
+    if (a.kind !== 'markdown' && a.kind !== 'text') return;
+    const sel = getSelection();
+    const t = sel?.toString().trim();
+    if (!t || !frame.contains(sel.anchorNode)) return closeTip();
+    const r = sel.getRangeAt(0).getBoundingClientRect();
+    showTip(r.left, r.bottom, { quote: t.slice(0, 1500) });
+  }, 0));
+  // a picture: click to point at a spot
+  frame.addEventListener('click', (e) => {
+    const img = e.target.closest?.('.av-img img');
+    if (!img) return;
+    const r = img.getBoundingClientRect();
+    const px = Math.round(((e.clientX - r.left) / r.width) * 100), py = Math.round(((e.clientY - r.top) / r.height) * 100);
+    comment({ where: `at ${px}% across, ${py}% down the image`, x: e.clientX, y: e.clientY });
+  });
+  // a page (HTML): the page tells us what was selected, or Alt+clicked
+  const onPage = (ev) => {
+    const f = frame.querySelector('iframe');
+    if (!f || ev.source !== f.contentWindow || !ev.data?.mr) return;
+    const fr = f.getBoundingClientRect();
+    const d = ev.data;
+    if (d.mr === 'sel') {
+      if (!d.text) return closeTip();
+      showTip(fr.left + d.x, fr.top + d.y, { quote: d.text, where: d.el ? 'in ' + d.el : '' });
+    } else if (d.mr === 'pin') comment({ quote: d.text, where: 'the element ' + d.el, x: fr.left + d.x, y: fr.top + d.y });
+  };
+  window.addEventListener('message', onPage);
+  el.addEventListener('keydown', (e) => e.key === 'Escape' && (closePop(), closeTip()));
   const drawHead = () => head.replaceChildren(
     isPop ? null : h('button', { class: 'ibtn', title: 'Back', onclick: () => back('#/artifacts'), html: icon('back', 16) }),
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
@@ -330,7 +415,7 @@ export async function viewer(el, r, ctx) {
   }
   drawHead();
   draw();
-  return listen((ev) => {
+  const stopListen = listen((ev) => {
     if (ev.kind === 'artifact' && ev.data?.id === a.id) {
       if (ev.data.deleted) return frame.replaceChildren(empty('trash', 'This artifact was deleted'));
       a = { ...a, ...ev.data, url: a.url };
@@ -338,6 +423,7 @@ export async function viewer(el, r, ctx) {
       draw(true);
     }
   });
+  return () => (stopListen?.(), window.removeEventListener('message', onPage), closePop(), closeTip());
 }
 
 export { S, agentName, kicker };

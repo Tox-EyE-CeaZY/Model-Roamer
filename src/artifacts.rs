@@ -303,3 +303,17 @@ pub fn file(core: &Core, id: &str, rel: &str) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     (canon.starts_with(&root) && canon.is_file()).then_some(canon)
 }
+
+/// Added to the end of every HTML artifact when it is served. The page runs sandboxed, so the app can't see what the
+/// person selects in it; this tells the app (via postMessage to the window that framed it) so the person can comment on
+/// that part. Alt+click does the same for a single element. It sends nothing anywhere else.
+pub const COMMENT_SNIPPET: &str = r#"<script data-roamer-comment>(function(){
+function d(e){var o=[];for(var i=0;e&&e.nodeType===1&&i<4&&e!==document.body;i++,e=e.parentElement){var s=e.tagName.toLowerCase();if(e.id)s+='#'+e.id;else if(e.className&&typeof e.className==='string')s+='.'+e.className.trim().split(/\s+/).slice(0,2).join('.');o.unshift(s)}return o.join(' > ')}
+function send(){var s=getSelection(),t=s&&s.toString().trim();if(!t){parent.postMessage({mr:'sel',text:''},'*');return}
+var r=s.getRangeAt(0).getBoundingClientRect(),n=s.anchorNode,e=n&&(n.nodeType===1?n:n.parentElement);
+parent.postMessage({mr:'sel',text:t.slice(0,1500),x:r.left,y:r.bottom,el:d(e)},'*')}
+document.addEventListener('mouseup',function(){setTimeout(send,0)});
+document.addEventListener('keyup',function(e){if(e.key==='Shift'||e.key.indexOf('Arrow')===0)setTimeout(send,0)});
+document.addEventListener('click',function(e){if(!e.altKey)return;e.preventDefault();e.stopPropagation();var t=e.target;
+parent.postMessage({mr:'pin',el:d(t),text:(t.innerText||t.alt||'').trim().slice(0,300),x:e.clientX,y:e.clientY},'*')},true);
+})();</script>"#;

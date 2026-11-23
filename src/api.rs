@@ -929,7 +929,12 @@ async fn list_artifacts(State(core): State<CoreRef>, q: Q) -> R {
 
 async fn get_artifact(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let a = core.db.one("SELECT a.*, t.title AS thread_title, t.agent FROM artifacts a LEFT JOIN threads t ON t.id = a.thread_id WHERE a.id = ?1", &[&id])?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such artifact".into()))?;
-    Ok(Json(with_urls(&core, a)))
+    let mut a = with_urls(&core, a);
+    // where a comment on it can go: its project's lead (the thread that made it is thread_id)
+    if let Some(l) = a["project_id"].as_str().and_then(|p| core.lead_thread(p).ok()) {
+        a["lead_id"] = l["id"].clone();
+    }
+    Ok(Json(a))
 }
 
 async fn create_artifact(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
@@ -1070,6 +1075,13 @@ async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String
     let Some(path) = artifacts::file(&core, &id, &rest) else { return StatusCode::NOT_FOUND.into_response() };
     let Ok(bytes) = tokio::fs::read(&path).await else { return StatusCode::NOT_FOUND.into_response() };
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let bytes = if mime.essence_str() == "text/html" && q.get("download").is_none() {
+        let mut b = bytes;
+        b.extend_from_slice(artifacts::COMMENT_SNIPPET.as_bytes());
+        b
+    } else {
+        bytes
+    };
     let mut r = Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, "no-cache");
     if q.get("download").is_some() {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "artifact".into());

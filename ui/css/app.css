@@ -335,6 +335,7 @@ html.pop #side { display: none; }
 .sys-entry { display: flex; gap: 10px; align-items: flex-start; margin: 8px 0 8px 16px; padding: 8px 12px; background: color-mix(in oklch, var(--bg2) 70%, transparent); font-size: 13px; color: var(--dim); }
 .sys-entry time { margin-left: auto; font: 500 10px var(--f-mono); color: var(--faint); }
 .sys-entry .md p { margin: 0; }
+.sys-acts { display: flex; gap: 8px; margin-top: 8px; }
 .answered { margin-top: 4px; color: var(--accent); font-weight: 600; }
 .art-entry { --c: 10px; display: flex; align-items: center; gap: 12px; margin: 8px 0 8px 16px; padding: 10px 14px; color: var(--accent); }
 .art-entry > div { flex: 1; min-width: 0; color: var(--ink); display: grid; }
@@ -344,6 +345,8 @@ html.pop #side { display: none; }
 .live-what { flex: 1; min-width: 0; font: 500 11.5px var(--f-mono); color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-time { font-size: 10.5px; color: var(--faint); }
 .live-text { opacity: .92; }
+.live-text.typing > :last-child::after { content: ''; display: inline-block; width: .5em; height: 1em; margin-left: 2px; vertical-align: -2px; background: var(--accent); animation: caret 1s steps(1) infinite; }
+@keyframes caret { 50% { opacity: 0; } }
 
 /* the agent's steps */
 .acts-wrap { margin-top: 10px; }

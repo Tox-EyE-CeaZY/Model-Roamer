@@ -10,6 +10,7 @@ import { isPop, isDesktop, popOut, setTitle, openExternal, native } from '../nat
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
 import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+import { runStep } from '../term.js';
 
 export default async function threadView(el, r, ctx) {
   return mountThread(el, r.id, { full: true, ctx });
@@ -38,7 +39,11 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, scroller, composer.el), sidebar));
 
   let messages = [], turns = [], activity = {}, hasMore = false;
-  const live = { turn: null, segments: [], cur: '', acts: [], started: 0 };
+  // shown: how much of the streamed text is on screen; it catches up word by word, so every agent's reply reads as it
+  // is written, whether the agent sends tokens (Claude, Gemini) or whole paragraphs (Codex). hold: a finished reply
+  // that is still being typed out, moved into the log when the typing reaches its end.
+  const live = { turn: null, segments: [], cur: '', acts: [], started: 0, shown: 0, hold: null };
+  const liveTarget = () => (live.hold ? live.hold.body : [...live.segments, live.cur].filter(Boolean).join('\n\n'));
 
   // ---------------------------------------------------------- header
   function drawHead() {
@@ -314,7 +319,12 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         const d = (t.decisions || []).find((x) => x.id === meta.decision.id) || meta.decision;
         return h('div', { class: 'sys-entry' }, ic('question', 14), h('div', {}, h('b', {}, 'Asked you: '), m.body, d.answer != null ? h('div', { class: 'answered' }, '→ ', (parseOpts(d.options)[d.answer] || {}).label || 'answered') : h('div', { class: 'faint small' }, 'Waiting for your answer above')));
       }
-      return h('div', { class: 'sys-entry' }, ic('info', 14), h('div', { class: 'md' }, ...mdNodes(m.body)), h('time', {}, clock(m.created_at)));
+      const fix = meta.action === 'signin' && meta.agent
+        ? h('div', { class: 'sys-acts' },
+          h('button', { class: 'btn xs', onclick: () => runStep({ what: 'login', agent: meta.agent, title: `Sign ${agentName(meta.agent)} in again` }).then((code) => code === 0 && act('retry')) }, ic('login', 12), 'Sign in again'),
+          h('button', { class: 'btn xs', onclick: () => act('retry') }, ic('refresh', 12), 'Retry'))
+        : null;
+      return h('div', { class: 'sys-entry' }, ic('info', 14), h('div', { class: 'md' }, ...mdNodes(m.body), fix), h('time', {}, clock(m.created_at)));
     }
     const isAgent = m.role === 'agent';
     const who = isAgent ? meta.agent || t.agent : null;
@@ -361,18 +371,20 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
 
   // ---------------------------------------------------------- live turn
   function drawLive() {
-    const on = !!t.running || !!live.turn;
+    const on = !!t.running || !!live.turn || !!live.hold;
     liveEl.hidden = !on;
     if (!on) return;
-    const text = [...live.segments, live.cur].filter(Boolean).join('\n\n');
+    const full = liveTarget();
+    const text = full.slice(0, live.shown);
+    if (live.shown < full.length) typeOn();
     const last = live.acts.slice(-1)[0];
     liveEl.replaceChildren(
       h('div', { class: 'live-h', style: { '--ah': agentHue(t.agent) } },
         h('i', { class: 'pulse' }), stamp(t.agent, { model: t.model, small: true }),
-        h('span', { class: 'live-what' }, last ? actLabel(last) : 'Thinking…'),
+        h('span', { class: 'live-what' }, last ? actLabel(last) : text ? 'Writing…' : 'Thinking…'),
         h('span', { class: 'live-time mono', dataset: { since: live.started || t.running?.started || Date.now() } }, ''),
         h('button', { class: 'btn xs danger', onclick: () => act('stop'), title: 'Stop (Ctrl+.)' }, 'Stop')),
-      text ? wireMd(h('div', { class: 'md live-text' }, ...mdNodes(text)), openExternal) : null,
+      text ? wireMd(h('div', { class: 'md live-text' + (live.shown < full.length ? ' typing' : '') }, ...mdNodes(text)), openExternal) : null,
       live.acts.length ? activityStrip(live.acts, true) : null);
     tick();
     if (nearBottom(220)) toBottom();
@@ -494,18 +506,27 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const d = ev.data || {};
     switch (ev.kind) {
       case 'message': {
+        const typingIt = d.role === 'agent' && !reduced && typeof d.body === 'string' && !messages.some((x) => x.id === d.id) && (live.turn || live.shown) && live.shown < d.body.length;
+        if (typingIt) {
+          // keep what is already on screen if the reply continues it, so typing carries on from there
+          if (!d.body.startsWith(liveTarget().slice(0, live.shown))) live.shown = 0;
+          live.hold = d;
+          drawLive();
+          break;
+        }
         if (!messages.some((x) => x.id === d.id)) messages.push(d);
         else messages = messages.map((x) => (x.id === d.id ? d : x));
         if (d.role === 'agent') {
           live.segments = [];
           live.cur = '';
+          live.shown = 0;
         }
         drawLog();
         drawLive();
         break;
       }
       case 'delta':
-        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: live.started || Date.now() });
+        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: live.started || Date.now(), shown: 0 });
         if (d.block != null) {
           live.segments.push(d.block);
           live.cur = '';
@@ -514,13 +535,14 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         break;
       case 'activity':
         (activity[d.turn_id] ||= []).push(d);
-        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now() });
+        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now(), shown: 0 });
         live.acts.push(d);
         drawLiveSoon();
         break;
       case 'turn':
         if (d.state === 'start') {
-          Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now() });
+          if (live.hold) finishHoldNow();
+          Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now(), shown: 0 });
           t.running = { turn: d.turn_id, started: Date.now() };
         } else {
           live.turn = null;
@@ -557,8 +579,43 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   });
   let liveTimer = 0;
   const drawLiveSoon = () => liveTimer || (liveTimer = requestAnimationFrame(() => ((liveTimer = 0), drawLive())));
+  // Reveal the next words: a few per frame, more when far behind, so a long block finishes in about a second.
+  let typeTimer = 0;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function typeOn() {
+    if (typeTimer) return;
+    typeTimer = requestAnimationFrame(() => {
+      typeTimer = 0;
+      const full = liveTarget();
+      if (live.shown > full.length) live.shown = full.length; // a block replaced the streamed text with a shorter one
+      const behind = full.length - live.shown;
+      if (behind <= 0) return finishHold();
+      let next = reduced ? full.length : live.shown + Math.max(3, Math.ceil(behind / 40));
+      const space = full.slice(next).search(/\s/); // end on a word boundary
+      next = space < 0 ? full.length : next + space;
+      live.shown = Math.min(full.length, next);
+      drawLive();
+      if (live.shown >= full.length) finishHold();
+    });
+  }
+  function finishHoldNow() {
+    if (live.hold) live.shown = live.hold.body.length;
+    finishHold();
+  }
+  function finishHold() {
+    if (!live.hold || live.shown < live.hold.body.length) return;
+    const m = live.hold;
+    live.hold = null;
+    live.segments = [];
+    live.cur = '';
+    live.shown = 0;
+    if (!messages.some((x) => x.id === m.id)) messages.push(m);
+    drawLog();
+    drawLive();
+  }
 
   async function refreshAll() {
+    Object.assign(live, { hold: null, shown: 0 }); // the reload brings every finished reply
     try {
       [messages] = await Promise.all([loadMessages(), loadActivity()]);
       t = await get('threads/' + id);

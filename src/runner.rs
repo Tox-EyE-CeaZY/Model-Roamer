@@ -59,6 +59,16 @@ fn note(core: &CoreRef, thread: &str, text: &str) {
     let _ = post(core, thread, "system", "Model Roamer", text, json!({}), false);
 }
 
+/// A failure that passes on its own: the CLI's sign-in token was being refreshed by another copy of it (Claude Code
+/// running elsewhere on this computer), or the service was briefly overloaded. Worth retrying after a pause.
+pub fn transient_error(e: &str) -> bool {
+    let l = e.to_lowercase();
+    (l.contains("refresh") && l.contains("oauth")) || l.contains("another claude code process") || l.contains("overloaded_error") || l.contains("\"overloaded\"")
+}
+
+/// Automatic retries of a transient failure before the turn is reported as failed, and the pause before each.
+const TRANSIENT_RETRIES: [u64; 3] = [8, 25, 60];
+
 /// Tell the project's lead something happened (a worker replied, a limit was hit, a decision was answered).
 pub fn wake_lead(core: &CoreRef, project: &str, body: &str, meta: Value) {
     match core.lead_thread(project) {
@@ -425,6 +435,8 @@ enum Outcome {
     Limited,
     Failed,
     RetryFresh,
+    /// A transient failure (see `transient_error`): try again after a pause, this many seconds.
+    RetryLater(u64),
 }
 
 async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<bool>) -> Result<()> {
@@ -679,6 +691,16 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             (l.contains("session") || l.contains("conversation") || l.contains("thread")) && (l.contains("not found") || l.contains("no conversation") || l.contains("invalid") || l.contains("does not exist") || l.contains("unable to resume") || l.contains("could not resume"))
         });
 
+    // a transient failure, unless the agent got real work done anyway (an error text alone doesn't count as a reply)
+    let transient = !cancelled
+        && limit.is_none()
+        && (errs.iter().chain(stderr_tail.iter()).any(|e| transient_error(e)) || (reply.len() < 600 && transient_error(&reply)))
+        && (reply.trim().is_empty() || transient_error(&reply));
+    let earlier_tries = if transient {
+        core.db.scalar_i64("SELECT COUNT(*) FROM turns WHERE thread_id = ?1 AND error LIKE 'Retrying:%' AND started_at > ?2", &[&thread, &(util::now_ms() - 30 * 60_000)])?
+    } else {
+        0
+    };
     let outcome = if cancelled {
         Outcome::Cancelled
     } else if let Some((until, msg)) = &limit {
@@ -689,6 +711,10 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         );
         core.bus.emit("limits", None, None, json!({ "agent": agent, "limit": core.limit_of(&agent) }));
         Outcome::Limited
+    } else if transient && (earlier_tries as usize) < TRANSIENT_RETRIES.len() {
+        Outcome::RetryLater(TRANSIENT_RETRIES[earlier_tries as usize])
+    } else if transient {
+        Outcome::Failed
     } else if session_failed {
         Outcome::RetryFresh
     } else if timed_out.is_some() || (reply.trim().is_empty() && (exit.unwrap_or(1) != 0 || !errs.is_empty())) {
@@ -701,11 +727,13 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         Outcome::Done => "done",
         Outcome::Cancelled => "cancelled",
         Outcome::Limited => "limited",
-        Outcome::Failed | Outcome::RetryFresh => "failed",
+        Outcome::Failed | Outcome::RetryFresh | Outcome::RetryLater(_) => "failed",
     };
     let ended = util::now_ms();
     let err_s = match outcome {
+        Outcome::Failed if transient => errs.iter().chain(stderr_tail.iter()).find(|e| transient_error(e)).cloned().unwrap_or_else(|| reply.trim().to_string()),
         Outcome::Failed => timed_out.clone().or_else(|| errs.last().cloned()).or_else(|| stderr_tail.last().cloned()).unwrap_or_else(|| format!("exited with {exit:?}")),
+        Outcome::RetryLater(_) => format!("Retrying: {}", errs.iter().chain(stderr_tail.iter()).find(|e| transient_error(e)).cloned().unwrap_or_else(|| reply.trim().to_string())),
         Outcome::Limited => limit.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
         _ => String::new(),
     };
@@ -722,6 +750,21 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     let is_worker = matches!(t["kind"].as_str(), Some("worker" | "review"));
     match outcome {
         Outcome::Cancelled => Ok(()),
+        Outcome::RetryLater(secs) => {
+            let name = adapter.info().name;
+            note(core, thread, &format!("{name} was busy (another copy of it was refreshing its sign-in, or the service was overloaded). Trying again in {secs} seconds."));
+            requeue(core, &input_ids);
+            core.set_status(thread, "idle", &format!("Retrying in {secs}s"))?;
+            let (core2, th) = (core.clone(), thread.to_string());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                // only if nothing else picked the thread up in the meantime (the person retried, moved or stopped it)
+                if core2.thread(&th).map(|t| t["status"] == "idle").unwrap_or(false) {
+                    schedule(&core2, &th);
+                }
+            });
+            Ok(())
+        }
         Outcome::RetryFresh => {
             note(core, thread, &format!("{agent} couldn't resume its earlier session, so it starts fresh with the thread's history."));
             core.set_thread(thread, &json!({ "session_id": "", "session_agent": "" }))?;
@@ -755,12 +798,16 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         }
         Outcome::Failed => {
             let detail = clip(&err_s, 1500);
-            let hint = if stderr_tail.iter().chain(errs.iter()).any(|e| { let l = e.to_lowercase(); l.contains("login") || l.contains("log in") || l.contains("sign in") || l.contains("unauthorized") || l.contains("authenticat") }) {
+            let hint = if transient {
+                format!(" It kept failing after {} tries. If Claude Code is open somewhere else on this computer, close it; otherwise sign {} in again.", TRANSIENT_RETRIES.len() + 1, adapter.info().name)
+            } else if stderr_tail.iter().chain(errs.iter()).any(|e| { let l = e.to_lowercase(); l.contains("login") || l.contains("log in") || l.contains("sign in") || l.contains("unauthorized") || l.contains("authenticat") }) {
                 format!(" It looks like {} needs to sign in again: open Agents and choose Sign in.", adapter.info().name)
             } else {
                 String::new()
             };
-            note(core, thread, &format!("The turn failed: {detail}.{hint} Choose Retry to run it again, or move the thread to another agent."));
+            let text = format!("The turn failed: {detail}.{hint} Choose Retry to run it again, or move the thread to another agent.");
+            let meta = if transient || !hint.is_empty() { json!({ "action": "signin", "agent": agent }) } else { json!({}) };
+            let _ = post(core, thread, "system", "Model Roamer", &text, meta, false);
             core.set_status(thread, "failed", &clip(&detail, 160))?;
             if is_worker {
                 if let Some(p) = &pid {
@@ -1108,5 +1155,15 @@ pub async fn watch_limits(core: CoreRef) {
                 schedule(&core, id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn spots_transient_failures() {
+        assert!(super::transient_error("Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh."));
+        assert!(super::transient_error(r#"API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}"#));
+        assert!(!super::transient_error("Invalid API key · Please run /login"));
     }
 }

@@ -99,6 +99,15 @@ impl AgentAdapter for Codex {
                 let done = ty == "item.completed";
                 match it["type"].as_str().or(it["item_type"].as_str()).unwrap_or("") {
                     "agent_message" | "assistant_message" if done => out.push(AgentEvent::Text(s(&it["text"]))),
+                    // partial text, when this Codex sends it: pass on only what is new since the last update
+                    "agent_message" | "assistant_message" => {
+                        let text = s(&it["text"]);
+                        let seen = st["typed"][&id].as_u64().unwrap_or(0) as usize;
+                        if text.len() > seen && text.is_char_boundary(seen) {
+                            out.push(AgentEvent::Delta(text[seen..].to_string()));
+                            st["typed"][&id] = json!(text.len());
+                        }
+                    }
                     "reasoning" if done => out.push(AgentEvent::Thinking(s(&it["text"]))),
                     "command_execution" => {
                         if ty == "item.started" {
@@ -210,6 +219,18 @@ impl AgentAdapter for Codex {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streams_message_updates() {
+        let c = Codex;
+        let mut st = serde_json::json!({});
+        let a = c.parse(r#"{"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"Hel"}}"#, &mut st);
+        let b = c.parse(r#"{"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"Hello there"}}"#, &mut st);
+        let d = c.parse(r#"{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"Hello there"}}"#, &mut st);
+        assert!(matches!(&a[0], AgentEvent::Delta(t) if t == "Hel"));
+        assert!(matches!(&b[0], AgentEvent::Delta(t) if t == "lo there"));
+        assert!(matches!(&d[0], AgentEvent::Text(t) if t == "Hello there"));
+    }
+
     use super::*;
     #[test]
     fn parses_jsonl() {

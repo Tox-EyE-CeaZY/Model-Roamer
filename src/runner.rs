@@ -53,7 +53,19 @@ pub fn post(core: &CoreRef, thread: &str, role: &str, author: &str, body: &str, 
     let m = core.db.one("SELECT * FROM messages WHERE id = ?1", &[&id])?.unwrap_or_default();
     core.bus.emit("message", t["project_id"].as_str(), Some(thread), m.clone());
     if wake {
-        schedule(core, thread);
+        let secs = core.settings()["wake_batch_secs"].as_u64().unwrap_or(45);
+        let automatic = role == "wake" && t["kind"] == "lead";
+        let idle = !core.running.lock().unwrap_or_else(|p| p.into_inner()).contains_key(thread);
+        if automatic && idle && secs > 0 {
+            // a turn re-reads the whole conversation, so let nearby events pile up and read them together
+            let (c, th) = (core.clone(), thread.to_string());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                schedule(&c, &th);
+            });
+        } else {
+            schedule(core, thread);
+        }
     }
     Ok(m)
 }

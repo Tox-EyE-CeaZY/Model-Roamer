@@ -118,9 +118,9 @@ export function chatPick() {
   const a = S.settings.default_lead || 'claude';
   return { agent: a, model: S.settings.default_lead_model ?? S.agents[a]?.config?.model ?? '' };
 }
-export function rememberChatPick(agent, model) {
+export function rememberChatPick(agent, model, effort = '') {
   try {
-    sessionStorage.setItem('mr-chat-pick', JSON.stringify({ agent, model }));
+    sessionStorage.setItem('mr-chat-pick', JSON.stringify({ agent, model, effort }));
   } catch { /* private window */ }
 }
 

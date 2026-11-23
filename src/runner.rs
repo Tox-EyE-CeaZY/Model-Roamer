@@ -103,6 +103,8 @@ pub struct NewWorker {
     pub agent: String,
     pub task_kind: String,
     pub model: String,
+    /// Thinking strength for this thread ("" = the agent's setting)
+    pub effort: String,
     pub workspace: String,
     pub depends_on: Vec<String>,
     pub parent: Option<String>,
@@ -145,6 +147,9 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     )?;
     if let Some(b) = &buddy {
         core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
+    }
+    if !w.effort.is_empty() && buddy.is_none() {
+        core.db.exec("UPDATE threads SET effort = ?1 WHERE id = ?2", &[&w.effort, &id])?;
     }
     let t = core.thread(&id)?;
     core.bus.emit("thread", Some(&pid_s), Some(&id), t.clone());
@@ -781,7 +786,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         session: session.clone(),
         cwd: workspace.clone(),
         model: model.clone(),
-        effort: cfg["effort"].as_str().unwrap_or("").to_string(),
+        effort: t["effort"].as_str().filter(|e| !e.is_empty()).or(cfg["effort"].as_str()).unwrap_or("").to_string(),
         autonomy: Autonomy::parse(cfg["autonomy"].as_str().unwrap_or("full")),
         mcp: Some(mcp.clone()),
         extra_dirs,
@@ -1198,6 +1203,11 @@ fn requeue(core: &CoreRef, ids: &[String]) {
 
 // ------------------------------------------------------------------------------------------------ controls
 
+/// Whether the thread has a turn running right now.
+pub fn turn_active(core: &CoreRef, thread: &str) -> bool {
+    core.running.lock().map(|r| r.get(thread).is_some_and(|x| !x.turn_id.is_empty())).unwrap_or(false)
+}
+
 pub async fn cancel(core: &CoreRef, thread: &str, status: &str, reason: &str) {
     let _ = core.set_status(thread, status, reason);
     let tx = core.running.lock().ok().and_then(|r| r.get(thread).map(|x| x.cancel.clone()));
@@ -1382,6 +1392,7 @@ pub async fn request_review(core: &CoreRef, target: &Value, agent: &str, focus: 
             agent: reviewer,
             task_kind: "review".into(),
             model: String::new(),
+            effort: String::new(),
             workspace: ws,
             depends_on: vec![],
             parent: Some(lead_thread.to_string()),
@@ -1474,10 +1485,34 @@ pub fn recover(core: &CoreRef) {
     }
 }
 
+/// Parked threads (kept idle by the lead) that nobody has touched for `idle_close_hours` are closed. Their session
+/// and worktree stay, so the lead can bring one back with `reopen_thread`.
+async fn close_idle_parked(core: &CoreRef) {
+    let hours = core.settings()["idle_close_hours"].as_i64().unwrap_or(24);
+    if hours <= 0 {
+        return;
+    }
+    let cutoff = util::now_ms() - hours * 3_600_000;
+    let rows = core
+        .db
+        .all("SELECT id FROM threads WHERE parked_at IS NOT NULL AND resolved = 0 AND deleted_at IS NULL AND status = 'idle' AND updated_at < ?1", &[&cutoff])
+        .unwrap_or_default();
+    for r in rows {
+        let id = r["id"].as_str().unwrap_or("");
+        if core.db.scalar_i64("SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND pending = 1", &[&id]).unwrap_or(0) > 0 || turn_active(core, id) {
+            continue;
+        }
+        if resolve(core, id, true).await.is_ok() {
+            note(core, id, &format!("Closed after {hours} hours unused. The lead can reopen it."));
+        }
+    }
+}
+
 /// Every minute: threads waiting on a usage limit start again once it resets.
 pub async fn watch_limits(core: CoreRef) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
+        close_idle_parked(&core).await;
         let limited = core.db.all("SELECT id, agent, project_id FROM threads WHERE status = 'limited' AND deleted_at IS NULL", &[]).unwrap_or_default();
         for t in limited {
             let agent = t["agent"].as_str().unwrap_or("");

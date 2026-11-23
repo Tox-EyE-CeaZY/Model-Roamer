@@ -11,7 +11,7 @@ import { dialog, toast, showMenu } from '../ui.js';
 import { mountThread, decisionCard } from './thread.js';
 import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, agentOptions, modelOptions, pickFolder, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 
-const TABS = [['', 'Board', 'board'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
+const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
 
 export default async function projectView(el, r, ctx) {
   let p;
@@ -34,7 +34,7 @@ export default async function projectView(el, r, ctx) {
       h('div', { class: 'p-title' },
         h('i', { class: 'p-sw' }),
         h('h1', {}, p.name),
-        stamp(p.lead_agent, { model: p.lead_model, lead: true }),
+        h('span', { class: 'p-sub mono', title: p.home }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', {}, where), p.base_branch ? [h('span', { class: 'faint' }, '·'), h('span', {}, p.base_branch)] : null),
         h('span', { class: 'grow' }),
         h('button', { class: 'btn primary sm', onclick: () => newThreadDialog(p.id) }, ic('plus', 13), 'New thread'),
         h('button', { class: 'ibtn', title: 'More', onclick: (e) => {
@@ -48,7 +48,6 @@ export default async function projectView(el, r, ctx) {
             { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
           ], b.right, b.bottom + 4, { anchor: e.currentTarget });
         }, html: icon('more', 16) })),
-      h('div', { class: 'p-sub mono' }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', { title: p.home }, where), p.base_branch ? [h('span', { class: 'faint' }, '·'), h('span', {}, p.base_branch)] : null),
       h('nav', { class: 'p-tabs' }, TABS.map(([k, label, ico]) => h('a', { class: 'p-tab' + (k === tab ? ' on' : ''), href: '#/p/' + p.id + (k ? '/' + k : '') }, ic(ico, 14), label))));
   }
   drawHead();
@@ -61,6 +60,7 @@ export default async function projectView(el, r, ctx) {
   });
   let inner = null;
   if (tab === '') inner = await board(body, p, r, ctx);
+  else if (tab === 'files') inner = await (await import('./files.js')).default(body, p, r);
   else if (tab === 'git') inner = await gitTab(body, p);
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
@@ -177,7 +177,7 @@ async function board(el, p, r, ctx) {
       }));
     }
     const claims = p.claims || [];
-    claimsEl.replaceChildren(claims.length ? [kicker('Claimed files', h('small', { class: 'faint' }, 'so agents stay out of each other’s way')), h('div', { class: 'claims' }, claims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent)))))] : []);
+    claimsEl.replaceChildren(...(claims.length ? [kicker('Claimed files', h('small', { class: 'faint' }, 'so agents stay out of each other’s way')), h('div', { class: 'claims' }, claims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent)))))] : []));
   }
 
   // A thread opened from the board sits beside the project chat, in place of the board; the address carries it
@@ -241,9 +241,9 @@ export async function newThreadDialog(projectId) {
     check: async () => {
       if (!title.value.trim()) return 'Give it a title.';
       if (!instr.value.trim()) return 'Say what the agent should do.';
-      const { agent: a, model: m } = pick.get();
+      const { agent: a, model: m, effort: ef } = pick.get();
       try {
-        made = await post(`projects/${projectId}/workers`, { title: title.value.trim(), instructions: instr.value, criteria: crit.value, task_kind: kinds.value, agent: a, model: m, workspace: wsv });
+        made = await post(`projects/${projectId}/workers`, { title: title.value.trim(), instructions: instr.value, criteria: crit.value, task_kind: kinds.value, agent: a, model: m, effort: ef, workspace: wsv });
       } catch (e) {
         return e.message;
       }

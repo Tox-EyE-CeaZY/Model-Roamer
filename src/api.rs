@@ -49,6 +49,8 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/projects/{id}/restore", post(restore_project))
         .route("/api/projects/{id}/threads", get(project_threads))
         .route("/api/projects/{id}/git", get(project_git))
+        .route("/api/projects/{id}/files", get(crate::files::list))
+        .route("/api/projects/{id}/file", get(crate::files::read))
         .route("/api/projects/{id}/prs", get(project_prs))
         .route("/api/projects/{id}/prs/{number}/merge", post(project_pr_merge))
         .route("/api/projects/{id}/workers", post(new_worker))
@@ -533,6 +535,7 @@ async fn new_worker(State(core): State<CoreRef>, Path(id): Path<String>, Json(b)
             agent: s(&b, "agent"),
             task_kind: s(&b, "task_kind"),
             model: s(&b, "model"),
+            effort: s(&b, "effort"),
             workspace: s(&b, "workspace"),
             depends_on: vec![],
             parent: lead["id"].as_str().map(str::to_string),
@@ -562,7 +565,10 @@ async fn list_threads(State(core): State<CoreRef>, q: Q) -> R {
 async fn create_chat(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
     let agent = if s(&b, "agent").is_empty() { core.settings()["default_lead"].as_str().unwrap_or("claude").to_string() } else { s(&b, "agent") };
     let model = if b.get("model").is_some() { s(&b, "model") } else { core.agent_cfg(&agent)["model"].as_str().unwrap_or("").to_string() };
-    let t = runner::create_chat(&core, &agent, &model, &s(&b, "title"), &s(&b, "folder"))?;
+    let mut t = runner::create_chat(&core, &agent, &model, &s(&b, "title"), &s(&b, "folder"))?;
+    if !s(&b, "effort").is_empty() && !agent.starts_with("buddy:") {
+        t = core.set_thread(t["id"].as_str().unwrap_or(""), &json!({ "effort": s(&b, "effort") }))?;
+    }
     let text = s(&b, "text");
     if !text.is_empty() {
         runner::post(&core, t["id"].as_str().unwrap_or(""), "user", "You", &text, json!({ "files": b["files"] }), true)?;
@@ -589,7 +595,7 @@ async fn get_thread(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
 
 async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
     let mut f = serde_json::Map::new();
-    for k in ["title", "pinned", "unread", "instructions", "criteria", "model"] {
+    for k in ["title", "pinned", "unread", "instructions", "criteria", "model", "effort"] {
         if let Some(v) = b.get(k) {
             f.insert(k.into(), v.clone());
         }
@@ -628,6 +634,8 @@ async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(
             return Err(bad("Wait for this turn to finish (or stop it) before switching agents."));
         }
         f.insert("agent".into(), json!(a));
+        // another agent has other effort levels: back to its default unless the person chose one
+        f.entry("effort").or_insert(json!(""));
         f.insert("session_id".into(), json!(""));
         f.insert("session_agent".into(), json!(""));
         if !f.contains_key("model") {
@@ -776,6 +784,7 @@ async fn thread_action(State(core): State<CoreRef>, Path(id): Path<String>, Json
         "resolve" => runner::resolve(&core, &id, true).await?,
         "reopen" => {
             runner::resolve(&core, &id, false).await?;
+            core.set_thread(&id, &json!({ "parked_at": serde_json::Value::Null }))?;
             core.set_status(&id, "idle", "")?;
         }
         "reassign" => runner::reassign(&core, &id, &s(&b, "agent"), &s(&b, "model"), &s(&b, "note")).await?,

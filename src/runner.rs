@@ -1099,9 +1099,13 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                 } else {
                     let mut out = String::from("<tool-results>\n");
                     for (name, args) in calls {
-                        let res = match tools::call(core, &core.thread(thread)?, &name, &args).await {
-                            Ok(r) => r,
-                            Err(e) => format!("Error: {e}"),
+                        let res = if args.get("_raw").is_some() {
+                            format!("Error: the arguments of this call weren't valid JSON, so it did not run. Send it again with a single JSON object as the body, for example <roamer-tool name=\"{name}\">{{\"text\": \"...\"}}</roamer-tool>.")
+                        } else {
+                            match tools::call(core, &core.thread(thread)?, &name, &args).await {
+                                Ok(r) => r,
+                                Err(e) => format!("Error: {e}"),
+                            }
                         };
                         add_activity(core, &t, &turn_id, "tool", &format!("roamer:{name}"), &args.to_string());
                         out.push_str(&format!("<result tool=\"{name}\">\n{}\n</result>\n", clip(&res, 30_000)));

@@ -601,14 +601,28 @@ async fn repo_of(core: &CoreRef, project: Option<&str>) -> Result<(String, Strin
 // ------------------------------------------------------------------------------------------------ text protocol
 /// For agents without MCP: `<roamer-tool name="spawn_thread">{"title": "..."}</roamer-tool>` blocks in a reply.
 pub fn text_calls(reply: &str) -> (String, Vec<(String, Value)>) {
-    let re = regex::Regex::new(r#"(?s)<roamer-tool\s+name="([a-z_]+)"\s*>(.*?)</roamer-tool>"#).unwrap();
+    // Be forgiving: single or double quotes, spaces around `=`, a `roamer:` / `mcp__roamer__` prefix on the name,
+    // and a self-closing block with no arguments.
+    let re = regex::Regex::new(r#"(?s)<roamer-tool\s+name\s*=\s*["']([A-Za-z0-9_:.\-]+)["']\s*(?:/>|>(.*?)</roamer-tool\s*>)"#).unwrap();
     let mut calls = vec![];
     for c in re.captures_iter(reply) {
-        let body = c[2].trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-        let args = if body.is_empty() { json!({}) } else { serde_json::from_str(body).unwrap_or_else(|_| json!({ "_raw": body })) };
-        calls.push((c[1].to_string(), args));
+        let name = c[1].rsplit(|ch| ch == ':' || ch == '.').next().unwrap_or("").trim_start_matches("mcp__roamer__").trim_start_matches("roamer__").to_lowercase().replace('-', "_");
+        let body = c.get(2).map(|m| m.as_str()).unwrap_or("").trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let args = if body.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(body)
+                .or_else(|_| serde_json::from_str(&strip_trailing_commas(body)))
+                .unwrap_or_else(|_| json!({ "_raw": body }))
+        };
+        calls.push((name, args));
     }
     (re.replace_all(reply, "").trim().to_string(), calls)
+}
+
+/// `{"a": 1,}` and `[1, 2,]` are common slips in hand-written JSON.
+fn strip_trailing_commas(s: &str) -> String {
+    regex::Regex::new(r",\s*([}\]])").unwrap().replace_all(s, "$1").into_owned()
 }
 
 pub const TEXT_PROTOCOL: &str = r#"## Calling Model Roamer tools without native tool calls
@@ -619,8 +633,11 @@ reply (JSON arguments, one block per call):
 <roamer-tool name="read_memory">{}</roamer-tool>
 <roamer-tool name="spawn_thread">{"title": "Build the settings page", "instructions": "...", "agent": "antigravity"}</roamer-tool>
 
-Model Roamer runs them when your turn ends and sends the results back to you in a new turn. Text outside the blocks
-is your reply. Only use this when the native tools are missing."#;
+Model Roamer runs them when your turn ends (not while you are still writing) and sends the results back to you in a
+new turn. Text outside the blocks is your reply. Rules that keep calls from failing: the tag is exactly
+`<roamer-tool name="tool_name">`, the body is one valid JSON object (double quotes, no comments), and the name is
+the bare tool name from the list above. If a call's arguments can't be read you get an error back and can try
+again. Only use this when the native tools are missing."#;
 
 /// A title as the person will see it in a list: one line, no wrapping quotes or trailing period, at most 60 characters.
 fn clean_title(raw: &str) -> String {
@@ -644,6 +661,14 @@ mod tests {
         assert_eq!(rest, "Hi\n\nbye");
         assert_eq!(calls[0].0, "read_memory");
         assert_eq!(calls[0].1["name"], "plan");
+    }
+    #[test]
+    fn text_calls_are_forgiving() {
+        let (rest, calls) = text_calls("<roamer-tool name='mcp__roamer__message_lead'>{\"text\": \"hi\",}</roamer-tool> <roamer-tool name = \"roamer:read_memory\" />");
+        assert!(rest.trim().is_empty());
+        assert_eq!(calls[0].0, "message_lead");
+        assert_eq!(calls[0].1["text"], "hi");
+        assert_eq!(calls[1].0, "read_memory");
     }
     #[test]
     fn overlap_rules() {

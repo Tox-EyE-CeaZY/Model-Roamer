@@ -873,3 +873,20 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
   .fl-split:has(.fl-view:not([hidden])) { grid-template-columns: 1fr; }
   .fl-view { position: fixed; inset: 56px 0 56px; z-index: 30; margin: 0; background: var(--bg); }
 }
+
+/* usage: plan limits (the status bar's figures, for screens without one) */
+.plans { display: grid; gap: 10px; margin-bottom: 14px; }
+.plan-row { display: grid; grid-template-columns: 130px minmax(0, 1fr) minmax(0, 1fr); gap: 6px 18px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+.plan-row:first-of-type { border-top: 0; }
+.plan-n { color: var(--m); font-family: var(--f-display); }
+.plan-w { display: grid; grid-template-columns: 54px auto 66px; gap: 8px; align-items: center; font-size: 12px; }
+.plan-w small { grid-column: 2 / -1; margin-top: -2px; }
+.plan-w.hot b { color: var(--hot); }
+.plan-w .sb-m-bar { --m: oklch(.72 .16 var(--ah)); display: block; }
+.plan-l { font: 600 10.5px var(--f-mono); text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+.plan-f { grid-column: 1 / -1; }
+@media (max-width: 720px) {
+  .plan-row { grid-template-columns: 1fr; }
+  .plan-w .sb-m-bar.wide { width: 100%; }
+  .plan-w { grid-template-columns: 54px minmax(0, 1fr) 66px; }
+}

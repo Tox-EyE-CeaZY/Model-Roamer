@@ -4,7 +4,7 @@
 import { h, ago } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen } from '../api.js';
-import { S, watch, agentName, agentHue, project as projectOf } from '../store.js';
+import { S, watch, agentName, agentHue, project as projectOf, addRef } from '../store.js';
 import { go, back, openThread, deleteProject } from '../app.js';
 import { popOut, setTitle, openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
@@ -139,6 +139,7 @@ async function board(el, p, r, ctx) {
       { label: 'Open beside the chat', icon: 'thread', run: () => peek(t.id) },
       { label: 'Open full view', icon: 'fullscreen', run: () => go('#/t/' + t.id) },
       { label: 'Open in its own window', icon: 'popout', run: () => openThread(t.id, { pop: true }) },
+      { label: 'Reference in the lead chat', icon: 'chat', run: () => { addRef(p.lead.id, t); toast('Added to your next message to the lead'); } },
       { sep: true },
       t.running ? { label: 'Pause', icon: 'pause', run: () => a('pause') } : null,
       t.running ? { label: 'Stop', icon: 'stop', run: () => a('stop') } : null,

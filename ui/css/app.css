@@ -907,3 +907,4 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
 .av-quote { margin: 0; padding: 4px 0 4px 10px; border-left: 3px solid var(--accent); color: var(--dim); font-size: 12.5px; max-height: 84px; overflow: auto; white-space: pre-wrap; }
 .av-frame.av-pick .md p, .av-frame.av-pick .md li, .av-frame.av-pick .md h1, .av-frame.av-pick .md h2, .av-frame.av-pick .md h3, .av-frame.av-pick .md pre { cursor: crosshair; }
 .av-frame.av-pick .md p:hover, .av-frame.av-pick .md li:hover, .av-frame.av-pick .md h1:hover, .av-frame.av-pick .md h2:hover, .av-frame.av-pick .md h3:hover, .av-frame.av-pick .md pre:hover { outline: 2px solid var(--accent); }
+.file-chip.ref { border-color: var(--accent); }

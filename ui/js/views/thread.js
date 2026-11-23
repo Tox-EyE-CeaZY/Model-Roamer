@@ -4,7 +4,7 @@
 import { h, ago, clock, dayLabel, dur, num, bytes } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen, upload } from '../api.js';
-import { S, watch, agentName, agentHue, project as projectOf, rememberChatPick } from '../store.js';
+import { S, watch, agentName, agentHue, project as projectOf, rememberChatPick, watchRefs, takeRefs } from '../store.js';
 import { go, back, openThread } from '../app.js';
 import { isPop, isDesktop, popOut, setTitle, openExternal, native } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
@@ -39,6 +39,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   const log = h('div', { class: 'th-log' });
   const liveEl = h('div', { class: 'th-live', hidden: true });
   const scroller = h('div', { class: 'th-scroll' }, h('div', { class: 'th-inner' }, log, liveEl));
+  const composerStops = [];
   const composer = makeComposer();
   const sidebar = full ? h('aside', { class: 'th-side' }) : null;
   el.classList.add('thread', compact ? 'compact' : 'full');
@@ -521,7 +522,15 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const ta = h('textarea', { class: 'cmp-in', rows: 1, placeholder: placeholderFor(), spellcheck: 'true' });
     const files = [];
     const chips = h('div', { class: 'cmp-files' });
-    const drawChips = () => chips.replaceChildren(...files.map((f, i) => h('span', { class: 'file-chip' + (f.path ? '' : ' up') }, ic('clip', 12), f.name, h('small', {}, f.path ? bytes(f.size) : 'uploading…'), h('button', { title: 'Remove', onclick: () => (files.splice(i, 1), drawChips()), html: icon('close', 11) }))));
+    // threads the person pointed at: they go to the lead with the message (title, state and latest summary)
+    const refs = [];
+    const refChips = () => refs.map((r, i) => h('span', { class: 'file-chip ref', title: r.note || r.title }, ic('thread', 12), r.title, h('small', {}, r.status), h('button', { title: 'Remove', onclick: () => (refs.splice(i, 1), drawChips()), html: icon('close', 11) })));
+    const addRefs = (list) => {
+      for (const r of list) if (r.id !== id && !refs.some((x) => x.id === r.id)) refs.push(r);
+      drawChips();
+      ta.focus();
+    };
+    const drawChips = () => chips.replaceChildren(...refChips(), ...files.map((f, i) => h('span', { class: 'file-chip' + (f.path ? '' : ' up') }, ic('clip', 12), f.name, h('small', {}, f.path ? bytes(f.size) : 'uploading…'), h('button', { title: 'Remove', onclick: () => (files.splice(i, 1), drawChips()), html: icon('close', 11) }))));
     const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: () => (addFiles([...fileIn.files]), (fileIn.value = '')) });
     async function addFiles(list) {
       for (const f of list) {
@@ -537,15 +546,33 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         drawChips();
       }
     }
+    async function pickThread(anchor) {
+      let list = [];
+      try {
+        list = await get('projects/' + t.project_id + '/threads');
+      } catch (e) {
+        return toast(e.message, { err: true });
+      }
+      list = list.filter((x) => x.id !== id && x.kind !== 'lead' && !refs.some((r) => r.id === x.id));
+      const r = anchor.getBoundingClientRect();
+      if (!list.length) return toast('No other threads to reference yet');
+      showMenu([
+        { header: 'Reference a thread' },
+        ...list.slice(0, 30).map((x) => ({ label: x.title, title: x.status, icon: 'thread', run: () => addRefs([{ id: x.id, title: x.title, agent: x.agent, status: x.status, note: (x.status_note || x.last_body || '').replace(/[#*_`>]/g, '').slice(0, 400) }]) })),
+      ], r.left, r.top - 4, { anchor });
+    }
+    const refBtn = t.kind === 'lead' ? h('button', { class: 'ibtn', title: 'Reference a thread (or type @)', onclick: (e) => pickThread(e.currentTarget), html: icon('thread', 17) }) : null;
     const stepsBtn = h('button', { class: 'cmp-steps', type: 'button', title: 'How this chat shows the agent’s steps', onclick: (e) => stepsMenu(e.currentTarget) });
     const sendBtn = h('button', { class: 'cmp-send', title: 'Send (Enter)', onclick: () => go_(), html: icon('send', 17) });
     async function go_() {
       const text = ta.value.trim();
       if (files.some((f) => !f.path)) return toast('Wait for the attachments to finish uploading');
-      if (!text && !files.length) return ta.focus();
-      const sent = { text, files: files.map((f) => f.path) };
+      if (!text && !files.length && !refs.length) return ta.focus();
+      const refText = refs.map((r) => `Referenced thread: "${r.title}" (id ${r.id}, ${r.agent}, ${r.status})${r.note ? '\n> ' + r.note.replace(/\n+/g, ' ') : ''}`).join('\n\n');
+      const sent = { text: [text, refText].filter(Boolean).join('\n\n'), files: files.map((f) => f.path) };
       ta.value = '';
       files.length = 0;
+      refs.length = 0;
       drawChips();
       grow();
       try {
@@ -561,6 +588,11 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       ta.style.height = Math.min(ta.scrollHeight, 280) + 'px';
     };
     ta.oninput = () => {
+      // typing @ on its own opens the thread picker
+      if (refBtn && /(^|\s)@$/.test(ta.value)) {
+        ta.value = ta.value.slice(0, -1);
+        pickThread(refBtn);
+      }
       grow();
       try {
         localStorage.setItem('mr-draft-' + id, ta.value);
@@ -585,10 +617,16 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const el = h('div', { class: 'composer cut', ondragover: (e) => (e.preventDefault(), el.classList.add('drop')), ondragleave: () => el.classList.remove('drop'), ondrop: (e) => (e.preventDefault(), el.classList.remove('drop'), addFiles([...e.dataTransfer.files])) },
       chips,
       h('div', { class: 'cmp-row' },
-        h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn,
+        h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn, refBtn,
         ta, sendBtn),
       h('div', { class: 'cmp-hint mono' }, t.kind === 'chat' ? chatPicker() : null, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' }), stepsBtn));
     setTimeout(grow);
+    // threads sent here from a card's menu ("Reference in the lead chat"), now or while this was closed
+    if (t.kind === 'lead') {
+      addRefs(takeRefs(id));
+      const stop = watchRefs((cid) => cid === id && addRefs(takeRefs(id)));
+      composerStops.push(stop);
+    }
     return { el, ta, focus: () => ta.focus(), stepsBtn };
   }
   /** A chat's agent and model, changeable any time; the choice carries over to new chats until the app restarts. */
@@ -852,6 +890,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   return () => {
     unlisten();
     unwatchSteps();
+    composerStops.forEach((f) => f());
     clearInterval(ticker);
     document.removeEventListener('keydown', keys);
   };

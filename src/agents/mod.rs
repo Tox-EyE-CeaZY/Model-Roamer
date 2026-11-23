@@ -92,6 +92,9 @@ pub struct TurnSpec {
     pub extra_args: Vec<String>,
     /// Running on a server with no one at its screen (sign-in pages can't open there).
     pub headless: bool,
+    /// The project's lead: it coordinates and hands all work to threads, so it gets no file-editing or shell tools
+    /// where the CLI can switch them off.
+    pub lead: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

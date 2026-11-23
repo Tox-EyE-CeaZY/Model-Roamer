@@ -5,7 +5,7 @@ import { h, ago } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen } from '../api.js';
 import { S, watch, agentName, agentHue, project as projectOf } from '../store.js';
-import { go, openThread, deleteProject } from '../app.js';
+import { go, back, openThread, deleteProject } from '../app.js';
 import { popOut, setTitle, openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { mountThread, decisionCard } from './thread.js';
@@ -60,7 +60,7 @@ export default async function projectView(el, r, ctx) {
     }
   });
   let inner = null;
-  if (tab === '') inner = await board(body, p);
+  if (tab === '') inner = await board(body, p, r, ctx);
   else if (tab === 'git') inner = await gitTab(body, p);
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
@@ -76,12 +76,14 @@ const LANES = [
   ['done', 'Done', (t) => !t.running && (t.resolved || t.status === 'done')],
 ];
 
-async function board(el, p) {
+async function board(el, p, r, ctx) {
   const leadBox = h('div', { class: 'b-lead' });
   const lanes = h('div', { class: 'b-lanes' });
   const decisions = h('div', { class: 'b-decisions' });
   const claimsEl = h('div', { class: 'b-claims' });
-  const split = h('div', { class: 'board' }, leadBox, h('div', { class: 'b-right' }, decisions, lanes, claimsEl));
+  const boardEl = h('div', { class: 'b-right' }, decisions, lanes, claimsEl);
+  const peekEl = h('div', { class: 'b-peek', hidden: true });
+  const split = h('div', { class: 'board' }, leadBox, boardEl, peekEl);
   el.append(split);
   let threads = [], doneOpen = false;
   try {
@@ -115,8 +117,8 @@ async function board(el, p) {
       class: 'tcard cut' + (t.unread ? ' unread' : '') + (t.running ? ' running' : ''),
       style: { '--ah': agentHue(t.agent) },
       tabindex: '0',
-      onclick: (e) => !e.target.closest('button') && openThread(t.id),
-      onkeydown: (e) => e.key === 'Enter' && openThread(t.id),
+      onclick: (e) => !e.target.closest('button') && peek(t.id),
+      onkeydown: (e) => e.key === 'Enter' && peek(t.id),
       onauxclick: (e) => e.button === 1 && openThread(t.id, { pop: true }),
       oncontextmenu: (e) => (e.preventDefault(), cardMenu(t, e.clientX, e.clientY)),
     },
@@ -134,7 +136,8 @@ async function board(el, p) {
   function cardMenu(t, x, y) {
     const a = (action) => post(`threads/${t.id}/action`, { action }).then(load).catch((e) => toast(e.message, { err: true }));
     showMenu([
-      { label: 'Open', icon: 'thread', run: () => openThread(t.id, { pop: false }) },
+      { label: 'Open beside the chat', icon: 'thread', run: () => peek(t.id) },
+      { label: 'Open full view', icon: 'fullscreen', run: () => go('#/t/' + t.id) },
       { label: 'Open in its own window', icon: 'popout', run: () => openThread(t.id, { pop: true }) },
       { sep: true },
       t.running ? { label: 'Pause', icon: 'pause', run: () => a('pause') } : null,
@@ -153,7 +156,7 @@ async function board(el, p) {
 
   function draw() {
     decisions.replaceChildren(...(p.decisions || []).map((d) => h('div', { class: 'b-dec' },
-      h('button', { class: 'linkbtn small', onclick: () => openThread(d.thread_id) }, 'from ' + (d.thread_id === p.lead.id ? 'the lead' : threads.find((t) => t.id === d.thread_id)?.title || 'a thread')),
+      h('button', { class: 'linkbtn small', onclick: () => peek(d.thread_id) }, 'from ' + (d.thread_id === p.lead.id ? 'the lead' : threads.find((t) => t.id === d.thread_id)?.title || 'a thread')),
       decisionCard(d, (i) => post('decisions/' + d.id, { choice: i }).then(load).catch((e) => toast(e.message, { err: true }))))));
     if (!threads.length) {
       lanes.replaceChildren(empty('thread', 'No threads yet', 'Tell the lead what you want in the project chat. It opens threads for the right agents. You can also open one yourself.', h('button', { class: 'btn', onclick: () => newThreadDialog(p.id) }, ic('plus', 13), 'New thread')));
@@ -177,6 +180,35 @@ async function board(el, p) {
     claimsEl.replaceChildren(claims.length ? [kicker('Claimed files', h('small', { class: 'faint' }, 'so agents stay out of each other’s way')), h('div', { class: 'claims' }, claims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent)))))] : []);
   }
 
+  // A thread opened from the board sits beside the project chat, in place of the board; the address carries it
+  // (#/p/<id>?t=<thread>), so Back closes it and Expand's full view comes back here.
+  const peek = (id) => go('#/p/' + p.id + '?t=' + id);
+  let peeked = null, stopPeek = null;
+  async function showPeek(id) {
+    if (id === peeked) return;
+    stopPeek?.();
+    stopPeek = null;
+    peeked = id;
+    boardEl.hidden = !!id;
+    peekEl.hidden = !id;
+    split.classList.toggle('peeking', !!id);
+    if (!id) return peekEl.replaceChildren();
+    const title = h('b', { class: 'bp-title' }, 'Thread');
+    const body = h('div', { class: 'bp-body' });
+    peekEl.replaceChildren(h('div', { class: 'b-lead-h bp-h' },
+      h('button', { class: 'ibtn sm', title: 'Back to the board (Alt+Left)', onclick: () => back('#/p/' + p.id), html: icon('back', 14) }),
+      title,
+      h('span', { class: 'grow' }),
+      h('button', { class: 'ibtn sm', title: 'Expand to the full view', onclick: () => go('#/t/' + id), html: icon('fullscreen', 14) }),
+      h('button', { class: 'ibtn sm', title: 'Pop out', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 14) }),
+      h('button', { class: 'ibtn sm', title: 'Close', onclick: () => back('#/p/' + p.id), html: icon('close', 14) })), body);
+    const stop = await mountThread(body, id, { compact: true, ctx: { setPopTitle: (t) => (title.textContent = t) } });
+    if (peeked !== id) return stop?.();
+    stopPeek = stop;
+  }
+  ctx?.onRoute?.((nr) => showPeek(nr.q.t || null));
+  await showPeek(r.q?.t || null);
+
   await load();
   let timer = 0;
   const soon = () => (clearTimeout(timer), (timer = setTimeout(load, 300)));
@@ -185,7 +217,7 @@ async function board(el, p) {
     if (ev.project !== p.id && !(ev.kind === 'running' && threads.some((t) => t.id === ev.thread))) return;
     if (['thread', 'turn', 'running', 'decision', 'claims', 'message', 'progress'].includes(ev.kind)) soon();
   });
-  return () => (unlisten(), stopLead?.());
+  return () => (unlisten(), stopPeek?.(), stopLead?.());
 }
 
 // ------------------------------------------------------------ new thread (by hand)
@@ -217,7 +249,7 @@ export async function newThreadDialog(projectId) {
       }
     },
   });
-  if (ok && made) toast(`Started ${made.title} with ${agentName(made.agent)}`, { action: 'Open', run: () => openThread(made.id) });
+  if (ok && made) toast(`Started ${made.title} with ${agentName(made.agent)}`, { action: 'Open', run: () => go('#/p/' + projectId + '?t=' + made.id) });
 }
 
 // ------------------------------------------------------------ git

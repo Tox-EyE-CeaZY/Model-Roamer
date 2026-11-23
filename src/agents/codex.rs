@@ -47,7 +47,9 @@ impl AgentAdapter for Codex {
 
     fn launch(&self, spec: &TurnSpec) -> anyhow::Result<Launch> {
         let mut a: Vec<String> = vec!["exec".into(), "--json".into(), "--skip-git-repo-check".into(), "--color".into(), "never".into()];
-        match spec.autonomy {
+        // the lead coordinates: a read-only sandbox, so its commands can look but not change anything (its roamer
+        // tools run in Model Roamer, outside the sandbox)
+        match if spec.lead { Autonomy::ReadOnly } else { spec.autonomy } {
             Autonomy::Full => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
             Autonomy::Edits => a.extend(["--sandbox".into(), "workspace-write".into()]),
             Autonomy::ReadOnly => a.extend(["--sandbox".into(), "read-only".into()]),
@@ -70,6 +72,9 @@ impl AgentAdapter for Codex {
             let env: Vec<String> = m.env.iter().map(|(k, v)| format!("{k} = {}", toml_str(v))).collect();
             a.extend(["-c".into(), format!("mcp_servers.roamer.env={{ {} }}", env.join(", "))]);
             a.extend(["-c".into(), "mcp_servers.roamer.tool_timeout_sec=600".into()]);
+            // Model Roamer's own tools are always allowed: without this, a read-only sandbox (the lead's) refuses them
+            // because no one is there to approve
+            a.extend(["-c".into(), "mcp_servers.roamer.default_tools_approval_mode=\"approve\"".into()]);
         }
         a.extend(spec.extra_args.iter().cloned());
         if let Some(sid) = &spec.session {
@@ -253,5 +258,29 @@ mod tests {
         let e = c.parse(r#"{"type":"turn.failed","error":{"message":"You've hit your usage limit. Try again in 3 hours."}}"#, &mut st);
         assert!(matches!(&e[0], AgentEvent::Limit { until: Some(_), .. }));
         assert_eq!(toml_str("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
+}
+
+#[cfg(test)]
+mod lead_tests {
+    use super::*;
+    use crate::agents::{AgentAdapter, McpLaunch, TurnSpec};
+
+    fn spec(lead: bool) -> TurnSpec {
+        let d = std::env::temp_dir();
+        TurnSpec {
+            prompt: "hi".into(), system: String::new(), session: None, cwd: d.clone(), model: String::new(), effort: String::new(), autonomy: Autonomy::Full,
+            mcp: Some(McpLaunch { command: "model-roamer".into(), args: vec!["mcp".into()], env: vec![] }),
+            extra_dirs: vec![], scratch: d, extra_args: vec![], headless: true, lead,
+        }
+    }
+
+    #[test]
+    fn lead_is_read_only_but_keeps_its_tools() {
+        let a = Codex.launch(&spec(true)).unwrap().args.join(" ");
+        assert!(a.contains("--sandbox read-only") && !a.contains("--dangerously-bypass"));
+        assert!(a.contains("mcp_servers.roamer.default_tools_approval_mode"));
+        let w = Codex.launch(&spec(false)).unwrap().args.join(" ");
+        assert!(w.contains("--dangerously-bypass-approvals-and-sandbox"));
     }
 }

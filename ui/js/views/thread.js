@@ -4,8 +4,8 @@
 import { h, ago, clock, dayLabel, dur, num, bytes } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen, upload } from '../api.js';
-import { S, agentName, agentHue, project as projectOf, rememberChatPick } from '../store.js';
-import { go, openThread } from '../app.js';
+import { S, watch, agentName, agentHue, project as projectOf, rememberChatPick } from '../store.js';
+import { go, back, openThread } from '../app.js';
 import { isPop, isDesktop, popOut, setTitle, openExternal, native } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
@@ -45,6 +45,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   // parts: the turn so far in the order it happened: text the agent wrote and its steps (thinking, tools, results).
   // Only the trailing text is typed out; text before a step is already on screen.
   const live = { turn: null, parts: [], started: 0, shown: 0, hold: null };
+  const steps = stepView(() => t.steps || S.settings.steps || 'collapsed');
   const trailing = () => (live.parts.at(-1)?.k === 'text' ? live.parts.at(-1) : null);
   const liveTarget = () => (live.hold ? live.hold.body : trailing()?.text || '');
   const resetLive = (turn, started = Date.now()) => Object.assign(live, { turn, parts: [], started, shown: 0 });
@@ -79,6 +80,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const title = h('h1', { class: 'th-title', title: 'Rename', tabindex: '0', onclick: rename, onkeydown: (e) => e.key === 'Enter' && rename() }, t.title);
     head.replaceChildren(
       h('div', { class: 'th-crumbs mono' },
+        !isPop && full ? h('button', { class: 'ibtn xs th-back', title: 'Back (Alt+Left)', onclick: () => back(p ? '#/p/' + p.id : '#/chats'), html: icon('back', 14) }) : null,
         p ? h('a', { href: '#/p/' + p.id, style: { '--ph': p.color } }, h('i', { class: 'sw' }), p.name) : h('a', { href: '#/chats' }, 'Chats'),
         h('span', {}, '/'),
         h('span', {}, t.kind === 'lead' ? 'project chat' : t.kind === 'review' ? 'review' : t.kind === 'chat' ? 'chat' : 'thread')),
@@ -376,7 +378,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         m.pending ? h('span', { class: 'tag' }, 'not read yet') : null,
         h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
         h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
-      acts?.length ? timeline(acts, false) : null,
+      acts?.length ? timeline(acts, steps) : null,
       wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
       files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null);
     return e;
@@ -420,10 +422,10 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     liveEl.replaceChildren(
       h('div', { class: 'live-h', style: { '--ah': agentHue(t.agent) } },
         h('i', { class: 'pulse' }), stamp(t.agent, { model: t.model, small: true }),
-        h('span', { class: 'live-what' }, last ? actLabel(last) : text ? 'Writing…' : 'Thinking…'),
+        h('span', { class: 'live-what' }, last && steps.mode() !== 'hidden' ? actLabel(last) : text ? 'Writing…' : last ? 'Working…' : 'Thinking…'),
         h('span', { class: 'live-time mono', dataset: { since: live.started || t.running?.started || Date.now() } }, ''),
         h('button', { class: 'btn xs danger', onclick: () => act('stop'), title: 'Stop (Ctrl+.)' }, 'Stop')),
-      before.length ? timeline(before, true) : null,
+      before.length ? timeline(before, steps) : null,
       text ? wireMd(h('div', { class: 'md live-text' + (live.shown < full.length ? ' typing' : '') }, ...mdNodes(text)), openExternal) : null);
     tick();
     if (nearBottom(220)) toBottom();
@@ -452,6 +454,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         drawChips();
       }
     }
+    const stepsBtn = h('button', { class: 'cmp-steps', type: 'button', title: 'How this chat shows the agent’s steps', onclick: (e) => stepsMenu(e.currentTarget) });
     const sendBtn = h('button', { class: 'cmp-send', title: 'Send (Enter)', onclick: () => go_(), html: icon('send', 17) });
     async function go_() {
       const text = ta.value.trim();
@@ -501,11 +504,41 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       h('div', { class: 'cmp-row' },
         h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn,
         ta, sendBtn),
-      h('div', { class: 'cmp-hint mono' }, t.kind === 'chat' ? chatPicker() : null, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' })));
+      h('div', { class: 'cmp-hint mono' }, t.kind === 'chat' ? chatPicker() : null, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' }), stepsBtn));
     setTimeout(grow);
-    return { el, ta, focus: () => ta.focus() };
+    return { el, ta, focus: () => ta.focus(), stepsBtn };
   }
   /** A chat's agent and model, changeable any time; the choice carries over to new chats until the app restarts. */
+  /** Steps for this chat: follow the setting, or its own choice (remembered with the thread). */
+  function stepsMenu(anchor) {
+    const r = anchor.getBoundingClientRect();
+    const def = S.settings.steps || 'collapsed';
+    const set = async (v) => {
+      try {
+        t = { ...t, ...(await patch('threads/' + id, { steps: v })) };
+        redrawSteps();
+      } catch (e) {
+        toast(e.message, { err: true });
+      }
+    };
+    showMenu([
+      { header: 'Steps in this chat' },
+      { label: `Use my setting (${def})`, checked: !t.steps, run: () => set('') },
+      { sep: true },
+      ...STEP_MODES.map(([v, label, title]) => ({ label, title, checked: t.steps === v, run: () => set(v) })),
+    ], r.left, r.top - 4, { anchor });
+  }
+  function drawStepsBtn() {
+    const m = steps.mode();
+    composer.stepsBtn.replaceChildren(ic(m === 'hidden' ? 'eye' : 'terminal', 12), h('span', {}, 'Steps: ' + m + (t.steps ? '' : '')));
+    composer.stepsBtn.classList.toggle('own', !!t.steps);
+  }
+  function redrawSteps() {
+    drawStepsBtn();
+    drawLog();
+    drawLive();
+  }
+
   function chatPicker() {
     const p = agentModelPicker({ agentId: t.agent, model: t.model || '', onchange: async (a, m) => {
       if (!a) return;
@@ -555,6 +588,13 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   };
   let pendingReload = 0;
   const soon = () => (clearTimeout(pendingReload), (pendingReload = setTimeout(reloadThread, 250)));
+  let stepsWas = S.settings.steps;
+  const unwatchSteps = watch((w) => {
+    if ((w === 'settings' || w === 'all') && S.settings.steps !== stepsWas) {
+      stepsWas = S.settings.steps;
+      redrawSteps();
+    }
+  });
   const unlisten = listen((ev) => {
     if (ev.kind === 'resync') return refreshAll();
     if (ev.thread !== id) return;
@@ -613,9 +653,13 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         break;
       case 'thread':
         if (d.deleted) return el.replaceChildren(empty('trash', 'This thread was deleted', '', h('button', { class: 'btn', onclick: () => post(`threads/${id}/restore`).then(() => mountThread(el, id, { full, compact, ctx })) }, 'Undo')));
-        t = { ...t, ...d };
-        drawHead();
-        drawLive();
+        {
+          const before = t.steps;
+          t = { ...t, ...d };
+          drawHead();
+          if (before !== t.steps) redrawSteps();
+          else drawLive();
+        }
         break;
       case 'decision':
       case 'artifact':
@@ -695,6 +739,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   document.addEventListener('keydown', keys);
 
   drawHead();
+  drawStepsBtn();
   log.replaceChildren(loading('Loading the conversation'));
   await refreshAll();
   toBottom();
@@ -703,6 +748,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
 
   return () => {
     unlisten();
+    unwatchSteps();
     clearInterval(ticker);
     document.removeEventListener('keydown', keys);
   };
@@ -753,43 +799,67 @@ export function turnParts(acts, reply) {
   return parts.length ? parts : null;
 }
 
+/** How a thread shows its steps (thinking, tools, commands): its own choice, else the setting, else collapsed. Groups
+ * the person opened (or closed, when expanded) are remembered by key, so live redraws keep them as they left them. */
+export function stepView(modeOf) {
+  const flip = new Set();
+  let was = modeOf();
+  const mode = () => {
+    const m = modeOf();
+    if (m !== was) (flip.clear(), (was = m));
+    return m;
+  };
+  return {
+    mode,
+    open: (key) => (mode() === 'expanded') !== flip.has(key),
+    toggle: (key) => (flip.has(key) ? flip.delete(key) : flip.add(key)),
+    flipped: (key) => flip.has(key),
+  };
+}
+export const STEP_MODES = [['collapsed', 'Collapsed', 'One line per group of steps; open it to see them'], ['expanded', 'Expanded', 'Every step shown as it happens'], ['hidden', 'Hidden', 'Only what the agent writes to you']];
+const actKey = (a) => `${a.turn_id || ''}:${a.created_at || ''}:${a.kind}:${String(a.title || '').slice(0, 24)}`;
+
 /** A turn as it happened: what the agent wrote between steps, its thinking (folded), and runs of tool calls with
- * their results (one strip each). While live, the newest thinking and steps stay open. */
-export function timeline(parts, live) {
+ * their results (one strip each). Steps follow the view: collapsed, expanded or hidden; nothing opens by itself. */
+export function timeline(parts, view) {
+  const hidden = view.mode() === 'hidden';
   const out = [];
   let run = [];
-  const flush = (last) => {
-    if (run.length) out.push(activityStrip(run, live && last));
+  const flush = () => {
+    if (run.length && !hidden) out.push(activityStrip(run, view));
     run = [];
   };
-  parts.forEach((p, i) => {
-    const last = i === parts.length - 1;
+  for (const p of parts) {
     if (p.k === 'text') {
-      flush(false);
+      flush();
       out.push(wireMd(h('div', { class: 'md tl-text' }, ...mdNodes(p.text)), openExternal));
     } else if (p.a.kind === 'thinking') {
-      flush(false);
-      out.push(thinkingBlock(p.a.body || '', live && last));
-    } else {
-      run.push(p.a);
-      if (last) flush(true);
-    }
-  });
-  flush(true);
-  return h('div', { class: 'tl' }, ...out);
+      flush();
+      if (!hidden) out.push(thinkingBlock(p.a, view));
+    } else run.push(p.a);
+  }
+  flush();
+  return out.length ? h('div', { class: 'tl' }, ...out) : null;
 }
 
-function thinkingBlock(text, open) {
+function thinkingBlock(a, view) {
+  const key = 'think:' + actKey(a);
+  const text = a.body || '';
+  const open = view.open(key);
   const body = wireMd(h('div', { class: 'md tl-think-body', hidden: !open }, ...mdNodes(text)), openExternal);
   const head = h('button', { class: 'tl-think-h' + (open ? ' open' : ''), type: 'button', onclick: () => {
+    view.toggle(key);
     body.hidden = !body.hidden;
     head.classList.toggle('open', !body.hidden);
   } }, ic('sparkle', 12), h('span', {}, 'Thinking'), h('span', { class: 'faint' }, text.replace(/\s+/g, ' ').slice(0, 90)), h('i', { class: 'act-more', html: icon('chevDown', 12) }));
   return h('div', { class: 'tl-think' }, head, body);
 }
 
-/** The agent's steps in a turn: commands, edits, tool calls and their results. Collapsed to one line until opened. */
-export function activityStrip(acts, open) {
+/** The agent's steps in a turn: commands, edits, tool calls and their results. One line until opened (or open, when
+ * the view is expanded); a long result stays folded to its first line until clicked. */
+export function activityStrip(acts, view) {
+  const key = 'run:' + actKey(acts[0]);
+  const open = view.open(key);
   const tools = acts.filter((a) => a.kind === 'tool');
   const errors = acts.filter((a) => a.kind === 'error').length;
   const names = [...new Set(tools.map((a) => (a.title || '').split(':')[0]))].slice(0, 5);
@@ -797,9 +867,10 @@ export function activityStrip(acts, open) {
   const draw = () => list.replaceChildren(...acts.slice(-200).map((a) => {
     const body = a.body || '';
     const long = body.length > 220 || body.includes('\n');
-    const pre = h('pre', { class: 'act-body', hidden: long && a.kind !== 'thinking' }, body);
+    const bkey = 'body:' + actKey(a);
+    const pre = h('pre', { class: 'act-body', hidden: long && a.kind !== 'thinking' && !view.flipped(bkey) }, body);
     return h('div', { class: 'act k-' + a.kind },
-      h('button', { class: 'act-h', onclick: () => long && (pre.hidden = !pre.hidden) },
+      h('button', { class: 'act-h', onclick: () => long && (view.toggle(bkey), (pre.hidden = !pre.hidden)) },
         h('i', { class: 'act-ic', html: icon(a.kind === 'tool' ? TOOL_ICONS[a.title] || (String(a.title).includes(':') ? 'cpu' : 'bolt') : a.kind === 'result' ? 'right' : a.kind === 'thinking' ? 'sparkle' : a.kind === 'error' ? 'warn' : 'info', 12) }),
         h('span', { class: 'act-t' }, a.kind === 'result' ? 'result' : a.kind === 'thinking' ? 'thinking' : a.title || a.kind),
         !long || a.kind === 'thinking' ? null : h('span', { class: 'act-peek' }, body.split('\n')[0].slice(0, 120)),
@@ -808,6 +879,7 @@ export function activityStrip(acts, open) {
   }));
   if (open) draw();
   const head = h('button', { class: 'acts-h', onclick: () => {
+    view.toggle(key);
     list.hidden = !list.hidden;
     if (!list.hidden && !list.childElementCount) draw();
     head.classList.toggle('open', !list.hidden);

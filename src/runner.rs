@@ -27,6 +27,9 @@ fn final_status() -> &'static Mutex<HashMap<String, (String, String)>> {
 }
 
 /// A tool asked for this status; it's applied when the turn ends.
+/// The lead coordinates: a line at the top of each of its turns.
+const LEAD_REMINDER: &str = "<model-roamer-reminder>You are this project's lead and coordinator. Don't edit files, run commands, builds or tests, or make things yourself: hand every piece of work to a thread with spawn_thread (or send_message to one that exists), then review, merge and keep the person posted in short replies.</model-roamer-reminder>\n\n";
+
 pub fn set_final_status(_core: &CoreRef, thread: &str, status: &str, note: &str) {
     if let Ok(mut m) = final_status().lock() {
         m.insert(thread.to_string(), (status.to_string(), note.to_string()));
@@ -647,6 +650,10 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     if session.is_none() {
         prompt.push_str(&recap(core, thread, &input_ids));
     }
+    if t["kind"] == "lead" {
+        // every turn, so a session started under older instructions (or one with no system prompt) still knows
+        prompt.push_str(LEAD_REMINDER);
+    }
     prompt.push_str(&format_inputs(&inputs));
     let cfg = core.agent_cfg(&agent);
     let model = t["model"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| cfg["model"].as_str().unwrap_or("").to_string());
@@ -672,6 +679,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         scratch: scratch.clone(),
         extra_args: cfg["extra_args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
         headless: core.headless,
+        lead: t["kind"] == "lead",
     };
     let mut launch = adapter.launch(&spec)?;
     launch.pty = launch.pty || adapter.needs_pty();

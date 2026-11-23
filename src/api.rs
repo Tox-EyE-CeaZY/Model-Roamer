@@ -591,6 +591,19 @@ async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(
         f.insert("title_by".into(), json!("person"));
     }
     let t = core.thread(&id)?;
+    // how this thread shows its steps: a view choice, so it doesn't move the thread up the lists
+    if let Some(v) = b.get("steps") {
+        let v = v.as_str().unwrap_or("");
+        if !["", "collapsed", "expanded", "hidden"].contains(&v) {
+            return Err(bad("Steps can be collapsed, expanded or hidden."));
+        }
+        core.db.exec("UPDATE threads SET steps = ?1 WHERE id = ?2", &[&v, &id])?;
+        if f.is_empty() && b.get("agent").is_none() && b.get("folder").is_none() {
+            let t = core.thread(&id)?;
+            core.bus.emit("thread", t["project_id"].as_str(), Some(&id), t.clone());
+            return Ok(Json(t));
+        }
+    }
     // another agent (a chat's picker): its CLI can't resume the old one's session, so the next turn starts fresh
     if let Some(a) = b["agent"].as_str().filter(|a| !a.is_empty() && Some(*a) != t["agent"].as_str()) {
         if core.adapter(a).is_none() {
@@ -1064,6 +1077,7 @@ async fn test_agent(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
         scratch: dir.clone(),
         extra_args: vec![],
         headless: core.headless,
+        lead: false,
     };
     let mut launch = a.launch(&spec)?;
     launch.pty = launch.pty || a.needs_pty();

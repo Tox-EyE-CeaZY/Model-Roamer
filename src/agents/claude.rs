@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// The lead's built-in tools: reading and research only. No Bash, Edit, Write, NotebookEdit or subagents.
+pub const LEAD_TOOLS: &str = "Read,Glob,Grep,WebFetch,WebSearch";
+
 pub struct Claude;
 
 impl AgentAdapter for Claude {
@@ -53,6 +56,11 @@ impl AgentAdapter for Claude {
             }
             .into(),
         );
+        if spec.lead {
+            // the lead reads and coordinates; its built-in tools are the read-only ones (its roamer tools are MCP)
+            a.push("--tools".into());
+            a.push(LEAD_TOOLS.into());
+        }
         if !spec.system.trim().is_empty() {
             let f = scratch_file(&spec.scratch, "system.md", &spec.system)?;
             a.push("--append-system-prompt-file".into());
@@ -267,5 +275,25 @@ mod tests {
         assert!(e.iter().any(|x| matches!(x, AgentEvent::Final(t) if t == "Done")));
         let e = c.parse(r#"{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached|1735689600"}"#, &mut st);
         assert!(e.iter().any(|x| matches!(x, AgentEvent::Limit { .. })));
+    }
+}
+
+#[cfg(test)]
+mod lead_tests {
+    use super::*;
+    use crate::agents::{AgentAdapter, Autonomy, TurnSpec};
+
+    fn spec(lead: bool) -> TurnSpec {
+        let d = std::env::temp_dir();
+        TurnSpec { prompt: "hi".into(), system: String::new(), session: None, cwd: d.clone(), model: String::new(), effort: String::new(), autonomy: Autonomy::Full, mcp: None, extra_dirs: vec![], scratch: d, extra_args: vec![], headless: true, lead }
+    }
+
+    #[test]
+    fn lead_gets_read_only_tools() {
+        let a = Claude.launch(&spec(true)).unwrap().args;
+        let i = a.iter().position(|x| x == "--tools").expect("--tools");
+        assert_eq!(a[i + 1], LEAD_TOOLS);
+        assert!(!LEAD_TOOLS.contains("Bash") && !LEAD_TOOLS.contains("Edit") && !LEAD_TOOLS.contains("Write"));
+        assert!(!Claude.launch(&spec(false)).unwrap().args.contains(&"--tools".to_string()));
     }
 }

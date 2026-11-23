@@ -5,7 +5,7 @@ import { h, ago } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen } from '../api.js';
 import { S, agentName } from '../store.js';
-import { go, openThread } from '../app.js';
+import { go, back, openThread } from '../app.js';
 import { popOut, setTitle, openExternal, isPop } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
@@ -124,6 +124,13 @@ export default async function artifacts(el, r, opts = {}) {
     cur = id;
     if (id) for (const f of chain(id)) if (f.id !== id) open.add(f.id);
     saveOpen();
+    // the folder you're in is part of the address (without a history entry of its own), so Back from an artifact
+    // returns to this very folder
+    if (!opts.project) {
+      try {
+        history.replaceState(history.state, '', '#/artifacts' + (id && id !== root ? '?f=' + id : ''));
+      } catch { /* fine */ }
+    }
     q.value = '';
     draw();
   }
@@ -298,7 +305,7 @@ export async function viewer(el, r, ctx) {
   el.classList.add('artifact-view');
   el.append(head, frame);
   const drawHead = () => head.replaceChildren(
-    isPop ? null : h('a', { class: 'ibtn', href: '#/artifacts', title: 'All artifacts', html: icon('back', 16) }),
+    isPop ? null : h('button', { class: 'ibtn', title: 'Back', onclick: () => back('#/artifacts'), html: icon('back', 16) }),
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
     a.agent ? stamp(a.agent, { small: true }) : null,
     h('span', { class: 'grow' }),

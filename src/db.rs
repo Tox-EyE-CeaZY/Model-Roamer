@@ -207,6 +207,8 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // which usage window ran out (five_hour | weekly), and decisions Model Roamer acts on itself when answered
     "ALTER TABLE limits ADD COLUMN window TEXT NOT NULL DEFAULT ''; ALTER TABLE decisions ADD COLUMN action TEXT;",
+    // how this thread shows its steps: '' follows the setting, or collapsed | expanded | hidden
+    "ALTER TABLE threads ADD COLUMN steps TEXT NOT NULL DEFAULT '';",
 ];
 
 #[derive(Clone)]

@@ -11,6 +11,8 @@ pub fn defaults() -> Value {
         "grain": true,
         "motion": true,
         "density": "cozy",
+        // agents' steps (thinking, tools, commands) in chats: collapsed | expanded | hidden
+        "steps": "collapsed",
 
         // windows
         "popout_threads": false,

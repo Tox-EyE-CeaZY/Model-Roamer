@@ -53,6 +53,25 @@ export const go = (hash) => {
   else location.hash = hash;
 };
 
+// Where we are in this window's history: each page we open is stamped with its place, so "back" can tell a page we
+// came from inside the app (go back to it, exactly as it was) from the first one (go to the fallback instead).
+let navAt = 0, navStarted = false;
+function stampNav() {
+  try {
+    if (history.state?.i == null) history.replaceState({ ...(history.state || {}), i: navStarted ? navAt + 1 : 0 }, '');
+    navAt = history.state?.i ?? navAt;
+    navStarted = true;
+  } catch { /* fine */ }
+}
+stampNav();
+addEventListener('hashchange', stampNav);
+addEventListener('popstate', stampNav);
+/** Back to the page we came from; with nowhere to go back to (opened straight on this page), to the fallback. */
+export function back(fallback = '#/') {
+  if (navAt > 0) history.back();
+  else go(fallback);
+}
+
 /** Open a thread: in this window, or in one of its own when the person likes pop-outs (or asks for one). */
 export function openThread(id, { pop } = {}) {
   if ((pop ?? S.settings.popout_threads) && !isPop) {
@@ -214,10 +233,18 @@ export function newProject() {
 }
 
 // ------------------------------------------------------------ router
-let cleanup = null, seq = 0;
+let cleanup = null, seq = 0, routeHook = null, lastRoute = null;
 let tb;
 async function render() {
   const r = parseRoute();
+  // inside one project's board, opening or closing a thread beside the chat doesn't rebuild the page
+  const prev = lastRoute;
+  lastRoute = r;
+  if (routeHook && prev && prev.view === 'project' && r.view === 'project' && prev.id === r.id && prev.tab === r.tab) {
+    closeMenu();
+    return routeHook(r);
+  }
+  routeHook = null;
   const my = ++seq;
   const el = $('#view');
   closeMenu();
@@ -236,7 +263,7 @@ async function render() {
     if (my !== seq) return;
     const box = h('div', { class: 'v v-' + r.view });
     el.replaceChildren(box);
-    cleanup = (await mod.default(box, r, { setPopTitle: (t) => tb?.popTitle && (tb.popTitle.textContent = t) })) || null;
+    cleanup = (await mod.default(box, r, { setPopTitle: (t) => tb?.popTitle && (tb.popTitle.textContent = t), onRoute: (fn) => (routeHook = fn) })) || null;
     if (r.view !== 'thread' && r.view !== 'project') setTitle(r.view === 'home' ? 'Model Roamer' : `${r.view[0].toUpperCase() + r.view.slice(1)} · Model Roamer`);
   } catch (e) {
     console.error(e);

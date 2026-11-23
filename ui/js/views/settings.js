@@ -61,6 +61,8 @@ function windows(el) {
   const s = S.settings;
   el.replaceChildren(
     h('section', { class: 'panel cut' }, kicker('Threads'),
+      field('Agents’ steps', seg([['collapsed', 'Collapsed'], ['expanded', 'Expanded'], ['hidden', 'Hidden']], s.steps || 'collapsed', (v) => save({ steps: v })),
+        'Thinking, tools and commands. Collapsed shows one line you can open; nothing opens by itself while an agent works. Any chat can choose its own from “Steps” under its message box.'),
       toggle(!!s.popout_threads, (v) => save({ popout_threads: v }), { label: 'Open threads in their own windows (like popping out an email)' }),
       h('p', { class: 'faint small' }, 'Either way: Ctrl+Shift+O, the pop-out button, or a middle click on a thread card opens it in a window of its own. Each window remembers where it was.')),
     isDesktop ? h('section', { class: 'panel cut' }, kicker('This app'),

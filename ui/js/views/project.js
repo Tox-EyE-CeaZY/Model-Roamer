@@ -34,7 +34,7 @@ export default async function projectView(el, r, ctx) {
       h('div', { class: 'p-title' },
         h('i', { class: 'p-sw' }),
         h('h1', {}, p.name),
-        stamp(p.lead_agent, { model: p.lead_model, lead: true }),
+        h('span', { class: 'p-sub mono', title: p.home }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', {}, where), p.base_branch ? [h('span', { class: 'faint' }, '·'), h('span', {}, p.base_branch)] : null),
         h('span', { class: 'grow' }),
         h('button', { class: 'btn primary sm', onclick: () => newThreadDialog(p.id) }, ic('plus', 13), 'New thread'),
         h('button', { class: 'ibtn', title: 'More', onclick: (e) => {
@@ -48,7 +48,6 @@ export default async function projectView(el, r, ctx) {
             { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
           ], b.right, b.bottom + 4, { anchor: e.currentTarget });
         }, html: icon('more', 16) })),
-      h('div', { class: 'p-sub mono' }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', { title: p.home }, where), p.base_branch ? [h('span', { class: 'faint' }, '·'), h('span', {}, p.base_branch)] : null),
       h('nav', { class: 'p-tabs' }, TABS.map(([k, label, ico]) => h('a', { class: 'p-tab' + (k === tab ? ' on' : ''), href: '#/p/' + p.id + (k ? '/' + k : '') }, ic(ico, 14), label))));
   }
   drawHead();

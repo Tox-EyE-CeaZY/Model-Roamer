@@ -1,7 +1,7 @@
 name: Build and release
 
 # Every push to main builds everything and publishes the downloads as the release for the version in Cargo.toml
-# (v0.1.0, ...): the first push of a version creates the release, later pushes refresh its files.
+# (v2.1.0, ...): the first push of a version creates the release, later pushes refresh its files.
 # Pushing a tag like v0.2.0 publishes that version instead. Pull requests build and test without publishing.
 # Asset names must match src/update.rs, which picks the file to self-update from.
 on:

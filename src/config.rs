@@ -28,7 +28,7 @@ pub fn defaults() -> Value {
         "default_lead": "claude",
         "default_lead_model": "opus",
         "lead_fallback": ["claude", "codex", "antigravity"],
-        "auto_fallback": true,
+        "auto_fallback": false, // move work off a used-up agent without asking: only when the person turns it on
         "cross_review": true,
 
         // turns

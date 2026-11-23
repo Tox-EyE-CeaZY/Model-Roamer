@@ -205,6 +205,8 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX folders_parent ON folders(parent_id);
     ALTER TABLE artifacts ADD COLUMN folder_id TEXT;
     "#,
+    // which usage window ran out (five_hour | weekly), and decisions Model Roamer acts on itself when answered
+    "ALTER TABLE limits ADD COLUMN window TEXT NOT NULL DEFAULT ''; ALTER TABLE decisions ADD COLUMN action TEXT;",
 ];
 
 #[derive(Clone)]

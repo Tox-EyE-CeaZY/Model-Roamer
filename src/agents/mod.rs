@@ -396,6 +396,18 @@ pub fn limit_in(text: &str) -> Option<Option<i64>> {
     Some(reset_time(text))
 }
 
+/// Which plan window a limit message is about: "weekly", "five_hour", or "" when it doesn't say.
+pub fn limit_window(text: &str) -> &'static str {
+    let t = text.to_lowercase();
+    if t.contains("weekly") || t.contains("week") || t.contains("7-day") || t.contains("7 day") {
+        "weekly"
+    } else if t.contains("5-hour") || t.contains("5 hour") || t.contains("five-hour") || t.contains("5h") || t.contains("session limit") || t.contains("hourly") {
+        "five_hour"
+    } else {
+        ""
+    }
+}
+
 /// "try again in 2 hours 13 minutes", "resets in 45m", "resets at 1735689600"
 pub fn reset_time(text: &str) -> Option<i64> {
     let now = crate::util::now_ms();

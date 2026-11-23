@@ -250,7 +250,7 @@ async function routing(el) {
             [f[i - 1], f[i]] = [f[i], f[i - 1]];
             setSetting({ lead_fallback: f }).then(draw);
           }, html: icon('left', 12) }) : null)))),
-        toggle(S.settings.auto_fallback !== false, (v) => setSetting({ auto_fallback: v }), { label: 'When an agent hits its limit, move its waiting work to the next agent (otherwise it waits for the reset)' }),
+        toggle(S.settings.auto_fallback === true, (v) => setSetting({ auto_fallback: v }), { label: 'When an agent runs out of usage, move its work to another agent without asking (otherwise you are asked: move it, or wait for the reset)' }),
         toggle(S.settings.cross_review !== false, (v) => setSetting({ cross_review: v }), { label: 'Have a different agent review finished work before it’s merged' })),
       h('section', { class: 'panel cut' }, kicker('Turns'),
         h('div', { class: 'row3' },

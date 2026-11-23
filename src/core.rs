@@ -324,11 +324,11 @@ impl Core {
     }
 
     pub fn limit_of(&self, agent: &str) -> Value {
-        match self.db.one("SELECT limited_until, note, hit_at FROM limits WHERE agent = ?1", &[&agent]) {
+        match self.db.one("SELECT limited_until, note, hit_at, window FROM limits WHERE agent = ?1", &[&agent]) {
             Ok(Some(r)) => {
                 let until = r["limited_until"].as_i64();
                 let active = until.map(|u| u > util::now_ms()).unwrap_or(r["hit_at"].as_i64().unwrap_or(0) > util::now_ms() - 30 * 60_000);
-                json!({ "active": active, "until": until, "note": r["note"], "hit_at": r["hit_at"] })
+                json!({ "active": active, "until": until, "note": r["note"], "hit_at": r["hit_at"], "window": r["window"] })
             }
             _ => json!({ "active": false }),
         }

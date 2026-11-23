@@ -28,6 +28,20 @@ fn harness(agent: &str) -> String {
 
 /// What the lead knows about each agent: strengths, sign-in, headroom, what's running.
 /// For a thread run by a buddy pair: who the other half is, what each of them is for, and how the turns pass.
+/// Files other threads have claimed right now, so a thread knows before it starts what to leave alone.
+fn claims_section(core: &Core, t: &Value, project: Option<&Value>) -> String {
+    let (Some(pid), Some(tid)) = (project.and_then(|p| p["id"].as_str()), t["id"].as_str()) else { return String::new() };
+    let rows = core
+        .db
+        .all("SELECT c.path, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1 AND c.thread_id != ?2 AND t.resolved = 0 AND t.status NOT IN ('done','cancelled','failed') ORDER BY c.created_at LIMIT 40", &[&pid, &tid])
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = rows.iter().map(|r| format!("- `{}`: {} ({})", r["path"].as_str().unwrap_or(""), r["title"].as_str().unwrap_or(""), r["agent"].as_str().unwrap_or(""))).collect();
+    format!("\n\n## Files other threads have claimed right now\n\nAnother agent is working in these. Don't edit them. If your task needs one, `message_lead` to ask for the work to be sequenced, and keep going on the rest. (`list_claims` shows the live picture.)\n\n{}\n", list.join("\n"))
+}
+
 fn buddy_section(core: &Core, t: &Value) -> String {
     let b = &t["buddy"];
     let Some(def) = b["id"].as_str().and_then(|id| core.buddy_def(id)) else { return String::new() };
@@ -131,6 +145,7 @@ pub fn system(core: &Core, c: &Ctx) -> String {
     };
     s.push_str(&body.replace("{{PROJECT}}", pname));
     s.push_str(&buddy_section(core, t));
+    s.push_str(&claims_section(core, t, c.project));
     s.push_str("\n\n");
     s.push_str(&harness(agent));
     s.push_str("\n\n## Model Roamer tools\n\n");

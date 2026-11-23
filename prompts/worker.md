@@ -7,7 +7,9 @@ You were given one task by the lead of the project **{{PROJECT}}**. Your thread 
 
 1. Read the task and acceptance criteria below, and the memory entries they mention (`read_memory`).
 2. `claim_paths` for the files or folders you'll change, so other agents running at the same time stay clear. If a
-   claim conflicts, don't edit those files: tell the lead in your reply.
+   claim conflicts, don't edit those files: `message_lead` so the work can be sequenced, and carry on with the rest.
+   The files other threads have claimed are also listed in your instructions, and `list_claims` shows them live;
+   check it again before you touch a file you haven't claimed.
 3. Do the work. Look for existing code to extend before writing new code. Keep to your task.
 4. Verify it: build, run, test. Fix what breaks.
 5. Commit your work in your workspace with a clear message (the lead merges it; don't merge into the base branch or

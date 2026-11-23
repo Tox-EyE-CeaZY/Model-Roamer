@@ -1,6 +1,9 @@
 [package]
 name = "model-roamer"
-version = "0.1.0"
+# Versioning: MAJOR.MINOR.PATCH (written 0.00.000 in speech: 2.01.000 = 2.1.0).
+#   MAJOR big versions, MINOR substantial features, PATCH small changes and bug fixes.
+#   Cargo needs no leading zeros, so the file says 2.1.0. A push to main publishes the release for this version.
+version = "2.1.0"
 edition = "2021"
 description = "An AI orchestration studio in the Roamer suite: one lead agent runs Claude Code, Codex, Gemini and Antigravity together"
 license = "MIT"

@@ -806,3 +806,40 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
 .buddy-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line2); }
 .ctx-chip.buddy { color: var(--accent); border-color: var(--accent); }
 .ctx-chip.buddy small { opacity: .7; }
+
+.v-browse { display: flex; flex-direction: column; height: 100%; }
+.browse { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.br-bar { flex: none; display: flex; align-items: center; gap: 8px; padding: 8px var(--gut); border-bottom: 1px solid var(--line); }
+.br-addr { flex: 1; min-width: 0; height: 30px; padding: 0 10px; font: 12px var(--f-mono); color: var(--ink); background: var(--bg2); border: 1px solid var(--line); }
+.br-note { padding: 6px var(--gut); }
+.br-frame { flex: 1; min-height: 0; width: 100%; border: 0; background: #fff; }
+
+/* ------------------------------------------------------------ phones
+   Narrow screens: the side rail becomes a bar along the bottom, lists stack, the status bar steps aside. */
+@media (max-width: 720px) {
+  #shell { flex-direction: column; }
+  #view { order: 1; min-width: 0; }
+  #side { order: 2; width: 100% !important; height: 54px; flex-direction: row; border-right: 0; border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom, 0); box-sizing: content-box; }
+  #side .sd-nav { display: flex; flex: 1; gap: 0; padding: 0; }
+  #side .sd-i { flex: 1; justify-content: center; height: 54px; padding: 0; }
+  #side .sd-i.on::before { left: 18%; right: 18%; top: 0; bottom: auto; width: auto; height: 3px; }
+  #side .sd-i .sd-n, #side .sd-i .sd-dot { position: absolute; top: 6px; right: calc(50% - 20px); margin: 0; }
+  #side .sd-head, #side .sd-projects, #side .sd-foot { display: none; }
+  #statusbar { display: none; }
+  html.has-sb:not(.fullscreen) #shell { height: calc(100dvh - var(--tbh)); }
+  .chat-row { flex-wrap: wrap; row-gap: 6px; }
+  .cr-main { flex-basis: 100%; order: -1; }
+  .p-title { flex-wrap: wrap; row-gap: 6px; }
+  .p-title .btn.primary { font-size: 0; gap: 0; padding: 0 10px; }
+  .p-title .btn.primary svg { margin: 0; }
+  .board.peeking .b-lead { display: none; }
+  .cmp-hint { flex-wrap: wrap; row-gap: 4px; }
+  .cmp-pick select { max-width: 150px; }
+  .th-title-row { flex-wrap: wrap; row-gap: 6px; }
+  .dlg { max-width: calc(100vw - 24px); }
+  h1 { overflow-wrap: anywhere; }
+}
+@media (pointer: coarse) {
+  .ibtn { min-width: 38px; min-height: 38px; }
+  .btn.xs, .btn.sm { min-height: 34px; }
+}

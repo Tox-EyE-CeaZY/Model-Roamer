@@ -132,11 +132,16 @@ pub async fn auth(State(core): State<CoreRef>, mut req: Request, next: Next) -> 
 
 /// Small security headers on everything we serve.
 pub async fn headers(req: Request, next: Next) -> Response {
-    let is_artifact = req.uri().path().starts_with("/a/");
+    let is_forward = req.uri().path().starts_with("/fwd/");
+    let is_artifact = req.uri().path().starts_with("/a/") || is_forward;
     let mut r = next.run(req).await;
     let h = r.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    if is_forward {
+        // sandboxed pages have no origin of their own, so their requests back to the server need this (no cookies go with them)
+        h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+    }
     if is_artifact {
         // artifacts run in their own sandbox: they can script themselves but can't reach the app
         h.insert("content-security-policy", HeaderValue::from_static("sandbox allow-scripts allow-popups allow-forms allow-modals allow-downloads allow-popups-to-escape-sandbox"));

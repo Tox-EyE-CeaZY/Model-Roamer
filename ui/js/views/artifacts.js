@@ -6,7 +6,7 @@ import { icon } from '../icons.js';
 import { get, post, patch, del, listen } from '../api.js';
 import { S, agentName } from '../store.js';
 import { go, back, openThread } from '../app.js';
-import { popOut, setTitle, openExternal, isPop } from '../native.js';
+import { popOut, setTitle, openExternal, openOutside, isPop } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
 import { ic, stamp, empty, loading, errorBox, field, input, textarea, select, kicker, askLine } from '../common.js';
@@ -246,7 +246,7 @@ function menu(a, x, y, after, extra = {}) {
   showMenu([
     { label: 'Open', icon: 'eye', run: () => go('#/a/' + a.id) },
     { label: 'Open in its own window', icon: 'popout', run: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }) },
-    { label: 'Open in your browser', icon: 'external', run: () => openExternal(location.origin + a.url) },
+    { label: 'Open in your browser', icon: 'external', run: () => openOutside(location.origin + a.url) },
     { label: 'Download', icon: 'download', run: () => window.open(a.url + '?download=1') },
     { sep: true },
     { label: 'Rename…', icon: 'edit', run: () => rename(a).then(after) },
@@ -312,7 +312,7 @@ export async function viewer(el, r, ctx) {
     h('button', { class: 'btn sm', onclick: () => draw(true) }, ic('reload', 13), 'Reload'),
     a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
     isPop ? null : h('button', { class: 'ibtn', title: 'Open in its own window', onclick: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 16) }),
-    h('button', { class: 'ibtn', title: 'Open in your browser', onclick: () => openExternal(location.origin + a.url), html: icon('external', 16) }),
+    h('button', { class: 'ibtn', title: 'Open in your browser', onclick: () => openOutside(location.origin + a.url), html: icon('external', 16) }),
     h('button', { class: 'ibtn', title: 'More', onclick: (e) => menu(a, e.clientX, e.clientY, async () => ((a = await get('artifacts/' + a.id)), drawHead())), html: icon('more', 16) }));
   async function draw(bust) {
     const src = a.url + (bust ? '?t=' + Date.now() : '');

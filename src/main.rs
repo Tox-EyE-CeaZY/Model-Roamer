@@ -16,6 +16,7 @@ mod core;
 mod db;
 #[cfg(feature = "desktop")]
 mod desktop;
+mod forward;
 mod git;
 mod github;
 mod mcp;

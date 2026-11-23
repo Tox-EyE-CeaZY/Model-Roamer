@@ -22,6 +22,7 @@ const VIEWS = {
   settings: () => import('./views/settings.js'),
   pair: () => import('./views/pair.js'),
   welcome: () => import('./views/welcome.js'),
+  browse: () => import('./views/browse.js'),
 };
 
 const NAV = [
@@ -465,6 +466,8 @@ async function start() {
   }
   connect();
   side();
+  // a phone can install the app to its home screen (needs https or localhost; harmless elsewhere)
+  if (!isDesktop && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
   if (!isPop) import('./statusbar.js').then((m) => m.initStatusBar()).catch((e) => console.error(e));
   addEventListener('hashchange', render);
   render();

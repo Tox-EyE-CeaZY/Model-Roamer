@@ -6,7 +6,7 @@ import { icon } from '../icons.js';
 import { get, post, del, listen } from '../api.js';
 import { S, watch, setSetting } from '../store.js';
 import { go, switchTo } from '../app.js';
-import { isDesktop, native, openExternal } from '../native.js';
+import { isDesktop, native, openExternal, openOutside } from '../native.js';
 import { dialog, toast } from '../ui.js';
 import { runStep } from '../term.js';
 import { ic, field, input, select, seg, toggle, loading, errorBox, empty, kicker, copyable, timeAgo, pickFolder } from '../common.js';
@@ -394,7 +394,7 @@ async function about(el) {
   });
   check();
   get('suite').then((s) => suite.replaceChildren(...s.apps.map((a) => h('div', { class: 'suite-app cut' }, h('b', {}, a.name), h('small', { class: 'faint' }, a.about),
-    h('div', { class: 'row' }, a.open ? h('button', { class: 'btn sm primary', onclick: () => openExternal(a.open) }, 'Open') : a.running === true && a.id === 'model-roamer' ? h('span', { class: 'status acc' }, 'You’re here') : null, h('button', { class: 'btn sm', onclick: () => openExternal(a.repo) }, 'GitHub')))))).catch(() => {});
+    h('div', { class: 'row' }, a.open ? h('button', { class: 'btn sm primary', onclick: () => openOutside(a.open) }, 'Open') : a.running === true && a.id === 'model-roamer' ? h('span', { class: 'status acc' }, 'You’re here') : null, h('button', { class: 'btn sm', onclick: () => openExternal(a.repo) }, 'GitHub')))))).catch(() => {});
   return un;
 }
 

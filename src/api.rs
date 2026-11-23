@@ -3,7 +3,7 @@
 use crate::{
     agents, artifacts,
     core::{CoreRef, TermEntry},
-    git, github, memory, net, procs, runner,
+    forward, git, github, memory, net, procs, runner,
     server::{self, bad, ApiErr, Who, R},
     setup, util,
 };
@@ -27,10 +27,16 @@ pub fn router(core: CoreRef) -> Router {
         .route("/", get(|| async { server::asset("index.html") }))
         .route("/ui/{*path}", get(|Path(p): Path<String>| async move { server::asset(&p) }))
         .route("/favicon.ico", get(|| async { server::asset("favicon.svg") }))
+        .route("/manifest.webmanifest", get(|| async { server::asset("manifest.webmanifest") }))
+        .route("/sw.js", get(|| async { server::asset("sw.js") }))
         .route("/auth", get(auth_cookie))
         .route("/a/{id}/{sig}", get(artifact_file))
         .route("/a/{id}/{sig}/", get(artifact_file))
         .route("/a/{id}/{sig}/{*rest}", get(artifact_file))
+        .route("/fwd/{sig}/{port}", any(forward::serve))
+        .route("/fwd/{sig}/{port}/", any(forward::serve))
+        .route("/fwd/{sig}/{port}/{*rest}", any(forward::serve))
+        .route("/api/forward", post(forward_url))
         .route("/api/hello", get(hello))
         .route("/api/pair", post(pair))
         .route("/api/mcp", post(mcp))
@@ -1037,6 +1043,12 @@ async fn delete_artifact(State(core): State<CoreRef>, Path(id): Path<String>) ->
     core.db.exec("UPDATE artifacts SET deleted_at = ?1 WHERE id = ?2", &[&now, &id])?;
     core.bus.emit("artifact", None, None, json!({ "id": id, "deleted": true }));
     Ok(Json(json!({ "ok": true })))
+}
+
+/// A page on this machine's localhost, as a link another device can open (served by the server under /fwd/).
+async fn forward_url(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
+    let (path, port) = forward::rewrite(&core, &s(&b, "url"))?;
+    Ok(Json(json!({ "path": path, "port": port })))
 }
 
 async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String, String>>, q: Q) -> Response {

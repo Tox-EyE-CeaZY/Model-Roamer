@@ -145,6 +145,9 @@ pub fn system(core: &Core, c: &Ctx) -> String {
         chrono::Local::now().format("%A %Y-%m-%d %H:%M %Z"),
         crate::os::os_name()
     ));
+    if role != "lead" && t["title_by"].as_str().unwrap_or("auto") == "auto" {
+        s.push_str("This thread still has a placeholder title. Once you know what the person wants, name it with `set_title` this turn.\n");
+    }
     s
 }
 

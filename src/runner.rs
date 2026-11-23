@@ -134,8 +134,8 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     let ws = if mode.starts_with("path:") { mode } else { format!("mode:{mode}") };
     let pid_s = p["id"].as_str().unwrap_or("").to_string();
     core.db.exec(
-        "INSERT INTO threads(id, project_id, parent_id, kind, title, agent, model, status, task_kind, instructions, criteria, workspace, depends_on, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        "INSERT INTO threads(id, project_id, parent_id, kind, title, agent, model, status, task_kind, instructions, criteria, workspace, depends_on, created_at, updated_at, title_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 'agent')",
         &[&id, &pid_s, &w.parent, &w.kind, &w.title.trim(), &agent, &model, &status, &kind, &w.instructions, &w.criteria, &ws, &deps, &now],
     )?;
     let t = core.thread(&id)?;
@@ -156,6 +156,7 @@ pub fn create_chat(core: &CoreRef, agent: &str, model: &str, title: &str, folder
     }
     let id = util::id("th");
     let now = util::now_ms();
+    // the app passes the first line of the opening message: a placeholder the agent replaces with set_title
     let title = if title.trim().is_empty() { "New chat" } else { title.trim() };
     let ws = if folder.trim().is_empty() { String::new() } else { format!("path:{}", folder.trim()) };
     core.db.exec(

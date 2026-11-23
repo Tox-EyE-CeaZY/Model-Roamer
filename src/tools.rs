@@ -99,6 +99,9 @@ const DEFS: &[Def] = &[
     Def { name: "post_update", roles: ALL, desc: "Show a short progress line on your thread without ending your turn (e.g. 'Tests pass, writing docs').", schema: || obj(json!({
         "text": {"type": "string"}
     }), &["text"]) },
+    Def { name: "set_title", roles: ALL, desc: "Name your chat or thread so the person can find it in a list: lead with the verb of their goal, 3 to 6 words, sentence case, in their words (e.g. 'Fix Safari export button'). Call it after the first exchange and again when the goal changes. Lead: pass thread_id to name a worker's thread.", schema: || obj(json!({
+        "title": {"type": "string"}, "thread_id": {"type": "string"}
+    }), &["title"]) },
     Def { name: "set_status", roles: WORK, desc: "Set your thread's status: review (ready for the lead to check), done, blocked (say why), working.", schema: || obj(json!({
         "status": {"type": "string", "enum": ["working", "review", "done", "blocked"]}, "note": {"type": "string"}
     }), &["status"]) },
@@ -341,6 +344,30 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             core.bus.emit("progress", project.as_deref(), Some(&tid), json!({ "text": a("text") }));
             Ok("Shown.".into())
         }
+        "set_title" => {
+            let target = if a("thread_id").is_empty() || a("thread_id") == tid {
+                caller.clone()
+            } else {
+                if role != "lead" {
+                    bail!("You can only name your own thread.");
+                }
+                let t = core.thread(&a("thread_id"))?;
+                same_project(&t)?;
+                t
+            };
+            if target["kind"] == "lead" {
+                bail!("The project chat is named after the project. Name the threads instead.");
+            }
+            if target["title_by"] == "person" {
+                bail!("The person named this thread \"{}\" themselves. Keep their title.", target["title"].as_str().unwrap_or(""));
+            }
+            let title = clean_title(&a("title"));
+            if title.is_empty() {
+                bail!("Give a title of a few words.");
+            }
+            core.set_thread(target["id"].as_str().unwrap_or(""), &json!({ "title": title, "title_by": "agent" }))?;
+            Ok(format!("Named \"{title}\"."))
+        }
         "set_status" => {
             let st = a("status");
             if !["working", "review", "done", "blocked"].contains(&st.as_str()) {
@@ -492,6 +519,19 @@ reply (JSON arguments, one block per call):
 Model Roamer runs them when your turn ends and sends the results back to you in a new turn. Text outside the blocks
 is your reply. Only use this when the native tools are missing."#;
 
+/// A title as the person will see it in a list: one line, no wrapping quotes or trailing period, at most 60 characters.
+fn clean_title(raw: &str) -> String {
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let t = line.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '*' | '#' | '\u{201c}' | '\u{201d}') || c.is_whitespace());
+    let t = t.trim_end_matches('.').trim();
+    if t.chars().count() <= 60 {
+        return t.to_string();
+    }
+    // cut at a word boundary rather than mid-word
+    let cut: String = t.chars().take(60).collect();
+    cut.rsplit_once(' ').map(|(a, _)| a.trim_end_matches([',', ':', ';', '-']).trim().to_string()).unwrap_or(cut)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +548,14 @@ mod tests {
         assert!(overlaps("./src/ui/", "src/ui"));
         assert!(!overlaps("src/ui", "src/core"));
         assert!(!overlaps("src/ui2", "src/ui"));
+    }
+    #[test]
+    fn cleans_titles() {
+        assert_eq!(clean_title("  \"Fix Safari export button.\"\nextra"), "Fix Safari export button");
+        assert_eq!(clean_title("**Add dark mode**"), "Add dark mode");
+        let long = clean_title(&"word ".repeat(30));
+        assert!(long.chars().count() <= 60 && !long.ends_with(' '));
+        assert!(list("chat").iter().any(|t| t["name"] == "set_title"));
     }
     #[test]
     fn lists_by_role() {

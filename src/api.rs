@@ -539,6 +539,10 @@ async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(
             f.insert(k.into(), v.clone());
         }
     }
+    // a title the person typed is theirs: agents' set_title leaves it alone from now on
+    if f.contains_key("title") {
+        f.insert("title_by".into(), json!("person"));
+    }
     Ok(Json(core.set_thread(&id, &Value::Object(f))?))
 }
 

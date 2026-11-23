@@ -22,6 +22,15 @@ design language and origin. If you design any UI, follow the design memory note 
 - Use the Model Roamer tools (listed below) for anything that crosses threads: memory, messages, artifacts, status,
   GitHub. They are the only way other agents and the person learn what you did outside your reply.
 
+## Naming your thread
+
+The person finds a chat or thread by its title alone, in a list of everything. Name yours with `set_title` after the
+first exchange, and again when the goal changes or narrows so the old title no longer says what it is about. A good
+title leads with the verb of the person's goal (not of the step they asked for), names one goal in the person's own
+words rather than names from the code, makes sense on its own, and is 3 to 6 words in sentence case with no quotes or
+final period. For example, "The export button does nothing on Safari, can you look?" becomes "Fix Safari export
+button". If the person renamed the thread themselves, keep their title.
+
 ## Standards for every piece of work
 
 **Meet expectations.** After each feature, ask: what would a reasonable user expect this to do? If they could

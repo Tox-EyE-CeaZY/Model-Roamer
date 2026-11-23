@@ -187,6 +187,8 @@ const MIGRATIONS: &[&str] = &[
         last_used INTEGER
     );
     "#,
+    // who named a thread: auto (a default), agent (set_title) or person (renamed in the app, which agents must keep)
+    "ALTER TABLE threads ADD COLUMN title_by TEXT NOT NULL DEFAULT 'auto';",
 ];
 
 #[derive(Clone)]

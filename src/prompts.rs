@@ -170,9 +170,14 @@ pub fn system(core: &Core, c: &Ctx) -> String {
     }
     let pid = c.project.and_then(|p| p["id"].as_str());
     s.push_str(&format!("\n### Memory index\n\n{}\n", memory::index(core, pid)));
-    // the design note travels with every agent so the suite stays one family
+    // The design note is long, so only agents doing UI work get it in full; everyone else is pointed to it.
     if let Ok(Some(d)) = memory::get_by_name(core, pid, "design-language") {
-        s.push_str(&format!("\n### Design language (from memory)\n\n{}\n", d["body"].as_str().unwrap_or("")));
+        let ui_work = agent == "antigravity" || matches!(t["task_kind"].as_str().unwrap_or(""), "design" | "frontend" | "creative");
+        if ui_work {
+            s.push_str(&format!("\n### Design language (from memory)\n\n{}\n", d["body"].as_str().unwrap_or("")));
+        } else {
+            s.push_str("\n### Design language\n\nIf you build or change any UI, first `read_memory` the entry `design-language` and follow it.\n");
+        }
     }
     s.push_str(&format!(
         "\n### About this session\n\nYou are `{}` in thread `{}` (\"{}\"). Today is {}. The person's machine runs {}.\n",

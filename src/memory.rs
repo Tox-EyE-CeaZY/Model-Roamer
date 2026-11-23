@@ -69,12 +69,23 @@ fn scope(m: &Value) -> &'static str {
     if m["project_id"].is_null() { "global" } else { "project" }
 }
 
+/// Entries named in the index every turn; the rest are found with `read_memory` (which can search).
+const INDEX_MAX: usize = 30;
+
 pub fn index(core: &Core, project: Option<&str>) -> String {
     let l = list(core, project).unwrap_or_default();
     if l.is_empty() {
         return "Memory is empty.".into();
     }
-    l.iter().map(|m| format!("- {} ({}): {}", m["name"].as_str().unwrap_or(""), scope(m), m["description"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")
+    let mut out: Vec<String> = l
+        .iter()
+        .take(INDEX_MAX)
+        .map(|m| format!("- {} ({}): {}", m["name"].as_str().unwrap_or(""), scope(m), util::clip(m["description"].as_str().unwrap_or(""), 110)))
+        .collect();
+    if l.len() > INDEX_MAX {
+        out.push(format!("- ...and {} more entries: call `read_memory` with a search to find them.", l.len() - INDEX_MAX));
+    }
+    out.join("\n")
 }
 
 pub fn write(core: &Core, project: Option<&str>, name: &str, description: &str, body: &str, by: &str) -> Result<Value> {

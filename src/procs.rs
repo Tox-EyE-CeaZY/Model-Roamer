@@ -172,9 +172,18 @@ pub async fn kill_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
-        let _ = tokio::process::Command::new("kill").args(["-TERM", &format!("-{pid}")]).stderr(Stdio::null()).status().await;
+        // Children start in their own process group (see `command`), whose id is the child's pid. Signal the group
+        // directly: the `kill` program parses "-<pid>" differently between systems, and once signalled the wrong group.
+        let Ok(pg) = libc::pid_t::try_from(pid) else { return };
+        if pg <= 1 {
+            return;
+        }
+        // SAFETY: killpg only sends a signal; a group that has already exited just returns ESRCH.
+        if unsafe { libc::killpg(pg, libc::SIGTERM) } != 0 {
+            return; // the group is gone already
+        }
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let _ = tokio::process::Command::new("kill").args(["-KILL", &format!("-{pid}")]).stderr(Stdio::null()).status().await;
+        unsafe { libc::killpg(pg, libc::SIGKILL) };
     }
 }
 
@@ -399,6 +408,7 @@ mod tests {
     fn strips_escapes() {
         assert_eq!(strip_ansi("\x1b[1;32mhello\x1b[0m world\x1b]0;title\x07"), "hello world");
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn runs_with_timeout() {
         let sh = resolve(&["sh"], None).unwrap();
@@ -406,6 +416,8 @@ mod tests {
         assert!(out.ok() && out.stdout.trim() == "hi");
         let slow = run(&sh, &Launch { args: vec!["-c".into(), "sleep 5".into()], ..Default::default() }, Duration::from_millis(300)).await.unwrap();
         assert!(slow.timed_out);
+        // the test process itself is still here (an earlier kill signalled the wrong group) and its own group is untouched
+        assert_eq!(unsafe { libc::kill(std::process::id() as libc::pid_t, 0) }, 0);
     }
     #[tokio::test]
     async fn streams_lines_and_stdin() {

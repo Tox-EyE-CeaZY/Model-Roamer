@@ -1887,6 +1887,7 @@ dependencies = [
  "futures-util",
  "hostname",
  "if-addrs",
+ "libc",
  "mime_guess",
  "open",
  "percent-encoding",

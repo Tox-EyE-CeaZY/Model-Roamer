@@ -15,11 +15,21 @@ android {
         versionName = System.getenv("MR_VERSION_NAME") ?: "0.1.0"
     }
 
+    // Installed by hand (sideloaded), so no store account is involved. One fixed key, kept in the repo (it protects
+    // nothing: anyone can sideload anything), so every build can update the one before it. A key made fresh on each
+    // build would make Android refuse the update.
+    signingConfigs {
+        create("sideload") {
+            storeFile = file("sideload.keystore")
+            storePassword = "android"
+            keyAlias = "roamer"
+            keyPassword = "android"
+        }
+    }
     buildTypes {
-        // Installed by hand (sideloaded), so it is signed with the debug key and needs no store account.
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("sideload")
         }
     }
     compileOptions {

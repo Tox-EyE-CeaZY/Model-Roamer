@@ -148,6 +148,12 @@ jobs:
           gradle -p android assembleRelease --no-daemon
           mkdir dist
           cp android/app/build/outputs/apk/release/*.apk dist/ModelRoamer-android.apk
+      - name: Check the APK (signature and manifest)
+        run: |
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          "$BT/apksigner" verify --verbose --print-certs dist/ModelRoamer-android.apk
+          "$BT/aapt" dump badging dist/ModelRoamer-android.apk | head -20
+          unzip -l dist/ModelRoamer-android.apk | tail -25
       - uses: actions/upload-artifact@v4
         with:
           name: android

@@ -184,12 +184,13 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     }
     runner::recover(&core);
     tokio::spawn(runner::watch_limits(core.clone()));
-    // find out which agents are installed and signed in, in the background
+    // what the last run found about each agent shows at once; only agents whose facts may have changed are checked
+    // again, in the background and all at once (so one slow CLI doesn't hold up the others)
+    core.load_remembered_status();
     let c = core.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(600)).await;
-        // all at once, so one slow CLI doesn't hold up the others
-        let ids: Vec<String> = c.adapters().iter().map(|a| a.id()).collect();
+        let ids: Vec<String> = c.adapters().iter().map(|a| a.id()).filter(|id| c.needs_check(id)).collect();
         futures_util::future::join_all(ids.iter().map(|id| c.agent_status(id))).await;
     });
     Ok(core)

@@ -9,7 +9,7 @@ import { go } from '../app.js';
 import { openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { runStep } from '../term.js';
-import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, loading, errorBox, empty, kicker } from '../common.js';
+import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
 
 const TABS = [['agents', 'Agents', 'agents'], ['tools', 'Tools', 'terminal'], ['routing', 'Routing', 'route']];
 
@@ -104,7 +104,8 @@ function card(a) {
     h('div', { class: 'ag-tags' }, (info.strengths || []).map((s) => h('span', { class: 'tag' }, s)), info.can_lead ? h('span', { class: 'tag acc' }, 'can lead') : null),
     h('dl', { class: 'facts ag-facts' },
       h('dt', {}, 'Program'), h('dd', { class: 'mono' }, a.installed ? [a.version || 'installed', a.path ? h('small', { class: 'faint', title: a.path }, ' · ' + a.path) : null] : a.pending ? 'checking…' : 'not found'),
-      h('dt', {}, 'Account'), h('dd', { class: 'ag-state' }, h('span', { class: 'status ' + authTone }, authIco === 'spin' ? h('span', { class: 'spin' }) : null, authText)),
+      h('dt', {}, 'Account'), h('dd', { class: 'ag-state' }, h('span', { class: 'status ' + authTone }, authIco === 'spin' ? h('span', { class: 'spin' }) : null, authText),
+        a.checked_at && !a.pending ? h('small', { class: 'faint', title: 'Remembered between launches. More › Check again looks now.' }, ' · checked ', timeAgo(a.checked_at)) : null),
       lim ? [h('dt', {}, 'Limit'), h('dd', {}, h('span', { class: 'status hot' }, lim.until ? `At its limit, back ${until(lim.until)}` : 'At its usage limit'), h('button', { class: 'linkbtn small', onclick: () => del(`agents/${a.id}/limit`).then(() => toast('Cleared: queued work goes to it again')) }, 'It’s back, clear it'))] : null,
       a.pty ? [h('dt', {}, 'Needs'), h('dd', { class: 'faint small' }, 'a terminal (ConPTY on Windows), handled for you')] : null),
     testOut,

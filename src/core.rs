@@ -230,6 +230,7 @@ impl Core {
                 let v = json!({ "id": id, "info": self.info_of(a.as_ref()), "config": self.agent_cfg(id), "limit": self.limit_of(id), "checked_at": util::now_ms(),
                     "installed": true, "auth": { "signed_in": "unknown", "detail": "The check took too long; choose Check again" }, "pty": a.needs_pty(),
                     "install": a.install(), "login": a.login(self.headless), "logout": a.logout() });
+                // not remembered: a timeout says nothing lasting about the agent
                 if let Ok(mut c) = self.status_cache.lock() {
                     c.insert(id.to_string(), v.clone());
                 }
@@ -237,6 +238,31 @@ impl Core {
                 v
             }
         }
+    }
+
+    /// Show what the last run found right away: every agent's last status is kept in the database, so a launch
+    /// doesn't wait on (or spawn) a single CLI.
+    pub fn load_remembered_status(&self) {
+        let Ok(mut c) = self.status_cache.lock() else { return };
+        for a in self.adapters() {
+            let id = a.id();
+            let v = self.db.setting(&format!("status.{id}"));
+            if v.is_object() && v["id"] == json!(id) {
+                c.insert(id, v);
+            }
+        }
+    }
+
+    /// Whether an agent needs a real check now: never checked, the last check is old, it failed to finish, or its
+    /// program moved, appeared or vanished since (finding the program is cheap; running it is not).
+    pub fn needs_check(&self, id: &str) -> bool {
+        let Some(v) = self.status_cache.lock().ok().and_then(|c| c.get(id).cloned()) else { return true };
+        let age = util::now_ms() - v["checked_at"].as_i64().unwrap_or(0);
+        let found = self.locate(id).map(|r| r.shown);
+        age > 12 * 3_600_000
+            || v["auth"]["signed_in"] == "unknown"
+            || found.is_some() != (v["installed"] == true)
+            || found.is_some_and(|p| v["path"].as_str() != Some(p.as_str()))
     }
 
     async fn check_agent(&self, id: &str, force_models: bool) -> Value {
@@ -275,6 +301,7 @@ impl Core {
         if let Ok(mut c) = self.status_cache.lock() {
             c.insert(id.to_string(), v.clone());
         }
+        let _ = self.db.set_setting(&format!("status.{id}"), &v);
         self.bus.emit("agent", None, None, v.clone());
         v
     }
@@ -288,6 +315,7 @@ impl Core {
                 cache.get(&id).cloned().map(|mut v| {
                     v["limit"] = self.limit_of(&id);
                     v["config"] = self.agent_cfg(&id);
+                    v["info"] = json!(self.info_of(a.as_ref())); // this version's descriptions, the CLI's models
                     v
                 }).unwrap_or_else(|| json!({ "id": id, "info": self.info_of(a.as_ref()), "config": self.agent_cfg(&id), "limit": self.limit_of(&id), "pending": true }))
             })

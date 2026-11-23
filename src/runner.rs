@@ -807,6 +807,13 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             };
             let text = format!("The turn failed: {detail}.{hint} Choose Retry to run it again, or move the thread to another agent.");
             let meta = if transient || !hint.is_empty() { json!({ "action": "signin", "agent": agent }) } else { json!({}) };
+            if !hint.is_empty() {
+                // the remembered "signed in" may be out of date now
+                let (c2, a2) = (core.clone(), agent.clone());
+                tokio::spawn(async move {
+                    let _ = c2.agent_status(&a2).await;
+                });
+            }
             let _ = post(core, thread, "system", "Model Roamer", &text, meta, false);
             core.set_status(thread, "failed", &clip(&detail, 160))?;
             if is_worker {

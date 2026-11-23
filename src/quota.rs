@@ -4,7 +4,8 @@
 //! - Claude Code: the same usage endpoint its /usage screen calls, with the sign-in it already saved. The token is
 //!   only read, never refreshed here (refreshing would race the CLI's own refresh).
 //! - Codex: the rate limits it writes into its session logs after every turn (~/.codex/sessions).
-//! - Antigravity doesn't expose its plan usage, so it has turn counts only.
+//! - Antigravity: its own `agy -p "/usage"`, which prints the plan's remaining share per model group and window as a
+//!   table. It needs no token from us; the CLI uses its own sign-in.
 
 use crate::agents::{codex_quota_at, epoch_ms};
 use serde_json::{json, Value};
@@ -14,6 +15,7 @@ pub async fn probe(agent: &str) -> Option<Value> {
     match agent {
         "claude" => claude().await,
         "codex" => tokio::task::spawn_blocking(codex).await.ok().flatten(),
+        "antigravity" => antigravity().await,
         _ => None,
     }
 }
@@ -159,6 +161,56 @@ pub fn codex_context_file(text: &str) -> Option<Value> {
     (window > 0).then(|| json!({ "used": used, "window": window, "compactions": compactions }))
 }
 
+async fn antigravity() -> Option<Value> {
+    use crate::procs::Launch;
+    let r = crate::procs::resolve(&["agy", "antigravity-cli"], None)?;
+    let l = Launch {
+        args: vec!["-p".into(), "/usage".into(), "--print-timeout".into(), "40s".into()],
+        env: vec![("AGY_CLI_DISABLE_AUTO_UPDATE".into(), "1".into()), ("NO_COLOR".into(), "1".into())],
+        ..Default::default()
+    };
+    let out = crate::procs::run(&r, &l, std::time::Duration::from_secs(50)).await.ok()?;
+    if !out.ok() {
+        tracing::debug!("antigravity usage read failed");
+        return None;
+    }
+    antigravity_parse(&crate::procs::strip_ansi(&out.stdout))
+}
+
+/// Rows of "group<TAB>limit name<TAB>NN%<TAB>reset time", e.g. "Gemini Models\tFive Hour Limit Remaining\t100%\t2026-11-23T19:21:15Z".
+/// The status bar shows one figure per window, so the group closest to its limit stands for the plan; every group is
+/// kept under "groups".
+pub fn antigravity_parse(text: &str) -> Option<Value> {
+    let mut q = json!({});
+    let mut groups = vec![];
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split('\t').map(str::trim).filter(|c| !c.is_empty()).collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let Some(left) = cols.iter().find_map(|c| c.strip_suffix('%')?.trim().parse::<f64>().ok()) else { continue };
+        let resets = cols.iter().find_map(|c| chrono::DateTime::parse_from_rfc3339(c).ok()).map(|d| d.timestamp_millis());
+        let name = cols[1].to_lowercase();
+        let window = if name.contains("five hour") || name.contains("5 hour") {
+            "five_hour"
+        } else if name.contains("week") {
+            "weekly"
+        } else {
+            continue;
+        };
+        let used = (1.0 - left / 100.0).clamp(0.0, 1.0);
+        groups.push(json!({ "group": cols[0], "window": window, "used": used, "resets_at": resets }));
+        if q[window]["used"].as_f64().is_none_or(|u| used > u) {
+            q[window] = json!({ "used": used, "resets_at": resets });
+        }
+    }
+    if q.as_object().is_none_or(|o| o.is_empty()) {
+        return None;
+    }
+    q["groups"] = json!(groups);
+    Some(q)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +235,14 @@ mod tests {
         assert!((c["five_hour"]["used"].as_f64().unwrap() - 0.12).abs() < 1e-9);
         assert!((c["weekly"]["used"].as_f64().unwrap() - 0.40).abs() < 1e-9);
         assert_eq!(c["five_hour"]["resets_at"].as_i64().unwrap(), chrono::DateTime::parse_from_rfc3339("2026-11-23T06:00:00Z").unwrap().timestamp_millis());
+    }
+    #[test]
+    fn reads_antigravity_usage() {
+        let t = "Gemini Models\tWeekly Limit Remaining\t87%\t2026-11-29T15:41:45Z\nGemini Models\tFive Hour Limit Remaining\t100%\t2026-11-23T19:21:15Z\nClaude and GPT models\tFive Hour Limit Remaining\t40%\t2026-11-23T19:21:15Z\n";
+        let q = antigravity_parse(t).unwrap();
+        assert!((q["weekly"]["used"].as_f64().unwrap() - 0.13).abs() < 1e-9);
+        assert!((q["five_hour"]["used"].as_f64().unwrap() - 0.6).abs() < 1e-9);
+        assert_eq!(q["groups"].as_array().unwrap().len(), 3);
+        assert!(antigravity_parse("nothing here").is_none());
     }
 }

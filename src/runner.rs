@@ -72,13 +72,50 @@ pub fn transient_error(e: &str) -> bool {
 /// Automatic retries of a transient failure before the turn is reported as failed, and the pause before each.
 const TRANSIENT_RETRIES: [u64; 3] = [8, 25, 60];
 
-/// Tell the project's lead something happened (a worker replied, a limit was hit, a decision was answered).
-pub fn wake_lead(core: &CoreRef, project: &str, body: &str, meta: Value) {
+/// Wakes waiting to be handed to a lead together, by project. Each lead turn re-reads the whole conversation, so
+/// five events a few seconds apart cost five full turns; held for a moment they cost one.
+fn wake_buffer() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static B: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn post_wake(core: &CoreRef, project: &str, body: &str, meta: Value) {
     match core.lead_thread(project) {
         Ok(l) => {
             let _ = post(core, l["id"].as_str().unwrap_or(""), "wake", "Model Roamer", body, meta, true);
         }
         Err(e) => tracing::warn!("no lead thread for {project}: {e}"),
+    }
+}
+
+/// Tell the project's lead something happened (a worker replied, a limit was hit, a decision was answered). Events
+/// within `wake_batch_sec` seconds (default 25, 0 = off) of the first one reach the lead as a single message.
+pub fn wake_lead(core: &CoreRef, project: &str, body: &str, meta: Value) {
+    let secs = core.settings()["wake_batch_sec"].as_u64().unwrap_or(25);
+    if secs == 0 {
+        return post_wake(core, project, body, meta);
+    }
+    let first = {
+        let mut b = wake_buffer().lock().unwrap_or_else(|p| p.into_inner());
+        let v = b.entry(project.to_string()).or_default();
+        v.push(body.to_string());
+        v.len() == 1
+    };
+    if first {
+        let (core, project) = (core.clone(), project.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            let bodies = wake_buffer().lock().unwrap_or_else(|p| p.into_inner()).remove(&project).unwrap_or_default();
+            match bodies.len() {
+                0 => {}
+                1 => post_wake(&core, &project, &bodies[0], json!({})),
+                n => post_wake(&core, &project, &format!("{n} events happened in the last few seconds. Handle them together:
+
+{}", bodies.join("
+
+")), json!({ "batched": n })),
+            }
+        });
     }
 }
 

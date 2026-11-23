@@ -55,6 +55,9 @@ pub fn defaults() -> Value {
         "idle_timeout_min": 25,
         "max_turn_min": 180,
         "max_tool_rounds": 8,
+        // events for the lead (a worker replied, a limit hit) that arrive within this many seconds of the first reach it as one message, so it
+        // runs one turn instead of several; 0 hands them over at once
+        "wake_batch_sec": 25,
 
         // git and GitHub
         "github_token": "",

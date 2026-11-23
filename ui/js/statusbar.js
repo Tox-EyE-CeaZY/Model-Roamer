@@ -122,7 +122,7 @@ function showPop(anchor, q) {
     return h('div', { class: 'sb-p-row' },
       h('span', {}, label),
       h('span', { class: 'sb-m-bar wide' }, h('i', { style: { width: (p ?? 0) + '%' } })),
-      h('b', {}, p == null ? 'not reported' : p + '%'),
+      h('b', {}, p == null ? 'unknown' : p + '%'),
       w?.resets_at ? h('small', {}, resetIn(w.resets_at)) : null);
   };
   const lim = q.limit?.active ? h('div', { class: 'sb-p-hot' }, `Out of usage${q.limit.until ? ', ' + resetIn(q.limit.until) : ''}. ${q.limit.note || ''}`) : null;
@@ -134,8 +134,8 @@ function showPop(anchor, q) {
     row('Weekly', q.weekly),
     h('div', { class: 'sb-p-foot' },
       `${plural(q.turns_5h || 0, 'turn')} in the last 5 hours, ${q.turns_7d || 0} this week`,
-      q.at ? ` · reported ${dur(Date.now() - q.at)} ago` : '',
-      unknown ? '. It reports its plan usage during a turn; numbers show after its next one.' : ''));
+      q.at ? ` · checked ${dur(Date.now() - q.at)} ago` : '',
+      !unknown ? '' : q.id === 'antigravity' ? '. Antigravity doesn’t share its plan usage, so only its turns are counted.' : '. Not read yet: it is checked at start-up, every ten minutes and after each turn (sign in under Agents if it stays empty).'));
   document.body.append(pop);
   const r = anchor.getBoundingClientRect();
   const w = pop.offsetWidth;

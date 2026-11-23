@@ -870,6 +870,11 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     if let Some(sid) = &new_session {
         core.set_thread(thread, &json!({ "session_id": sid, "session_agent": agent }))?;
     }
+    {
+        // the usage this turn spent, read fresh for the status bar
+        let (c2, a2) = (core.clone(), agent.clone());
+        tokio::spawn(async move { c2.refresh_quota(&a2).await });
+    }
     core.bus.emit("turn", pid.as_deref(), Some(thread), json!({ "turn_id": turn_id, "state": "end", "status": status_s, "usage": { "input": usage.0, "output": usage.1, "cached": usage.2, "cost": usage.3 } }));
     let _ = std::fs::remove_dir_all(&scratch);
 

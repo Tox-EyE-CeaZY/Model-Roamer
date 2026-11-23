@@ -342,6 +342,16 @@ impl Core {
         self.bus.emit("quota", None, None, json!({ "agent": agent, "quota": v }));
     }
 
+    /// Read an agent's plan usage the way its CLI does (see quota.rs) and keep it.
+    pub async fn refresh_quota(&self, agent: &str) {
+        if self.agent_cfg(agent)["enabled"] == false {
+            return;
+        }
+        if let Some(q) = crate::quota::probe(agent).await {
+            self.set_quota(agent, &q);
+        }
+    }
+
     /// Plan usage per agent for the status bar: what the CLI last reported (a window that has since reset reads as
     /// unused), its turns in the last 5 hours and 7 days, and any limit it is under.
     pub fn quotas(&self) -> Vec<Value> {

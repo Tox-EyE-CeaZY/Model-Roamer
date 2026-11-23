@@ -406,13 +406,18 @@ pub fn epoch_ms(n: i64) -> i64 {
 /// Codex-style rate limits anywhere in an event: {primary|secondary: {used_percent, window_minutes, resets_in_seconds |
 /// resets_at}}. The window decides 5-hour (up to a day) or weekly.
 pub fn codex_quota(v: &Value) -> Option<Value> {
+    codex_quota_at(v, crate::util::now_ms())
+}
+
+/// The same, for an event that happened at `base` (ms): "resets in N seconds" counts from then.
+pub fn codex_quota_at(v: &Value, base: i64) -> Option<Value> {
     let rl = [&v["rate_limits"], &v["msg"]["rate_limits"], &v["info"]["rate_limits"], &v["payload"]["rate_limits"]].into_iter().find(|x| x.is_object())?;
     let mut q = json!({});
     for k in ["primary", "secondary"] {
         let w = &rl[k];
         let Some(pct) = w["used_percent"].as_f64() else { continue };
         let mins = w["window_minutes"].as_i64().unwrap_or(if k == "primary" { 300 } else { 10080 });
-        let resets = w["resets_at"].as_i64().map(epoch_ms).or_else(|| w["resets_in_seconds"].as_i64().map(|s| crate::util::now_ms() + s * 1000));
+        let resets = w["resets_at"].as_i64().map(epoch_ms).or_else(|| w["resets_in_seconds"].as_i64().map(|s| base + s * 1000));
         q[if mins <= 1440 { "five_hour" } else { "weekly" }] = json!({ "used": (pct / 100.0).clamp(0.0, 1.0), "resets_at": resets });
     }
     (q.as_object().is_some_and(|o| !o.is_empty())).then_some(q)

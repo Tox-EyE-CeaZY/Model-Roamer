@@ -158,6 +158,19 @@ impl AgentAdapter for Claude {
                         q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": w["resetsAt"].as_i64().map(epoch_ms) });
                     }
                 }
+                // older CLIs: one window per event, {rateLimitType, utilization, resetsAt}
+                if q.as_object().is_some_and(|o| o.is_empty()) {
+                    if let Some(u) = info["utilization"].as_f64() {
+                        let name = match info["rateLimitType"].as_str().unwrap_or("") {
+                            "five_hour" => Some("five_hour"),
+                            t if t.starts_with("seven_day") => Some("weekly"),
+                            _ => None,
+                        };
+                        if let Some(name) = name {
+                            q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": info["resetsAt"].as_i64().map(epoch_ms) });
+                        }
+                    }
+                }
                 if q.as_object().is_some_and(|o| !o.is_empty()) {
                     out.push(AgentEvent::Quota(q));
                 }

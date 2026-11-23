@@ -77,6 +77,35 @@ pub fn index(core: &Core, project: Option<&str>) -> String {
     l.iter().map(|m| format!("- {} ({}): {}", m["name"].as_str().unwrap_or(""), scope(m), m["description"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")
 }
 
+/// The index as it goes into an agent's prompt on every turn: capped, so a project with hundreds of notes doesn't put all
+/// of them in front of every agent every time. Bodies never go in; agents read them on demand (read_memory).
+pub fn index_for_prompt(core: &Core, project: Option<&str>) -> String {
+    const MAX_LINES: usize = 40;
+    const MAX_CHARS: usize = 5000;
+    let l = list(core, project).unwrap_or_default();
+    if l.is_empty() {
+        return "Memory is empty.".into();
+    }
+    let mut out = String::new();
+    let mut shown = 0;
+    for m in &l {
+        let desc = m["description"].as_str().unwrap_or("");
+        let desc: String = if desc.chars().count() > 140 { desc.chars().take(140).collect::<String>() + "…" } else { desc.to_string() };
+        let line = format!("- {} ({}): {}
+", m["name"].as_str().unwrap_or(""), scope(m), desc);
+        if shown >= MAX_LINES || out.len() + line.len() > MAX_CHARS {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < l.len() {
+        out.push_str(&format!("…and {} more entries. `read_memory` with no arguments lists them all; `read_memory` with a query searches them. Read an entry only when your task needs it.
+", l.len() - shown));
+    }
+    out.trim_end().to_string()
+}
+
 pub fn write(core: &Core, project: Option<&str>, name: &str, description: &str, body: &str, by: &str) -> Result<Value> {
     let name = util::slug(name, 64);
     if body.trim().is_empty() {

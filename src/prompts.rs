@@ -154,9 +154,11 @@ pub fn system(core: &Core, c: &Ctx) -> String {
         }
     }
     let pid = c.project.and_then(|p| p["id"].as_str());
-    s.push_str(&format!("\n### Memory index\n\n{}\n", memory::index(core, pid)));
-    // the design note travels with every agent so the suite stays one family
-    if let Ok(Some(d)) = memory::get_by_name(core, pid, "design-language") {
+    s.push_str(&format!("\n### Memory index\n\n{}\n", memory::index_for_prompt(core, pid)));
+    // the design note travels with the agents that make things people look at, so the suite stays one family; everyone
+    // else has it in the index and can read it
+    let designs = role == "chat" || ["design", "frontend", "creative"].contains(&t["task_kind"].as_str().unwrap_or(""));
+    if let Ok(Some(d)) = memory::get_by_name(core, pid, "design-language").map(|d| d.filter(|_| designs)) {
         s.push_str(&format!("\n### Design language (from memory)\n\n{}\n", d["body"].as_str().unwrap_or("")));
     }
     s.push_str(&format!(

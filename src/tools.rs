@@ -601,26 +601,34 @@ async fn repo_of(core: &CoreRef, project: Option<&str>) -> Result<(String, Strin
 // ------------------------------------------------------------------------------------------------ text protocol
 /// For agents without MCP: `<roamer-tool name="spawn_thread">{"title": "..."}</roamer-tool>` blocks in a reply.
 pub fn text_calls(reply: &str) -> (String, Vec<(String, Value)>) {
-    let re = regex::Regex::new(r#"(?s)<roamer-tool\s+name="([a-z_]+)"\s*>(.*?)</roamer-tool>"#).unwrap();
+    // Agents get the exact shape wrong in small ways: single quotes, a prefix on the name (roamer:message_lead,
+    // mcp__roamer__message_lead), a self-closing block with no arguments. Take all of those.
+    let re = regex::Regex::new(r#"(?s)<roamer-tool\s+name\s*=\s*["']?([A-Za-z0-9_.:\-]+)["']?\s*(?:/>|>(.*?)</roamer-tool\s*>)"#).unwrap();
     let mut calls = vec![];
     for c in re.captures_iter(reply) {
-        let body = c[2].trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let name = c[1].rsplit(|ch| matches!(ch, ':' | '.')).next().unwrap_or(&c[1]);
+        let name = name.trim_start_matches("mcp__roamer__").trim_start_matches("mcp_roamer_").to_string();
+        let body = c.get(2).map(|m| m.as_str()).unwrap_or("").trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
         let args = if body.is_empty() { json!({}) } else { serde_json::from_str(body).unwrap_or_else(|_| json!({ "_raw": body })) };
-        calls.push((c[1].to_string(), args));
+        calls.push((name, args));
     }
     (re.replace_all(reply, "").trim().to_string(), calls)
 }
 
 pub const TEXT_PROTOCOL: &str = r#"## Calling Model Roamer tools without native tool calls
 
-If the Model Roamer tools are not available to you as tool calls, call them by writing blocks like this in your
-reply (JSON arguments, one block per call):
+Look once at your tool list. If the Model Roamer tools are there as tool calls (message_lead, set_status, read_memory,
+...), use them. If they are not, don't search for them or retry: call them by writing blocks like this in your reply
+(plain tool name, double quotes, JSON arguments, one block per call):
 
 <roamer-tool name="read_memory">{}</roamer-tool>
-<roamer-tool name="spawn_thread">{"title": "Build the settings page", "instructions": "...", "agent": "antigravity"}</roamer-tool>
+<roamer-tool name="message_lead">{"text": "I'm blocked on X, which should I do?"}</roamer-tool>
+<roamer-tool name="set_status">{"status": "review", "note": "ready"}</roamer-tool>
 
-Model Roamer runs them when your turn ends and sends the results back to you in a new turn. Text outside the blocks
-is your reply. Only use this when the native tools are missing."#;
+How it works: Model Roamer runs the blocks when your turn ENDS, then sends the results back in a new turn. So write the
+blocks at the end of your reply, and don't wait for a result inside the same turn. Text outside the blocks is your
+reply. This is also how you reach the lead (or your worker threads) when native tools are missing: `message_lead`
+from a worker, `send_message` from the lead. Writing to the lead in plain prose does not reach it; only a tool call does."#;
 
 /// A title as the person will see it in a list: one line, no wrapping quotes or trailing period, at most 60 characters.
 fn clean_title(raw: &str) -> String {
@@ -644,6 +652,14 @@ mod tests {
         assert_eq!(rest, "Hi\n\nbye");
         assert_eq!(calls[0].0, "read_memory");
         assert_eq!(calls[0].1["name"], "plan");
+    }
+    #[test]
+    fn text_calls_are_forgiving() {
+        let (_, c) = text_calls("<roamer-tool name='mcp__roamer__message_lead'>{\"text\":\"hi\"}</roamer-tool> <roamer-tool name=roamer:read_memory/> <roamer-tool name=\"set_status\">```json\n{\"status\":\"review\"}\n```</roamer-tool>");
+        let names: Vec<&str> = c.iter().map(|x| x.0.as_str()).collect();
+        assert_eq!(names, ["message_lead", "read_memory", "set_status"]);
+        assert_eq!(c[0].1["text"], "hi");
+        assert_eq!(c[2].1["status"], "review");
     }
     #[test]
     fn overlap_rules() {

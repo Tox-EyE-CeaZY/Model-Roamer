@@ -51,6 +51,8 @@ pub struct Core {
     pub turn_tokens: Mutex<HashMap<String, String>>,
     pub terms: Mutex<HashMap<String, TermEntry>>,
     pub status_cache: Mutex<HashMap<String, Value>>,
+    /// One status check per agent at a time: a second caller waits for the running one and reuses its answer.
+    checking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub slots: Mutex<HashMap<String, Arc<Semaphore>>>,
     pub pairing: Mutex<Option<(String, i64)>>,
     pub pair_failures: Mutex<Vec<i64>>,
@@ -100,6 +102,7 @@ impl Core {
             turn_tokens: Mutex::new(HashMap::new()),
             terms: Mutex::new(HashMap::new()),
             status_cache: Mutex::new(HashMap::new()),
+            checking: Mutex::new(HashMap::new()),
             slots: Mutex::new(HashMap::new()),
             pairing: Mutex::new(None),
             pair_failures: Mutex::new(vec![]),
@@ -172,11 +175,74 @@ impl Core {
         agents::locate(a.as_ref(), cfg["path"].as_str())
     }
 
+    /// The models an agent offers: what its CLI reported last time it was asked, else the built-in list.
+    pub fn models_of(&self, a: &dyn AgentAdapter) -> Vec<agents::ModelOpt> {
+        let found: Vec<agents::ModelOpt> = serde_json::from_value(self.db.setting(&format!("models.{}", a.id()))["list"].clone()).unwrap_or_default();
+        agents::merge_models(&a.info().models, &found)
+    }
+
+    fn info_of(&self, a: &dyn AgentAdapter) -> agents::Info {
+        let mut info = a.info();
+        info.models = self.models_of(a);
+        info
+    }
+
+    /// Ask the CLI for its models again when it changed (another version, a new sign-in), the list is a few hours
+    /// old, or `force`. Keeps the last good list when the CLI can't answer.
+    async fn refresh_models(&self, a: &dyn AgentAdapter, r: &Resolved, version: &Option<String>, signed_in: &str, force: bool) {
+        let key = format!("models.{}", a.id());
+        let stored = self.db.setting(&key);
+        let age = util::now_ms() - stored["at"].as_i64().unwrap_or(0);
+        let stale = force
+            || stored["version"] != json!(version)
+            || stored["signed_in"] != json!(signed_in)
+            || age > 6 * 3_600_000
+            || (stored["list"].as_array().is_none_or(|l| l.is_empty()) && age > 10 * 60_000);
+        if !stale {
+            return;
+        }
+        let found = agents::discover_models(a, r).await;
+        let list = if found.is_empty() { stored["list"].clone() } else { json!(found) };
+        let _ = self.db.set_setting(&key, &json!({ "list": list, "at": util::now_ms(), "version": version, "signed_in": signed_in }));
+    }
+
     /// One agent's install, version and sign-in state (slow: runs the CLI). Cached for the UI.
     pub async fn agent_status(&self, id: &str) -> Value {
+        self.agent_status_with(id, false).await
+    }
+
+    /// `agent_status`, asking the CLI for its models even if the list is fresh.
+    pub async fn agent_status_with(&self, id: &str, force_models: bool) -> Value {
+        let gate = self.checking.lock().map(|mut m| m.entry(id.to_string()).or_default().clone()).unwrap_or_default();
+        let started = util::now_ms();
+        let _turn = gate.lock().await;
+        // someone else checked while we waited: their answer is fresh enough
+        if let Some(v) = self.status_cache.lock().ok().and_then(|c| c.get(id).cloned()) {
+            if v["checked_at"].as_i64().unwrap_or(0) >= started && !force_models {
+                return v;
+            }
+        }
+        // never let a CLI that hangs keep the agent "checking" forever
+        match tokio::time::timeout(std::time::Duration::from_secs(60), self.check_agent(id, force_models)).await {
+            Ok(v) => v,
+            Err(_) => {
+                let Some(a) = self.adapter(id) else { return json!({ "id": id, "error": "unknown agent" }) };
+                let v = json!({ "id": id, "info": self.info_of(a.as_ref()), "config": self.agent_cfg(id), "limit": self.limit_of(id), "checked_at": util::now_ms(),
+                    "installed": true, "auth": { "signed_in": "unknown", "detail": "The check took too long; choose Check again" }, "pty": a.needs_pty(),
+                    "install": a.install(), "login": a.login(self.headless), "logout": a.logout() });
+                if let Ok(mut c) = self.status_cache.lock() {
+                    c.insert(id.to_string(), v.clone());
+                }
+                self.bus.emit("agent", None, None, v.clone());
+                v
+            }
+        }
+    }
+
+    async fn check_agent(&self, id: &str, force_models: bool) -> Value {
         crate::os::refresh_path();
         let Some(a) = self.adapter(id) else { return json!({ "id": id, "error": "unknown agent" }) };
-        let info = a.info();
+        let info = self.info_of(a.as_ref());
         let cfg = self.agent_cfg(id);
         let limit = self.limit_of(id);
         let mut v = json!({ "id": id, "info": info, "config": cfg, "limit": limit, "checked_at": util::now_ms(), "pty": a.needs_pty() });
@@ -191,6 +257,16 @@ impl Core {
                 let (ver, auth) = tokio::join!(agents::version(&r), agents::auth(a.as_ref(), &r));
                 v["version"] = json!(ver);
                 v["auth"] = json!(auth);
+                // the model list only matters once it can run; ask after showing the status
+                if auth.signed_in != "no" {
+                    let mut early = v.clone();
+                    early["install"] = json!(a.install());
+                    early["login"] = json!(a.login(self.headless));
+                    early["logout"] = json!(a.logout());
+                    self.bus.emit("agent", None, None, early);
+                    self.refresh_models(a.as_ref(), &r, &ver, &auth.signed_in, force_models).await;
+                    v["info"] = json!(self.info_of(a.as_ref()));
+                }
             }
         }
         v["install"] = json!(a.install());
@@ -213,7 +289,7 @@ impl Core {
                     v["limit"] = self.limit_of(&id);
                     v["config"] = self.agent_cfg(&id);
                     v
-                }).unwrap_or_else(|| json!({ "id": id, "info": a.info(), "config": self.agent_cfg(&id), "limit": self.limit_of(&id), "pending": true }))
+                }).unwrap_or_else(|| json!({ "id": id, "info": self.info_of(a.as_ref()), "config": self.agent_cfg(&id), "limit": self.limit_of(&id), "pending": true }))
             })
             .collect()
     }

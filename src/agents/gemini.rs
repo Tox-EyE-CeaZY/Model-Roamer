@@ -75,9 +75,11 @@ impl AgentAdapter for Gemini {
             summary: "Creative and visual: UI design, front-end layout, design exploration, reading huge codebases at once.".into(),
             site: "https://github.com/google-gemini/gemini-cli".into(),
             models: vec![
-                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Auto-routes between Pro and Flash".into() },
-                ModelOpt { id: "gemini-3-pro".into(), label: "Gemini Pro".into(), note: "Most capable".into() },
-                ModelOpt { id: "gemini-3-flash".into(), label: "Gemini Flash".into(), note: "Fast".into() },
+                // used until `gemini models list` answers; these aliases always mean the newest of each kind
+                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Auto-routes between models".into(), ..Default::default() },
+                ModelOpt { id: "pro".into(), label: "Pro (latest)".into(), note: "Most capable".into(), ..Default::default() },
+                ModelOpt { id: "flash".into(), label: "Flash (latest)".into(), note: "Fast".into(), ..Default::default() },
+                ModelOpt { id: "flash-lite".into(), label: "Flash-Lite (latest)".into(), note: "Fastest".into(), ..Default::default() },
             ],
             mcp: true,
             can_lead: true,
@@ -127,6 +129,10 @@ impl AgentAdapter for Gemini {
         // stdin carries the message; -p switches on headless mode and is appended to it
         a.extend(["-p".into(), " ".into()]);
         Ok(Launch { args: a, stdin: Some(with_system(spec)), cwd: Some(spec.cwd.clone()), env, pty: false })
+    }
+
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        Some(ModelsProbe { args: vec!["models".into(), "list".into(), "--output-format".into(), "json".into()], stdin: None })
     }
 
     fn parse(&self, line: &str, st: &mut Value) -> Vec<AgentEvent> {

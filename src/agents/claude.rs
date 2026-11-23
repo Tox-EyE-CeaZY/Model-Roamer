@@ -15,11 +15,11 @@ impl AgentAdapter for Claude {
             summary: "Best lead. Plans, breaks work down, writes and refactors core code, reviews others' work carefully.".into(),
             site: "https://claude.com/claude-code".into(),
             models: vec![
-                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Claude Code is set to".into() },
-                ModelOpt { id: "opus".into(), label: "Opus (latest)".into(), note: "Most capable; the default lead".into() },
-                ModelOpt { id: "fable".into(), label: "Fable (latest)".into(), note: "Fast and strong".into() },
-                ModelOpt { id: "sonnet".into(), label: "Sonnet (latest)".into(), note: "Balanced".into() },
-                ModelOpt { id: "haiku".into(), label: "Haiku (latest)".into(), note: "Quick small tasks".into() },
+                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Claude Code is set to".into(), ..Default::default() },
+                ModelOpt { id: "opus".into(), label: "Opus (latest)".into(), note: "Most capable; the default lead".into(), ..Default::default() },
+                ModelOpt { id: "fable".into(), label: "Fable (latest)".into(), note: "Fast and strong".into(), ..Default::default() },
+                ModelOpt { id: "sonnet".into(), label: "Sonnet (latest)".into(), note: "Balanced".into(), ..Default::default() },
+                ModelOpt { id: "haiku".into(), label: "Haiku (latest)".into(), note: "Quick small tasks".into(), ..Default::default() },
             ],
             mcp: true,
             can_lead: true,
@@ -74,6 +74,25 @@ impl AgentAdapter for Claude {
         a.extend(spec.extra_args.iter().cloned());
         // the prompt goes in on stdin: no quoting trouble, no length cap
         Ok(Launch { args: a, stdin: Some(spec.prompt.clone()), cwd: Some(spec.cwd.clone()), env: vec![("CLAUDE_CODE_ENTRYPOINT".into(), "model-roamer".into())], pty: false })
+    }
+
+    /// Claude Code has no "models" command, but its SDK handshake answers with the model picker's list.
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        Some(ModelsProbe {
+            args: vec!["-p".into(), "--input-format".into(), "stream-json".into(), "--output-format".into(), "stream-json".into(), "--verbose".into()],
+            stdin: Some("{\"type\":\"control_request\",\"request_id\":\"models\",\"request\":{\"subtype\":\"initialize\"}}\n".into()),
+        })
+    }
+
+    fn models_read(&self, out: &str) -> Vec<ModelOpt> {
+        out.lines()
+            .filter_map(json_line)
+            .find(|v| v["type"] == "control_response")
+            .map(|v| {
+                let r = if v["response"]["response"].is_object() { &v["response"]["response"] } else { &v["response"] };
+                parse_model_list(&r["models"].to_string())
+            })
+            .unwrap_or_default()
     }
 
     fn parse(&self, line: &str, st: &mut Value) -> Vec<AgentEvent> {

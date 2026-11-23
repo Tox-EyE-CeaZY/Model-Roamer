@@ -188,9 +188,9 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     let c = core.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(600)).await;
-        for a in c.adapters() {
-            let _ = c.agent_status(&a.id()).await;
-        }
+        // all at once, so one slow CLI doesn't hold up the others
+        let ids: Vec<String> = c.adapters().iter().map(|a| a.id()).collect();
+        futures_util::future::join_all(ids.iter().map(|id| c.agent_status(id))).await;
     });
     Ok(core)
 }

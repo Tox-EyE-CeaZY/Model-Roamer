@@ -33,9 +33,8 @@ impl AgentAdapter for Codex {
             summary: "Strong, fast engineer for back-end services, APIs, data, infrastructure, scripts and tests.".into(),
             site: "https://developers.openai.com/codex/cli".into(),
             models: vec![
-                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Codex is set to".into() },
-                ModelOpt { id: "gpt-5-codex".into(), label: "GPT-5 Codex".into(), note: "Tuned for coding".into() },
-                ModelOpt { id: "gpt-5".into(), label: "GPT-5".into(), note: "General reasoning".into() },
+                // `codex debug models` fills in the real list; until then, whatever Codex is set to
+                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Codex is set to".into(), ..Default::default() },
             ],
             mcp: true,
             can_lead: true,
@@ -78,6 +77,10 @@ impl AgentAdapter for Codex {
         }
         a.push("-".into()); // read the prompt from stdin
         Ok(Launch { args: a, stdin: Some(with_system(spec)), cwd: Some(spec.cwd.clone()), env: vec![], pty: false })
+    }
+
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        Some(ModelsProbe { args: vec!["debug".into(), "models".into()], stdin: None })
     }
 
     fn parse(&self, line: &str, st: &mut Value) -> Vec<AgentEvent> {

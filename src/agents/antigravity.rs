@@ -16,10 +16,8 @@ impl AgentAdapter for Antigravity {
             summary: "Google's agent-first harness: front-end and full app builds, visual design, checking work in a browser.".into(),
             site: "https://antigravity.google".into(),
             models: vec![
-                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever agy is set to (see `agy models`)".into() },
-                ModelOpt { id: "gemini-3-pro".into(), label: "Gemini Pro".into(), note: "".into() },
-                ModelOpt { id: "gemini-3-flash".into(), label: "Gemini Flash".into(), note: "".into() },
-                ModelOpt { id: "claude-opus".into(), label: "Claude Opus (via agy)".into(), note: "If your plan includes it".into() },
+                // `agy models` fills in the real list (it needs a sign-in)
+                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever agy is set to".into(), ..Default::default() },
             ],
             mcp: true,
             can_lead: true,
@@ -123,6 +121,10 @@ impl AgentAdapter for Antigravity {
             return vec![AgentEvent::Delta(t.into())];
         }
         vec![AgentEvent::Raw(line.to_string())]
+    }
+
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        Some(ModelsProbe { args: vec!["models".into()], stdin: None })
     }
 
     fn auth_probe(&self) -> Option<Vec<String>> {

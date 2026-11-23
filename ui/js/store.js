@@ -67,7 +67,8 @@ listen((ev) => {
       changed('running');
       break;
     case 'agent':
-      if (ev.data?.id) S.agents[ev.data.id] = { ...S.agents[ev.data.id], ...ev.data };
+      // a status event is the whole status: replacing it drops the "pending" of the placeholder it answers
+      if (ev.data?.id) S.agents[ev.data.id] = { ...ev.data, pending: false };
       changed('agents');
       break;
     case 'limits':

@@ -43,7 +43,7 @@ impl AgentAdapter for Custom {
             strengths: self.list("strengths"),
             summary: c["summary"].as_str().unwrap_or("A command-line agent you added").into(),
             site: s(&c["site"]),
-            models: vec![ModelOpt { id: "".into(), label: "CLI default".into(), note: String::new() }],
+            models: vec![ModelOpt { id: "".into(), label: "CLI default".into(), note: String::new(), ..Default::default() }],
             mcp: false,
             can_lead: c["can_lead"].as_bool().unwrap_or(false),
         }

@@ -108,11 +108,20 @@ pub struct Step {
     pub needs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize, PartialEq)]
 pub struct ModelOpt {
     pub id: String,
     pub label: String,
     pub note: String,
+    /// Reasoning effort levels this model takes, when the CLI says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+}
+
+/// How to ask a CLI which models it offers: arguments, and what to write to its stdin.
+pub struct ModelsProbe {
+    pub args: Vec<String>,
+    pub stdin: Option<String>,
 }
 
 /// Static facts about an agent, shown in the UI and given to the lead so it can route well.
@@ -160,6 +169,14 @@ pub trait AgentAdapter: Send + Sync {
     fn login(&self, headless: bool) -> Step;
     fn logout(&self) -> Option<Step> {
         None
+    }
+    /// How to ask the installed CLI for the models it offers (None: it can't say, so `info().models` is used).
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        None
+    }
+    /// Read the probe's output. The default understands JSON lists and plain "model-id  description" lines.
+    fn models_read(&self, out: &str) -> Vec<ModelOpt> {
+        parse_model_list(out)
     }
     /// Whether turns must run inside a pseudo-terminal.
     fn needs_pty(&self) -> bool {
@@ -255,6 +272,100 @@ pub async fn auth(a: &dyn AgentAdapter, r: &Resolved) -> AuthState {
         return AuthState { signed_in: "no".into(), detail: "No saved sign-in found".into() };
     }
     AuthState { signed_in: "unknown".into(), detail: "This CLI has no way to check; run a test to be sure".into() }
+}
+
+/// Ask the CLI which models it offers. Empty when it can't say (not installed, no probe, an error).
+pub async fn discover_models(a: &dyn AgentAdapter, r: &Resolved) -> Vec<ModelOpt> {
+    let Some(p) = a.models_probe() else { return vec![] };
+    let Ok(out) = procs::run(r, &Launch { args: p.args, stdin: p.stdin, ..Default::default() }, Duration::from_secs(45)).await else { return vec![] };
+    if out.timed_out {
+        return vec![];
+    }
+    let mut seen = std::collections::HashSet::new();
+    a.models_read(&out.stdout).into_iter().filter(|m| !m.id.is_empty() && seen.insert(m.id.clone())).collect()
+}
+
+/// The models to offer: "CLI default" first, then what the CLI reported, or the built-in list when it reported nothing.
+pub fn merge_models(builtin: &[ModelOpt], found: &[ModelOpt]) -> Vec<ModelOpt> {
+    if found.is_empty() {
+        return builtin.to_vec();
+    }
+    let mut v: Vec<ModelOpt> = builtin.iter().filter(|m| m.id.is_empty()).cloned().collect();
+    // "default"/"auto" mean the same as our "CLI default" entry
+    v.extend(found.iter().filter(|m| !m.id.is_empty() && m.id != "default" && m.id != "auto").cloned());
+    v
+}
+
+/// A model list in whatever shape a CLI prints it: a JSON array (or an object holding one) of strings or of objects
+/// with an id and a name, or text lines that start with a model id ("gemini-3-pro  Most capable", "- claude-opus").
+pub fn parse_model_list(out: &str) -> Vec<ModelOpt> {
+    let t = out.trim();
+    if let Some(start) = t.find(|c| c == '[' || c == '{') {
+        if let Ok(v) = serde_json::from_str::<Value>(&t[start..]) {
+            let list = if v.is_array() {
+                v
+            } else {
+                ["models", "data", "items", "available_models"].iter().map(|k| v[*k].clone()).find(|x| x.is_array()).unwrap_or(Value::Null)
+            };
+            if let Some(arr) = list.as_array() {
+                return arr.iter().filter_map(model_from_json).collect();
+            }
+        }
+    }
+    static ID: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ID.get_or_init(|| regex::Regex::new(r"^[\s*•>\-]*\(?([A-Za-z][A-Za-z0-9]*(?:[-._/:@][A-Za-z0-9]+)+)\)?(?:\s+\(([^)]*)\))?\s*(?:[-–—:|]\s*)?(.*)$").unwrap());
+    let mut v = vec![];
+    for line in t.lines() {
+        let l = procs::strip_ansi(line);
+        if l.trim().is_empty() || l.trim_end().ends_with(':') {
+            continue;
+        }
+        if let Some(c) = re.captures(&l) {
+            let id = c[1].to_string();
+            // a model id has a digit or a known family word; this keeps out URLs and prose
+            let lid = id.to_lowercase();
+            if id.contains("://") || !(lid.chars().any(|ch| ch.is_ascii_digit()) || ["opus", "sonnet", "haiku", "fable", "gemini", "gpt", "flash", "pro", "claude"].iter().any(|w| lid.contains(w))) {
+                continue;
+            }
+            let label = c.get(2).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty() && *s != id).unwrap_or_else(|| pretty_model(&id));
+            v.push(ModelOpt { id, label, note: c.get(3).map(|m| m.as_str().trim().to_string()).unwrap_or_default(), ..Default::default() });
+        }
+    }
+    v
+}
+
+/// A readable name for a bare model id: "gemini-3.5-flash" → "Gemini 3.5 Flash".
+pub fn pretty_model(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) if f.is_ascii_alphabetic() && w.len() <= 3 && !["pro", "max", "mini", "lite"].contains(&w) => w.to_uppercase(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn model_from_json(m: &Value) -> Option<ModelOpt> {
+    if let Some(id) = m.as_str() {
+        return Some(ModelOpt { id: id.into(), label: id.into(), ..Default::default() });
+    }
+    if m["visibility"].as_str().is_some_and(|x| x == "hide" || x == "hidden") || m["hidden"] == true {
+        return None;
+    }
+    let id = ["value", "slug", "id", "modelId", "model", "name"].iter().find_map(|k| m[*k].as_str().filter(|s| !s.is_empty()))?.to_string();
+    let label = ["displayName", "display_name", "label", "name"].iter().find_map(|k| m[*k].as_str().filter(|s| !s.is_empty() && *s != id)).map(str::to_string).unwrap_or_else(|| pretty_model(&id));
+    let note = ["description", "note"].iter().find_map(|k| m[*k].as_str()).unwrap_or("").to_string();
+    let efforts = m["supportedEffortLevels"]
+        .as_array()
+        .or(m["supported_reasoning_levels"].as_array())
+        .map(|a| a.iter().filter_map(|e| e.as_str().or(e["effort"].as_str()).map(str::to_string)).collect())
+        .unwrap_or_default();
+    Some(ModelOpt { id, label, note, efforts })
 }
 
 // ------------------------------------------------------------------------------------------------ shared helpers
@@ -364,6 +475,27 @@ pub fn scratch_file(dir: &Path, name: &str, body: &str) -> anyhow::Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_model_lists() {
+        // Codex: JSON catalog, hidden models left out, effort levels kept
+        let c = parse_model_list(r#"{"models":[{"slug":"gpt-6.2-sol","display_name":"GPT-6.2-Sol","description":"Fast","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},{"slug":"old","visibility":"hide"}]}"#);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].id.as_str(), c[0].label.as_str(), c[0].efforts.len()), ("gpt-6.2-sol", "GPT-6.2-Sol", 2));
+        // Gemini: JSON array
+        let g = parse_model_list(r#"[{"modelId":"auto","id":"auto","displayName":"Auto"},{"id":"gemini-4-argon","displayName":"Gemini 4 Argon","description":""}]"#);
+        assert_eq!(g[1].label, "Gemini 4 Argon");
+        // plain text, as a CLI might print it
+        let t = parse_model_list("Available models:\n  gemini-4-argon (Gemini 4 Argon)  Most capable\n  - claude-opus-5-5: Opus 5.5\nSee https://example.com/models for more\n");
+        assert_eq!(t.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["gemini-4-argon", "claude-opus-5-5"]);
+        assert_eq!(t[0].label, "Gemini 4 Argon");
+        assert_eq!(pretty_model("gemini-3.5-flash"), "Gemini 3.5 Flash");
+        assert_eq!(pretty_model("gpt-6-mini"), "GPT 6 Mini");
+        // "CLI default" stays first; the CLI's own "default"/"auto" entries are dropped
+        let merged = merge_models(&[ModelOpt { id: "".into(), label: "CLI default".into(), ..Default::default() }], &g);
+        assert_eq!(merged.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["", "gemini-4-argon"]);
+    }
+
     #[test]
     fn limits_and_resets() {
         assert!(limit_in("all good").is_none());

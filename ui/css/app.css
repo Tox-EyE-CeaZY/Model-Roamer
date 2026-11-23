@@ -134,7 +134,7 @@ html.pop #side { display: none; }
 .tgl-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 6px 0; font-size: 13.5px; }
 .pick2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .pick2 > span:empty { display: none; }
-.empty { display: grid; justify-items: center; gap: 8px; padding: 46px 20px; text-align: center; color: var(--dim); }
+.empty { grid-column: 1 / -1; justify-self: stretch; display: grid; justify-items: center; gap: 8px; padding: 46px 20px; text-align: center; color: var(--dim); }
 .empty-ic { color: var(--accent); opacity: .8; margin-bottom: 4px; }
 .empty h3 { margin: 0; font: 700 18px var(--f-display); color: var(--ink); }
 .empty p { margin: 0 0 8px; max-width: 50ch; font-size: 13.5px; }

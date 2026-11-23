@@ -68,6 +68,7 @@ pub fn router(core: CoreRef) -> Router {
         // agents and tools
         .route("/api/agents", get(list_agents).post(add_custom_agent))
         .route("/api/agents/{id}", get(agent_status).patch(patch_agent).delete(remove_custom_agent))
+        .route("/api/agents/{id}/models", post(refresh_agent_models))
         .route("/api/agents/{id}/test", post(test_agent))
         .route("/api/agents/{id}/limit", delete(clear_limit))
         .route("/api/setup", get(setup_status))
@@ -816,6 +817,14 @@ async fn list_agents(State(core): State<CoreRef>, q: Q) -> R {
 
 async fn agent_status(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     Ok(Json(core.agent_status(&id).await))
+}
+
+/// Ask the agent's CLI for its models now.
+async fn refresh_agent_models(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    if core.adapter(&id).is_none() {
+        return Err(bad("Unknown agent"));
+    }
+    Ok(Json(core.agent_status_with(&id, true).await))
 }
 
 async fn patch_agent(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {

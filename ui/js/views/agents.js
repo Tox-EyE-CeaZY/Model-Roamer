@@ -39,12 +39,16 @@ export default async function agents(el, r) {
 }
 
 // ------------------------------------------------------------ agent cards
+let checkingAll = null;
 async function agentCards(el, openId) {
   const grid = h('div', { class: 'ag-grid' });
   el.append(grid, h('div', { class: 'ag-custom' }, kicker('Your own agents'), h('p', { class: 'faint small' }, 'Any command-line agent that takes a prompt and prints an answer can join the fleet.'), h('button', { class: 'btn', onclick: () => customDialog() }, ic('plus', 13), 'Add an agent')));
   const draw = () => grid.replaceChildren(...agentList().map((a) => card(a)));
   draw();
-  if (agentList().some((a) => a.pending)) get('agents?refresh=1', { timeout: 90000 }).catch(() => {});
+  // the app checks every agent when it starts; ask only if none of that has come back (once per visit, never stacked)
+  if (agentList().every((a) => a.pending) && !checkingAll) {
+    checkingAll = get('agents?refresh=1', { timeout: 90000 }).catch(() => {}).finally(() => (checkingAll = null));
+  }
   if (openId) setTimeout(() => document.getElementById('ag-' + openId)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 100);
   return watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && draw());
 }
@@ -84,6 +88,7 @@ function card(a) {
       info.mcp === false ? null : { label: 'Add Model Roamer tools to its own config', icon: 'cpu', title: 'Not needed for Model Roamer itself; lets you use the tools from the CLI by hand', run: () => runStep({ what: 'connect', agent: a.id, title: 'Connect Model Roamer tools' }) },
       { sep: true },
       { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
+      a.installed ? { label: 'Refresh models', icon: 'refresh', title: 'Ask the CLI which models it offers now', run: () => post(`agents/${a.id}/models`, {}, { timeout: 90000 }).then((r) => toast(`${(r.info?.models || []).filter((m) => m.id).length} models from ${info.name}`)).catch((e) => toast(e.message, { err: true })) } : null,
       info.site ? { label: 'Website', icon: 'external', run: () => openExternal(info.site) } : null,
       a.id.match(/^(claude|codex|gemini|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
     ], r.right, r.bottom + 4, { anchor: e.currentTarget });
@@ -134,7 +139,18 @@ async function test(a, out) {
 function drawSettings(el, a) {
   const cfg = a.config || {};
   const save = (p) => patch('agents/' + a.id, p).then(() => toast('Saved', { ms: 1200 })).catch((e) => toast(e.message, { err: true }));
-  const efforts = a.id === 'claude' ? [['', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max']] : [['', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']];
+  // effort levels come from the CLI's model list when it gives them (they differ per model), else a common set
+  const EFFORT = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
+  const effortsFor = (model) => {
+    const ms = a.info?.models || [];
+    const m = ms.find((x) => x.id === model);
+    const lv = m?.efforts?.length ? m.efforts : [...new Set(ms.flatMap((x) => x.efforts || []))];
+    const list = lv.length ? lv : a.id === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high'];
+    return [['', 'CLI default'], ...list.map((e) => [e, EFFORT[e] || e])];
+  };
+  const effortBox = h('span');
+  const drawEffort = (model) => effortBox.replaceChildren(select(effortsFor(model), cfg.effort || '', (v) => save({ effort: (cfg.effort = v) })));
+  drawEffort(cfg.model || '');
   const path = input(cfg.path || '', { placeholder: 'Found automatically. Or the full path to the program.' });
   path.onchange = () => save({ path: path.value.trim() });
   const args = input((cfg.extra_args || []).join(' '), { placeholder: 'Extra arguments for every turn (advanced)' });
@@ -142,8 +158,8 @@ function drawSettings(el, a) {
   const par = input(cfg.max_parallel ?? 3, { type: 'number', min: 1, max: 12, class: 'input num' });
   par.onchange = () => save({ max_parallel: Math.max(1, Math.min(12, +par.value || 1)) });
   el.replaceChildren(
-    field('Model', select(modelOptions(a.id), cfg.model || '', (v) => save({ model: v })), 'Used for new work unless a thread names another.'),
-    a.id === 'claude' || a.id === 'codex' ? field('Effort', select(efforts, cfg.effort || '', (v) => save({ effort: v }))) : null,
+    field('Model', select(modelOptions(a.id), cfg.model || '', (v) => (save({ model: v }), drawEffort(v))), 'Used for new work unless a thread names another. The list comes from the CLI itself: More › Refresh models asks it again.'),
+    a.id === 'claude' || a.id === 'codex' ? field('Effort', effortBox) : null,
     field('Permissions', seg([['full', 'Full auto'], ['edits', 'Edits only'], ['readonly', 'Read only']], cfg.autonomy || 'full', (v) => save({ autonomy: v })), 'Full auto lets it run commands without asking (it works in its own worktree). Read only is for reviews and research.'),
     field('At the same time', par, 'How many turns of this agent may run at once. Subscriptions have limits; lower is gentler on them.'),
     field('Program', path),

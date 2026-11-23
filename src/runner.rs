@@ -53,7 +53,19 @@ pub fn post(core: &CoreRef, thread: &str, role: &str, author: &str, body: &str, 
     let m = core.db.one("SELECT * FROM messages WHERE id = ?1", &[&id])?.unwrap_or_default();
     core.bus.emit("message", t["project_id"].as_str(), Some(thread), m.clone());
     if wake {
-        schedule(core, thread);
+        let secs = core.settings()["wake_batch_secs"].as_u64().unwrap_or(45);
+        let automatic = role == "wake" && t["kind"] == "lead";
+        let idle = !core.running.lock().unwrap_or_else(|p| p.into_inner()).contains_key(thread);
+        if automatic && idle && secs > 0 {
+            // a turn re-reads the whole conversation, so let nearby events pile up and read them together
+            let (c, th) = (core.clone(), thread.to_string());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                schedule(&c, &th);
+            });
+        } else {
+            schedule(core, thread);
+        }
     }
     Ok(m)
 }
@@ -148,8 +160,9 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     if let Some(b) = &buddy {
         core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
     }
-    if !w.effort.is_empty() && buddy.is_none() {
-        core.db.exec("UPDATE threads SET effort = ?1 WHERE id = ?2", &[&w.effort, &id])?;
+    let effort = if w.effort.is_empty() { route_effort(core, Some(project), &kind, &agent) } else { w.effort.clone() };
+    if !effort.is_empty() && buddy.is_none() {
+        core.db.exec("UPDATE threads SET effort = ?1 WHERE id = ?2", &[&effort, &id])?;
     }
     let t = core.thread(&id)?;
     core.bus.emit("thread", Some(&pid_s), Some(&id), t.clone());
@@ -248,6 +261,21 @@ pub fn route(core: &CoreRef, project: Option<&str>, kind: &str) -> Option<(Strin
         }
     }
     None
+}
+
+/// The thinking strength the routing rules give a kind of task (stored as `effort:<kind>` next to the agent rule,
+/// the project's setting over the global one). It applies only when the thread runs on the agent the rule names,
+/// because the levels differ per agent.
+pub fn route_effort(core: &CoreRef, project: Option<&str>, kind: &str, agent: &str) -> String {
+    let mut routing = core.settings()["routing"].clone();
+    if let Some(p) = project.and_then(|p| core.project(p).ok()) {
+        crate::config::merge(&mut routing, &p["routing"]);
+    }
+    let rule_agent = routing[kind].as_str().or(routing["general"].as_str()).unwrap_or("claude");
+    if rule_agent != agent {
+        return String::new();
+    }
+    routing[format!("effort:{kind}")].as_str().unwrap_or("").to_string()
 }
 
 /// Every agent's state right now, for the lead: ready, out of usage (and until when), signed out, how much of its
@@ -1099,9 +1127,13 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                 } else {
                     let mut out = String::from("<tool-results>\n");
                     for (name, args) in calls {
-                        let res = match tools::call(core, &core.thread(thread)?, &name, &args).await {
-                            Ok(r) => r,
-                            Err(e) => format!("Error: {e}"),
+                        let res = if args.get("_raw").is_some() {
+                            format!("Error: the arguments of this call weren't valid JSON, so it did not run. Send it again with a single JSON object as the body, for example <roamer-tool name=\"{name}\">{{\"text\": \"...\"}}</roamer-tool>.")
+                        } else {
+                            match tools::call(core, &core.thread(thread)?, &name, &args).await {
+                                Ok(r) => r,
+                                Err(e) => format!("Error: {e}"),
+                            }
                         };
                         add_activity(core, &t, &turn_id, "tool", &format!("roamer:{name}"), &args.to_string());
                         out.push_str(&format!("<result tool=\"{name}\">\n{}\n</result>\n", clip(&res, 30_000)));

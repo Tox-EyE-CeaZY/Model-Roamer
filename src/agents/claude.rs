@@ -72,6 +72,10 @@ impl AgentAdapter for Claude {
             let f = scratch_file(&spec.scratch, "mcp.json", &cfg.to_string())?;
             a.push("--mcp-config".into());
             a.push(f);
+            if spec.lead {
+                // the lead only routes: don't load the person's other MCP servers into every turn
+                a.push("--strict-mcp-config".into());
+            }
             a.push("--allowedTools".into());
             a.push("mcp__roamer".into());
         }

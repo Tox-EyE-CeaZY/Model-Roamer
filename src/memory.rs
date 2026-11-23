@@ -62,19 +62,36 @@ pub fn read(core: &Core, project: Option<&str>, name: &str, query: &str) -> Resu
         }
         return Ok(r.iter().map(|m| format!("- {} ({}): {}", m["name"].as_str().unwrap_or(""), scope(m), m["snippet"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"));
     }
-    Ok(index(core, project))
+    Ok(index_described(core, project))
 }
 
 fn scope(m: &Value) -> &'static str {
     if m["project_id"].is_null() { "global" } else { "project" }
 }
 
+/// Names only, for every turn's prompt: descriptions can be long, so an agent asks for them (and for bodies) when it
+/// wants them.
+const INDEX_MAX: usize = 100;
+
 pub fn index(core: &Core, project: Option<&str>) -> String {
     let l = list(core, project).unwrap_or_default();
     if l.is_empty() {
         return "Memory is empty.".into();
     }
-    l.iter().map(|m| format!("- {} ({}): {}", m["name"].as_str().unwrap_or(""), scope(m), m["description"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n")
+    let mut names: Vec<String> = l.iter().take(INDEX_MAX).map(|m| format!("`{}`{}", m["name"].as_str().unwrap_or(""), if scope(m) == "global" { " (global)" } else { "" })).collect();
+    if l.len() > INDEX_MAX {
+        names.push(format!("...and {} more", l.len() - INDEX_MAX));
+    }
+    format!("Entries: {}.\nYou get names only. Call `read_memory` with a `name` for an entry in full, with a `query` to search, or with no arguments for each entry's description.", names.join(", "))
+}
+
+/// Every entry with its description, for `read_memory` with no arguments.
+pub fn index_described(core: &Core, project: Option<&str>) -> String {
+    let l = list(core, project).unwrap_or_default();
+    if l.is_empty() {
+        return "Memory is empty.".into();
+    }
+    l.iter().map(|m| format!("- {} ({}): {}", m["name"].as_str().unwrap_or(""), scope(m), util::clip(m["description"].as_str().unwrap_or(""), 300))).collect::<Vec<_>>().join("\n")
 }
 
 pub fn write(core: &Core, project: Option<&str>, name: &str, description: &str, body: &str, by: &str) -> Result<Value> {

@@ -9,7 +9,7 @@ import { go, back, openThread, deleteProject } from '../app.js';
 import { popOut, setTitle, openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { mountThread, decisionCard } from './thread.js';
-import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, agentOptions, modelOptions, pickFolder, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 
 const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
 
@@ -308,7 +308,13 @@ async function settingsTab(el, p, onSaved) {
     e.currentTarget.classList.add('on');
   } })));
   const routing = { ...(p.routing || {}) };
-  const routeRows = S.taskKinds.map((k) => h('div', { class: 'route-row' }, h('span', {}, k.label), select([['', `Default (${agentName(S.settings.routing?.[k.id] || 'claude')})`], ...agentOptions()], routing[k.id] || '', (v) => (v ? (routing[k.id] = v) : delete routing[k.id]))));
+  const routeRows = S.taskKinds.map((k) => {
+    const rule = () => routing[k.id] || S.settings.routing?.[k.id] || 'claude';
+    const ef = routeEffort(rule(), routing['effort:' + k.id] ?? S.settings.routing?.['effort:' + k.id], (v) => (routing['effort:' + k.id] = v));
+    return h('div', { class: 'route-row r3' }, h('span', {}, k.label),
+      select([['', `Default (${agentName(S.settings.routing?.[k.id] || 'claude')})`], ...agentOptions()], routing[k.id] || '', (v) => { if (v) routing[k.id] = v; else delete routing[k.id]; routing['effort:' + k.id] = ''; ef.set(rule()); }),
+      ef.el);
+  });
   const save = async () => {
     const { agent: la, model: lm } = lead.get();
     try {

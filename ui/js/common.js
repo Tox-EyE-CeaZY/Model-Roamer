@@ -116,6 +116,19 @@ export function effortOptions(agentId, model, defaultLabel = 'Default thinking')
   return [['', defaultLabel], ...list.map((e) => [e, EFFORT[e] || e])];
 }
 
+/** The thinking-strength select for a routing row. It follows the row's agent: call `set(agentId)` when that changes. */
+export function routeEffort(agentId, value, onchange) {
+  const el = h('span');
+  let cur = value || '';
+  const set = (a) => {
+    const o = effortOptions(a, agent(a).config?.model || '', 'Default thinking');
+    if (!o || !o.some(([v]) => v === cur)) cur = '';
+    el.replaceChildren(...(o ? [select(o, cur, (v) => onchange((cur = v)))] : []));
+  };
+  set(agentId);
+  return { el, set };
+}
+
 /** An agent + model (+ thinking strength) set of selects that keep each other in step. */
 export function agentModelPicker({ agentId, model, effort = '', leadOnly, auto, onchange }) {
   let a = agentId, m = model, e = effort;

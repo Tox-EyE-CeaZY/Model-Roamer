@@ -15,6 +15,9 @@ pub fn defaults() -> Value {
         "steps": "collapsed",
         // parked threads (kept idle by the lead for follow-ups) close themselves after this many hours unused; 0 = never
         "idle_close_hours": 24,
+        // automatic events (a thread replied, finished, hit a limit) wait this many seconds so the lead reads several in
+        // one turn instead of paying for a full turn each; 0 = wake at once. The person's own messages never wait.
+        "wake_batch_secs": 45,
 
         // windows
         "popout_threads": false,

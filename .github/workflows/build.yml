@@ -1,0 +1,161 @@
+name: Build and release
+
+# Every push to main builds everything and publishes the downloads as the release for the version in Cargo.toml
+# (v0.1.0, ...): the first push of a version creates the release, later pushes refresh its files.
+# Pushing a tag like v0.2.0 publishes that version instead. Pull requests build and test without publishing.
+# Asset names must match src/update.rs, which picks the file to self-update from.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (server build, no window libraries needed)
+        run: cargo test --no-default-features
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Interface modules parse
+        run: for f in $(find ui/js -name '*.js'); do node --experimental-default-type=module --check "$f" || exit 1; done
+
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64,   os: windows-latest,   target: x86_64-pc-windows-msvc,    ext: .exe }
+          - { name: windows-arm64, os: windows-latest,   target: aarch64-pc-windows-msvc,   ext: .exe }
+          - { name: macos-arm64,   os: macos-latest,     target: aarch64-apple-darwin }
+          - { name: macos-x64,     os: macos-latest,     target: x86_64-apple-darwin }
+          - { name: linux-x64,     os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the tag as the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          perl -0pi -e "s/^version = \"[^\"]*\"/version = \"$V\"/m" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libxdo-dev libayatana-appindicator3-dev libssl-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          V="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          cp "target/${{ matrix.target }}/release/model-roamer${{ matrix.ext }}" "dist/model-roamer-${{ matrix.name }}${{ matrix.ext }}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            bash .github/scripts/make_app.sh "target/${{ matrix.target }}/release/model-roamer" "$V" "dist/ModelRoamer-${{ matrix.name }}.zip"
+          fi
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  server:
+    name: server-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: linux-x64,   os: ubuntu-22.04 }
+          - { arch: linux-arm64, os: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the tag as the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          perl -0pi -e "s/^version = \"[^\"]*\"/version = \"$V\"/m" Cargo.toml
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-${{ matrix.arch }}
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Build (headless, no window)
+        run: cargo build --release --no-default-features
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/release/model-roamer "dist/model-roamer-server-${{ matrix.arch }}"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [test, desktop, server]
+    if: ${{ always() && !cancelled() && needs.test.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create or refresh the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="$GITHUB_REF_NAME"; else TAG="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"; fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Model Roamer ${TAG#v}" --generate-notes
+          fi

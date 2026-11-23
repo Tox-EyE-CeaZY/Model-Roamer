@@ -15,7 +15,7 @@ export default async function welcome(el) {
     return h('div', { class: 'wl-agent cut', style: { '--ah': a.info?.hue } },
       h('i', { class: 'ag-sw' }), h('div', {}, h('b', {}, a.info?.name), h('small', { class: 'faint' }, a.info?.vendor)),
       a.pending ? h('span', { class: 'status dim' }, h('span', { class: 'spin' }), 'Checking')
-        : ready ? h('span', { class: 'status acc' }, ic('check', 12), 'Ready')
+        : ready ? h('span', { class: 'status acc' }, 'Ready')
           : !a.installed ? h('button', { class: 'btn sm', onclick: () => runStep({ what: 'install', agent: a.id, title: a.install?.[0]?.label }) }, 'Install')
             : h('button', { class: 'btn sm primary', onclick: () => runStep({ what: 'login', agent: a.id, title: a.login?.label }) }, 'Sign in'));
   }));

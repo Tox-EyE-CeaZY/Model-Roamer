@@ -228,7 +228,7 @@ async function gitTab(el, p) {
   if (!g.repo) {
     return el.replaceChildren(empty('branch', 'Not a git repository', g.git ? `${g.folder} has no git history. Agents still work there, but in place (no branches, no merging). Ask the lead to run “git init” if you want branches.` : 'Git isn’t installed on this machine. Install it under Agents › Tools.', g.git ? null : h('a', { class: 'btn', href: '#/agents?tab=tools' }, 'Install Git')));
   }
-  const changes = (g.status || '').split('\n').filter(Boolean);
+  const changes = (g.status || '').split('\n').filter((l) => l && !l.startsWith('##')); // "## branch" is a header, not a change
   el.replaceChildren(h('div', { class: 'git-grid' },
     h('section', { class: 'panel cut' }, kicker('Repository'),
       h('dl', { class: 'facts' },
@@ -241,8 +241,24 @@ async function gitTab(el, p) {
     h('section', { class: 'panel cut wide' }, kicker('Pull requests', prs.repo ? h('a', { class: 'chipbtn', href: `https://github.com/${prs.repo}/pulls` }, 'On GitHub') : null),
       !prs.github ? h('p', { class: 'faint small' }, 'The remote isn’t on GitHub.')
         : prs.error ? h('p', { class: 'faint small' }, prs.error + ' — sign in under Settings › GitHub.')
-          : prs.prs?.length ? h('div', { class: 'prs' }, prs.prs.map((r) => h('a', { class: 'pr-i', href: r.url }, ic('pr', 14), h('b', {}, '#' + r.number), h('span', {}, r.title), h('code', { class: 'faint' }, r.branch), r.draft ? h('span', { class: 'tag' }, 'draft') : null, h('small', { class: 'faint' }, r.user))))
+          : prs.prs?.length ? h('div', { class: 'prs' }, prs.prs.map((r) => h('a', { class: 'pr-i', href: r.url }, ic('pr', 14), h('b', {}, '#' + r.number), h('span', {}, r.title), h('code', { class: 'faint' }, r.branch),
+            r.draft ? h('span', { class: 'tag' }, 'draft') : r.merged ? h('span', { class: 'tag' }, 'merged') : r.state === 'closed' ? h('span', { class: 'tag' }, 'closed') : null,
+            h('small', { class: 'faint' }, r.user),
+            r.state === 'open' && !r.draft ? h('button', { class: 'btn xs', onclick: (e) => (e.preventDefault(), mergePr(p, r, () => gitTab(el, p))) }, 'Merge') : null)))
             : h('p', { class: 'faint small' }, 'No pull requests yet.'))));
+}
+
+async function mergePr(p, r, after) {
+  const method = select([['merge', 'Merge commit'], ['squash', 'Squash into one commit'], ['rebase', 'Rebase onto ' + (r.base || 'the base')]], 'merge');
+  const okd = await dialog({ title: `Merge pull request #${r.number}?`, text: `Merges ${r.branch} into ${r.base} on GitHub. GitHub refuses if checks or reviews it requires haven't passed.`, body: field('How', method), ok: 'Merge' });
+  if (!okd) return;
+  try {
+    await post(`projects/${p.id}/prs/${r.number}/merge`, { method: method.value });
+    toast(`Merged #${r.number}`, { action: 'View', run: () => openExternal(r.url) });
+    after();
+  } catch (e) {
+    toast('Merge failed: ' + e.message, { err: true, ms: 9000 });
+  }
 }
 
 // ------------------------------------------------------------ settings

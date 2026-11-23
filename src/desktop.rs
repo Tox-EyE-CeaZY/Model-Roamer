@@ -74,7 +74,13 @@ impl Shell {
             w.window.set_focus();
             return;
         }
-        let (w, h) = (place.and_then(|p| p["w"].as_f64()).unwrap_or(if main { 1440.0 } else { 980.0 }), place.and_then(|p| p["h"].as_f64()).unwrap_or(if main { 920.0 } else { 820.0 }));
+        let (mut w, mut h) = (place.and_then(|p| p["w"].as_f64()).unwrap_or(if main { 1440.0 } else { 980.0 }), place.and_then(|p| p["h"].as_f64()).unwrap_or(if main { 920.0 } else { 820.0 }));
+        // never bigger than the screen it opens on (small laptops, a monitor that was unplugged)
+        if let Some(m) = target.primary_monitor() {
+            let size = m.size().to_logical::<f64>(m.scale_factor());
+            w = w.min(size.width - 40.0).max(560.0);
+            h = h.min(size.height - 60.0).max(420.0);
+        }
         #[allow(unused_mut)]
         let mut wb = WindowBuilder::new()
             .with_title("Model Roamer")

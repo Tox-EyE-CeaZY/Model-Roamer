@@ -44,6 +44,7 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/projects/{id}/threads", get(project_threads))
         .route("/api/projects/{id}/git", get(project_git))
         .route("/api/projects/{id}/prs", get(project_prs))
+        .route("/api/projects/{id}/prs/{number}/merge", post(project_pr_merge))
         .route("/api/projects/{id}/workers", post(new_worker))
         // threads
         .route("/api/threads", get(list_threads).post(create_chat))
@@ -436,17 +437,31 @@ async fn project_git(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     })))
 }
 
-async fn project_prs(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
-    let p = core.project(&id)?;
+/// The GitHub owner and repository a project pushes to: its repo URL, else its folder's remote.
+async fn project_github(core: &CoreRef, id: &str) -> Result<Option<(String, String)>, ApiErr> {
+    let p = core.project(id)?;
     let mut url = s(&p, "repo_url");
     if url.is_empty() {
         url = git::remote_url(&core.project_home(&p)).await;
     }
-    let Some((o, r)) = git::github_repo(&url) else { return Ok(Json(json!({ "github": false }))) };
+    Ok(git::github_repo(&url))
+}
+
+async fn project_prs(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let Some((o, r)) = project_github(&core, &id).await? else { return Ok(Json(json!({ "github": false }))) };
     match github::list_prs(&core, &o, &r, "all").await {
         Ok(list) => Ok(Json(json!({ "github": true, "repo": format!("{o}/{r}"), "prs": list }))),
         Err(e) => Ok(Json(json!({ "github": true, "repo": format!("{o}/{r}"), "error": e.to_string() }))),
     }
+}
+
+async fn project_pr_merge(State(core): State<CoreRef>, Path((id, number)): Path<(String, i64)>, Json(b): Json<Value>) -> R {
+    let Some((o, r)) = project_github(&core, &id).await? else { return Err(bad("This project's remote isn't on GitHub.")) };
+    let method = match s(&b, "method").as_str() {
+        m @ ("merge" | "squash" | "rebase") => m.to_string(),
+        _ => "merge".to_string(),
+    };
+    Ok(Json(github::merge_pr(&core, &o, &r, number, &method).await?))
 }
 
 /// The person opens a worker thread by hand (the lead hears about it).

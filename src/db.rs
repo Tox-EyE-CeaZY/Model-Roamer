@@ -206,6 +206,7 @@ impl Db {
         Ok(db)
     }
 
+    #[cfg(test)]
     pub fn memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
         let db = Db { conn: Arc::new(Mutex::new(conn)) };

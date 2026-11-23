@@ -93,7 +93,7 @@ pub async fn create_pr(core: &Core, owner: &str, repo: &str, head: &str, base: &
 pub async fn list_prs(core: &Core, owner: &str, repo: &str, state: &str) -> Result<Value> {
     let v = get(core, &format!("/repos/{owner}/{repo}/pulls?state={state}&per_page=30")).await?;
     Ok(json!(v.as_array().cloned().unwrap_or_default().iter().map(|p| json!({
-        "number": p["number"], "title": p["title"], "url": p["html_url"], "branch": p["head"]["ref"], "base": p["base"]["ref"],
+        "number": p["number"], "title": p["title"], "url": p["html_url"], "branch": p["head"]["ref"], "base": p["base"]["ref"], "state": p["state"], "merged": !p["merged_at"].is_null(),
         "draft": p["draft"], "user": p["user"]["login"], "updated": p["updated_at"]
     })).collect::<Vec<_>>()))
 }

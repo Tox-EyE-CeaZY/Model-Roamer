@@ -28,8 +28,9 @@ pub enum AgentEvent {
     /// A complete text block (replaces any streamed deltas for it).
     Text(String),
     Thinking(String),
-    ToolUse { id: String, name: String, input: String },
-    ToolResult { id: String, output: String, error: bool },
+    /// `id` pairs a result with its call; the timeline shows them in order, so it is parsed but not read yet.
+    ToolUse { #[allow(dead_code)] id: String, name: String, input: String },
+    ToolResult { #[allow(dead_code)] id: String, output: String, error: bool },
     Usage { input: i64, output: i64, cached: i64, cost: f64 },
     /// The CLI says its final answer is this.
     Final(String),

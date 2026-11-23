@@ -305,7 +305,7 @@ export async function viewer(el, r, ctx) {
   el.classList.add('artifact-view');
   el.append(head, frame);
   // ---- comments: select text (or Alt+click a part of a page, or click an image) and send a note about it
-  let pop = null, sendTo = localStorage.getItem('mr-art-comment-to') || 'lead';
+  let pop = null, cmode = 'text', sendTo = localStorage.getItem('mr-art-comment-to') || 'lead';
   const closePop = () => (pop?.remove(), (pop = null));
   function comment({ quote, where, x, y }) {
     closePop();
@@ -359,9 +359,20 @@ export async function viewer(el, r, ctx) {
     tip.style.left = Math.max(8, Math.min(x - box.left, box.width - 110)) + 'px';
     tip.style.top = Math.max(8, y - box.top + 6) + 'px';
   }
+  // what a click points at: some selected text, a whole element, or one spot (pages), as the person chooses
+  const modes = () => (a.kind === 'html' ? [['text', 'Select text'], ['element', 'Pick element'], ['spot', 'Pick spot']] : a.kind === 'markdown' || a.kind === 'text' ? [['text', 'Select text'], ['element', 'Pick paragraph']] : []);
+  const tellPage = () => frame.querySelector('iframe.av-if')?.contentWindow?.postMessage({ mr: 'mode', mode: cmode }, '*');
+  const setMode = (m) => ((cmode = m), closePop(), closeTip(), tellPage(), frame.classList.toggle('av-pick', m !== 'text'));
   // text shown in the page itself (markdown, plain text)
+  frame.addEventListener('click', (e) => {
+    if (cmode !== 'element' || (a.kind !== 'markdown' && a.kind !== 'text')) return;
+    const b = e.target.closest?.('p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, td, th');
+    if (!b || !frame.contains(b) || e.target.closest('a')) return;
+    e.preventDefault();
+    comment({ quote: b.innerText.trim().slice(0, 1500), where: 'the ' + b.tagName.toLowerCase() + ' block', x: e.clientX, y: e.clientY });
+  });
   frame.addEventListener('mouseup', () => setTimeout(() => {
-    if (a.kind !== 'markdown' && a.kind !== 'text') return;
+    if ((a.kind !== 'markdown' && a.kind !== 'text') || cmode !== 'text') return;
     const sel = getSelection();
     const t = sel?.toString().trim();
     if (!t || !frame.contains(sel.anchorNode)) return closeTip();
@@ -385,7 +396,11 @@ export async function viewer(el, r, ctx) {
     if (d.mr === 'sel') {
       if (!d.text) return closeTip();
       showTip(fr.left + d.x, fr.top + d.y, { quote: d.text, where: d.el ? 'in ' + d.el : '' });
-    } else if (d.mr === 'pin') comment({ quote: d.text, where: 'the element ' + d.el, x: fr.left + d.x, y: fr.top + d.y });
+    } else if (d.mr === 'ready') tellPage();
+    else if (d.mr === 'pin') {
+      const spot = d.mode === 'spot' ? `the spot ${d.px}% across and ${d.py}% down the page, on ${d.el || 'the page'}` : 'the element ' + d.el;
+      comment({ quote: d.mode === 'spot' ? '' : d.text, where: spot, x: fr.left + d.x, y: fr.top + d.y });
+    }
   };
   window.addEventListener('message', onPage);
   el.addEventListener('keydown', (e) => e.key === 'Escape' && (closePop(), closeTip()));
@@ -394,6 +409,7 @@ export async function viewer(el, r, ctx) {
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
     a.agent ? stamp(a.agent, { small: true }) : null,
     h('span', { class: 'grow' }),
+    modes().length ? h('span', { class: 'av-modes', title: 'What a click comments on' }, seg(modes(), cmode, setMode)) : null,
     h('button', { class: 'btn sm', onclick: () => draw(true) }, ic('reload', 13), 'Reload'),
     a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
     isPop ? null : h('button', { class: 'ibtn', title: 'Open in its own window', onclick: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 16) }),

@@ -768,6 +768,9 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         // every turn, so a session started under older instructions (or one with no system prompt) still knows
         prompt.push_str(LEAD_REMINDER);
     }
+    if t["kind"] != "lead" {
+        prompt.push_str(&claims_notice(core, &t));
+    }
     prompt.push_str(&format_inputs(&inputs));
     let cfg = core.agent_cfg(&agent);
     let model = t["model"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| cfg["model"].as_str().unwrap_or("").to_string());
@@ -1128,6 +1131,28 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             Ok(())
         }
     }
+}
+
+/// What other threads in this project have claimed right now, so an agent knows before it edits (it doesn't have to
+/// call list_claims first, and a thread that never claims anything still hears about everyone else's claims).
+fn claims_notice(core: &CoreRef, t: &Value) -> String {
+    let (Some(p), Some(me)) = (t["project_id"].as_str(), t["id"].as_str()) else { return String::new() };
+    let rows = core
+        .db
+        .all(
+            "SELECT c.path, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id \
+             WHERE c.project_id = ?1 AND c.thread_id != ?2 AND t.resolved = 0 AND t.status NOT IN ('done','cancelled','failed') ORDER BY c.created_at LIMIT 40",
+            &[&p, &me],
+        )
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = rows.iter().map(|r| format!("- {} (thread \"{}\", {})", r["path"].as_str().unwrap_or(""), clip(r["title"].as_str().unwrap_or(""), 50), r["agent"].as_str().unwrap_or(""))).collect();
+    format!(
+        "<model-roamer-claims>Other threads in this project have claimed these paths. Don't edit them. If your task needs one, say so to the lead (message_lead) instead of changing it:\n{}</model-roamer-claims>\n\n",
+        list.join("\n")
+    )
 }
 
 /// Marker an agent ends its reply with when the pair's work is complete.

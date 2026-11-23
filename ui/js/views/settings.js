@@ -63,6 +63,8 @@ function windows(el) {
     h('section', { class: 'panel cut' }, kicker('Threads'),
       field('Agents’ steps', seg([['collapsed', 'Collapsed'], ['expanded', 'Expanded'], ['hidden', 'Hidden']], s.steps || 'collapsed', (v) => save({ steps: v })),
         'Thinking, tools and commands. Collapsed shows one line you can open; nothing opens by itself while an agent works. Any chat can choose its own from “Steps” under its message box.'),
+      field('Close parked threads after', seg([[0, 'Never'], [6, '6 hours'], [24, '1 day'], [72, '3 days']], s.idle_close_hours ?? 24, (v) => save({ idle_close_hours: v })),
+        'The lead can park a thread: kept open and idle because its context is worth having for follow-ups. Parked threads nobody has touched for this long close on their own; the lead can reopen one at any time.'),
       toggle(!!s.popout_threads, (v) => save({ popout_threads: v }), { label: 'Open threads in their own windows (like popping out an email)' }),
       h('p', { class: 'faint small' }, 'Either way: Ctrl+Shift+O, the pop-out button, or a middle click on a thread card opens it in a window of its own. Each window remembers where it was.')),
     isDesktop ? h('section', { class: 'panel cut' }, kicker('This app'),

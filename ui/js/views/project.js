@@ -11,7 +11,7 @@ import { dialog, toast, showMenu } from '../ui.js';
 import { mountThread, decisionCard } from './thread.js';
 import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, agentOptions, modelOptions, pickFolder, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 
-const TABS = [['', 'Board', 'board'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
+const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
 
 export default async function projectView(el, r, ctx) {
   let p;
@@ -60,6 +60,7 @@ export default async function projectView(el, r, ctx) {
   });
   let inner = null;
   if (tab === '') inner = await board(body, p, r, ctx);
+  else if (tab === 'files') inner = await (await import('./files.js')).default(body, p, r);
   else if (tab === 'git') inner = await gitTab(body, p);
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
@@ -176,7 +177,7 @@ async function board(el, p, r, ctx) {
       }));
     }
     const claims = p.claims || [];
-    claimsEl.replaceChildren(claims.length ? [kicker('Claimed files', h('small', { class: 'faint' }, 'so agents stay out of each other’s way')), h('div', { class: 'claims' }, claims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent)))))] : []);
+    claimsEl.replaceChildren(...(claims.length ? [kicker('Claimed files', h('small', { class: 'faint' }, 'so agents stay out of each other’s way')), h('div', { class: 'claims' }, claims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent)))))] : []));
   }
 
   // A thread opened from the board sits beside the project chat, in place of the board; the address carries it

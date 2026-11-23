@@ -1479,10 +1479,34 @@ pub fn recover(core: &CoreRef) {
     }
 }
 
+/// Parked threads (kept idle by the lead) that nobody has touched for `idle_close_hours` are closed. Their session
+/// and worktree stay, so the lead can bring one back with `reopen_thread`.
+async fn close_idle_parked(core: &CoreRef) {
+    let hours = core.settings()["idle_close_hours"].as_i64().unwrap_or(24);
+    if hours <= 0 {
+        return;
+    }
+    let cutoff = util::now_ms() - hours * 3_600_000;
+    let rows = core
+        .db
+        .all("SELECT id FROM threads WHERE parked_at IS NOT NULL AND resolved = 0 AND deleted_at IS NULL AND status = 'idle' AND updated_at < ?1", &[&cutoff])
+        .unwrap_or_default();
+    for r in rows {
+        let id = r["id"].as_str().unwrap_or("");
+        if core.db.scalar_i64("SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND pending = 1", &[&id]).unwrap_or(0) > 0 || turn_active(core, id) {
+            continue;
+        }
+        if resolve(core, id, true).await.is_ok() {
+            note(core, id, &format!("Closed after {hours} hours unused. The lead can reopen it."));
+        }
+    }
+}
+
 /// Every minute: threads waiting on a usage limit start again once it resets.
 pub async fn watch_limits(core: CoreRef) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
+        close_idle_parked(&core).await;
         let limited = core.db.all("SELECT id, agent, project_id FROM threads WHERE status = 'limited' AND deleted_at IS NULL", &[]).unwrap_or_default();
         for t in limited {
             let agent = t["agent"].as_str().unwrap_or("");

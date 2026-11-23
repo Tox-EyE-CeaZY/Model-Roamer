@@ -92,7 +92,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         p ? h('a', { href: '#/p/' + p.id, style: { '--ph': p.color } }, h('i', { class: 'sw' }), p.name) : h('a', { href: '#/chats' }, 'Chats'),
         h('span', {}, '/'),
         h('span', {}, t.kind === 'lead' ? 'project chat' : t.kind === 'review' ? 'review' : t.kind === 'chat' ? 'chat' : 'thread')),
-      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t), buddyChip(), ctxChip()),
+      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t), parkedChip(), buddyChip(), ctxChip()),
       t.status_note ? h('div', { class: 'th-note' }, ic(t.status === 'blocked' || t.status === 'failed' ? 'warn' : 'info', 14), h('span', {}, t.status_note)) : null,
       h('div', { class: 'th-acts' },
         running
@@ -109,6 +109,13 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         h('span', { class: 'grow' }),
         !isPop ? h('button', { class: 'ibtn', title: 'Pop out into its own window (Ctrl+Shift+O)', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 16) }) : null,
         h('button', { class: 'ibtn', title: 'More', onclick: (e) => moreMenu(e.currentTarget), html: icon('more', 16) })));
+  }
+
+  /** A thread the lead is keeping open and idle on purpose. */
+  function parkedChip() {
+    if (!t.parked_at || t.resolved) return null;
+    const hrs = S.settings.idle_close_hours ?? 24;
+    return h('span', { class: 'ctx-chip', title: 'Kept open and idle by the lead for follow-ups.' + (hrs ? ` Closes by itself after ${hrs} hours unused; the lead can reopen it.` : '') }, 'Parked');
   }
 
   /** Buddy threads: which pair, whose turn it is, and how many turns it has used. */

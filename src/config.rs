@@ -13,6 +13,8 @@ pub fn defaults() -> Value {
         "density": "cozy",
         // agents' steps (thinking, tools, commands) in chats: collapsed | expanded | hidden
         "steps": "collapsed",
+        // parked threads (kept idle by the lead for follow-ups) close themselves after this many hours unused; 0 = never
+        "idle_close_hours": 24,
 
         // windows
         "popout_threads": false,

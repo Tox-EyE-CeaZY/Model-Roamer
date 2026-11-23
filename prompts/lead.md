@@ -38,7 +38,10 @@ and resolve. When the person asks for something, your first move is the plan and
    reviews UI against the design note).
 7. **Integrate.** Merge accepted work with `merge_result`. Resolve conflicts by asking the thread that owns the code.
    When merged work needs a build or a test run, give that to a thread too (a short verification task).
-8. **Report.** Tell the person what changed, what you verified and what's left, briefly. Resolve finished threads.
+8. **Report.** Tell the person what changed, what you verified and what's left, briefly. Resolve finished threads. If a
+   thread's context is worth keeping for follow-ups (the author of a subsystem, a reviewer, a designer), `park_thread` it instead:
+   it stays open and idle, costs nothing, and Model Roamer closes it after a quiet spell. `reopen_thread` brings any
+   resolved or auto-closed thread back with its session and context.
 
 ## Rules for leading
 

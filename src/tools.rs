@@ -68,6 +68,12 @@ const DEFS: &[Def] = &[
     Def { name: "resolve_thread", roles: LEAD, desc: "Mark a thread finished (hidden from the open list; it can be reopened). Removes its worktree once merged.", schema: || obj(json!({
         "thread_id": {"type": "string"}
     }), &["thread_id"]) },
+    Def { name: "park_thread", roles: LEAD, desc: "Keep a finished-for-now thread open and idle because its context is worth having for follow-ups (the author of a subsystem, a reviewer, a designer). It costs nothing while idle and its file claims are released. Model Roamer closes parked threads on its own after a quiet spell; reopen_thread brings one back.", schema: || obj(json!({
+        "thread_id": {"type": "string"}, "why": {"type": "string", "description": "What it is kept for"}
+    }), &["thread_id"]) },
+    Def { name: "reopen_thread", roles: LEAD, desc: "Bring a resolved or auto-closed thread back, with its session and context, optionally with a message for it to act on.", schema: || obj(json!({
+        "thread_id": {"type": "string"}, "message": {"type": "string"}
+    }), &["thread_id"]) },
     Def { name: "review_diff", roles: LEAD, desc: "The thread's changes against the base branch (committed and uncommitted), as a unified diff.", schema: || obj(json!({
         "thread_id": {"type": "string"}, "max_chars": {"type": "integer"}
     }), &["thread_id"]) },
@@ -232,12 +238,13 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "list_threads" => {
             let p = need_project()?;
             let filter = a("status");
-            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, parked_at, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
             let rows: Vec<Value> = rows
                 .into_iter()
                 .filter(|r| match filter.as_str() {
                     "" => true,
                     "open" => r["resolved"] == 0,
+                    "parked" => r["resolved"] == 0 && r["parked_at"].as_i64().is_some(),
                     f => r["status"] == f,
                 })
                 .collect();
@@ -304,6 +311,35 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             same_project(&t)?;
             runner::resolve(core, t["id"].as_str().unwrap(), true).await?;
             Ok("Resolved.".into())
+        }
+        "park_thread" => {
+            let t = core.thread(&a("thread_id"))?;
+            same_project(&t)?;
+            let id = t["id"].as_str().unwrap();
+            if t["resolved"] == 1 {
+                runner::resolve(core, id, false).await?;
+                core.set_status(id, "idle", "")?;
+            }
+            core.set_thread(id, &json!({ "parked_at": util::now_ms() }))?;
+            core.db.exec("DELETE FROM claims WHERE thread_id = ?1", &[&id])?;
+            let why = a("why");
+            runner::post(core, id, "system", "Model Roamer", &if why.is_empty() { "Parked by the lead: kept open and idle.".to_string() } else { format!("Parked by the lead: kept open and idle for {why}.") }, json!({}), false)?;
+            Ok(format!("Parked. It stays open and idle, and closes by itself after {} hours unused (reopen_thread brings it back).", core.settings()["idle_close_hours"].as_i64().unwrap_or(24)))
+        }
+        "reopen_thread" => {
+            let t = core.thread(&a("thread_id"))?;
+            same_project(&t)?;
+            let id = t["id"].as_str().unwrap();
+            runner::resolve(core, id, false).await?;
+            core.set_thread(id, &json!({ "parked_at": Value::Null }))?;
+            core.set_status(id, "idle", "")?;
+            let m = a("message");
+            if m.is_empty() {
+                Ok("Reopened and idle. Send it a message to give it work.".into())
+            } else {
+                runner::post(core, id, "user", &format!("Lead ({})", caller["agent"].as_str().unwrap_or("")), &m, json!({ "from_thread": tid }), true)?;
+                Ok("Reopened; it's working on your message.".into())
+            }
         }
         "review_diff" => {
             let t = core.thread(&a("thread_id"))?;
@@ -536,7 +572,7 @@ fn thread_line(t: &Value) -> String {
         t["status"].as_str().unwrap_or(""),
         t["status_note"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" ({s})")).unwrap_or_default(),
         t["branch"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" · branch {s}")).unwrap_or_default(),
-        if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else { "" },
+        if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else if t["parked_at"].as_i64().is_some() { " · parked (kept idle)" } else { "" },
         match (t["context"]["used"].as_i64(), t["context"]["window"].as_i64()) {
             (Some(u), Some(w)) if w > 0 => format!(" · context {}%{}", u * 100 / w, if u * 100 / w >= 80 { " (near compacting)" } else { "" }),
             _ => String::new(),

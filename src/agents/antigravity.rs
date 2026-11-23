@@ -12,8 +12,8 @@ impl AgentAdapter for Antigravity {
             name: "Antigravity".into(),
             vendor: "Google".into(),
             hue: 318,
-            strengths: vec!["UI and visual design".into(), "front-end builds".into(), "browser testing".into(), "agentic app building".into(), "creative work".into()],
-            summary: "Google's agent-first harness: front-end and full app builds, visual design, checking work in a browser.".into(),
+            strengths: vec!["UI and visual design".into(), "front-end builds".into(), "creative work".into(), "images".into(), "large-context research".into(), "browser testing".into()],
+            summary: "Google's agent-first harness on the Gemini models: front-end and full app builds, visual design and images, research across a whole codebase, checking work in a browser.".into(),
             site: "https://antigravity.google".into(),
             models: vec![
                 // `agy models` fills in the real list (it needs a sign-in)

@@ -17,7 +17,7 @@ struct Tool {
 
 const TOOLS: &[Tool] = &[
     Tool { id: "git", name: "Git", why: "Worktrees, commits, merges and pull requests", bins: &["git"] },
-    Tool { id: "node", name: "Node.js", why: "Needed to install Codex and Gemini CLI with npm", bins: &["node", "npm"] },
+    Tool { id: "node", name: "Node.js", why: "Needed to install Codex with npm", bins: &["node", "npm"] },
     Tool { id: "gh", name: "GitHub CLI", why: "Optional: sign in to GitHub without making a token", bins: &["gh"] },
     Tool { id: "tailscale", name: "Tailscale", why: "Optional: reach your server from anywhere, privately", bins: &["tailscale"] },
 ];

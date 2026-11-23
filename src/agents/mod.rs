@@ -1,4 +1,4 @@
-//! Agent harnesses. Every CLI (Claude Code, Codex, Gemini, Antigravity, and any custom one) sits behind the same
+//! Agent harnesses. Every CLI (Claude Code, Codex, Antigravity, and any custom one) sits behind the same
 //! `AgentAdapter` trait: it says how to start a turn, how to read the CLI's output into `AgentEvent`s, how to check the
 //! sign-in, and how to install, sign in and update. The runner does the rest the same way for all of them, so adding
 //! an agent means writing one adapter.
@@ -197,7 +197,6 @@ pub fn registry(custom: &Value) -> Vec<Arc<dyn AgentAdapter>> {
     let mut v: Vec<Arc<dyn AgentAdapter>> = vec![
         Arc::new(claude::Claude),
         Arc::new(codex::Codex),
-        Arc::new(gemini::Gemini),
         Arc::new(antigravity::Antigravity),
     ];
     if let Some(list) = custom.as_array() {
@@ -214,7 +213,7 @@ pub fn registry(custom: &Value) -> Vec<Arc<dyn AgentAdapter>> {
 pub fn default_routing() -> Value {
     json!({
         "plan": "claude", "orchestrate": "claude", "core": "claude", "refactor": "claude", "review": "claude", "docs": "claude",
-        "design": "gemini", "frontend": "gemini", "creative": "gemini", "research": "gemini",
+        "design": "antigravity", "frontend": "antigravity", "creative": "antigravity", "research": "antigravity",
         "backend": "codex", "api": "codex", "data": "codex", "infra": "codex", "scripts": "codex", "tests": "codex",
         "general": "claude"
     })

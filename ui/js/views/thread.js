@@ -40,7 +40,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
 
   let messages = [], turns = [], activity = {}, hasMore = false;
   // shown: how much of the streamed text is on screen; it catches up word by word, so every agent's reply reads as it
-  // is written, whether the agent sends tokens (Claude, Gemini) or whole paragraphs (Codex). hold: a finished reply
+  // is written, whether the agent sends tokens (Claude, Antigravity) or whole paragraphs (Codex). hold: a finished reply
   // that is still being typed out, moved into the log when the typing reaches its end.
   // parts: the turn so far in the order it happened: text the agent wrote and its steps (thinking, tools, results).
   // Only the trailing text is typed out; text before a step is already on screen.

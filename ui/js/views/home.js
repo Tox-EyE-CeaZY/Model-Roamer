@@ -22,7 +22,7 @@ export default async function home(el) {
       h('div', {},
         h('div', { class: 'eyebrow' }, S.me.local ? 'This computer' : `Connected to ${S.server.name}`),
         h('h1', {}, hello + '.'),
-        h('p', { class: 'lede' }, 'Give a project to a lead agent and it plans the work, hands pieces to Claude Code, Codex, Gemini CLI and Antigravity, and keeps them out of each other’s way.')),
+        h('p', { class: 'lede' }, 'Give a project to a lead agent and it plans the work, hands pieces to Claude Code, Codex and Antigravity, and keeps them out of each other’s way.')),
       h('div', { class: 'hero-acts' },
         h('button', { class: 'btn primary', onclick: () => newProject() }, ic('plus', 14), 'New project'),
         h('button', { class: 'btn', onclick: () => import('./chats.js').then((m) => m.newChat()) }, ic('chat', 14), 'New chat'))),
@@ -162,7 +162,7 @@ export async function newProjectDialog(preset = {}) {
     field('Name', name),
     h('div', { class: 'field' }, h('span', { class: 'f-l' }, 'Where the code lives'), seg([['folder', 'A folder'], ['github', 'A GitHub repo'], ['none', 'Start empty']], source, (v) => ((source = v), drawWhere()))),
     where,
-    field('Lead', lead.el, 'The lead plans, delegates, reviews and keeps the project’s memory. Claude, Gemini and Codex can all lead.'),
+    field('Lead', lead.el, 'The lead plans, delegates, reviews and keeps the project’s memory. Claude, Codex and Antigravity can all lead.'),
     field('Project instructions', instr));
   drawWhere();
   let made = null;

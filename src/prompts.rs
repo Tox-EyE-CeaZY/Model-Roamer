@@ -14,7 +14,7 @@ const HARNESS: &str = include_str!("../prompts/harness.md");
 /// The section of harness.md for one agent (custom agents share the generic one).
 fn harness(agent: &str) -> String {
     let key = match agent {
-        "claude" | "codex" | "gemini" | "antigravity" => agent,
+        "claude" | "codex" | "antigravity" => agent,
         _ => "custom",
     };
     // a Windows checkout may have CRLF line endings; the section markers below assume LF

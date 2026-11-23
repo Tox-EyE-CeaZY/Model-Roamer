@@ -342,7 +342,7 @@ async function about(el) {
   el.replaceChildren(
     h('section', { class: 'panel cut about' },
       h('div', { class: 'about-mark', html: `<svg viewBox="0 0 40 40" width="56" height="56">${(await import('../icons.js')).MARK}</svg>` }),
-      h('div', {}, h('h2', {}, 'Model Roamer'), h('p', { class: 'faint' }, `Version ${S.version} · ${S.server.os} · ${S.server.headless ? 'server' : isDesktop ? 'desktop' : 'browser'}`), h('p', { class: 'small' }, 'An orchestration studio for Claude Code, Codex, Gemini CLI and Antigravity. Part of the Roamer suite.'))),
+      h('div', {}, h('h2', {}, 'Model Roamer'), h('p', { class: 'faint' }, `Version ${S.version} · ${S.server.os} · ${S.server.headless ? 'server' : isDesktop ? 'desktop' : 'browser'}`), h('p', { class: 'small' }, 'An orchestration studio for Claude Code, Codex and Antigravity. Part of the Roamer suite.'))),
     h('section', { class: 'panel cut' }, kicker('Updates'), upd),
     h('section', { class: 'panel cut' }, kicker('The Roamer suite'), suite),
     h('section', { class: 'panel cut' }, kicker('Data and logs'),

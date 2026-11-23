@@ -32,7 +32,7 @@ const DEFS: &[Def] = &[
         "title": {"type": "string", "description": "Short title, verb first, 3-6 words"},
         "instructions": {"type": "string", "description": "The task: what to do, context, files/areas it owns, what not to touch"},
         "criteria": {"type": "string", "description": "Acceptance criteria: what done looks like and how to verify it"},
-        "agent": {"type": "string", "description": "claude | codex | gemini | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
+        "agent": {"type": "string", "description": "claude | codex | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
         "task_kind": {"type": "string", "description": "plan | core | refactor | review | docs | design | frontend | creative | research | backend | api | data | infra | scripts | tests | general"},
         "model": {"type": "string", "description": "Optional model for that agent"},
         "workspace": {"type": "string", "enum": ["worktree", "shared", "scratch"], "description": "worktree (default when the project has a git repo): its own branch and folder; shared: the project folder itself (read-only work, research); scratch: an empty folder"},
@@ -545,7 +545,7 @@ If the Model Roamer tools are not available to you as tool calls, call them by w
 reply (JSON arguments, one block per call):
 
 <roamer-tool name="read_memory">{}</roamer-tool>
-<roamer-tool name="spawn_thread">{"title": "Build the settings page", "instructions": "...", "agent": "gemini"}</roamer-tool>
+<roamer-tool name="spawn_thread">{"title": "Build the settings page", "instructions": "...", "agent": "antigravity"}</roamer-tool>
 
 Model Roamer runs them when your turn ends and sends the results back to you in a new turn. Text outside the blocks
 is your reply. Only use this when the native tools are missing."#;

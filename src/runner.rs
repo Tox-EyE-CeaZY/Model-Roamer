@@ -117,7 +117,7 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     } else {
         let a = w.agent.to_lowercase();
         if core.adapter(&a).is_none() {
-            bail!("There's no agent called '{a}'. Use claude, codex, gemini, antigravity or a custom agent's id.");
+            bail!("There's no agent called '{a}'. Use claude, codex, antigravity or a custom agent's id.");
         }
         a
     };
@@ -1047,7 +1047,7 @@ pub async fn request_review(core: &CoreRef, target: &Value, agent: &str, focus: 
     let reviewer = if !agent.is_empty() {
         agent.to_string()
     } else {
-        ["claude", "codex", "gemini", "antigravity"].iter().find(|a| **a != author && usable(core, a)).map(|s| s.to_string()).ok_or_else(|| anyhow!("No other agent is available to review."))?
+        ["claude", "codex", "antigravity"].iter().find(|a| **a != author && usable(core, a)).map(|s| s.to_string()).ok_or_else(|| anyhow!("No other agent is available to review."))?
     };
     let files = match workspace_of(core, target) {
         Some(ws) if git::is_repo(&ws).await => git::changed_files(&ws, target["base_branch"].as_str().filter(|s| !s.is_empty()).unwrap_or("HEAD")).await.join("\n"),

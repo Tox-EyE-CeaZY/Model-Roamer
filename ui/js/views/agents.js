@@ -90,7 +90,7 @@ function card(a) {
       { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
       a.installed ? { label: 'Refresh models', icon: 'refresh', title: 'Ask the CLI which models it offers now', run: () => post(`agents/${a.id}/models`, {}, { timeout: 90000 }).then((r) => toast(`${(r.info?.models || []).filter((m) => m.id).length} models from ${info.name}`)).catch((e) => toast(e.message, { err: true })) } : null,
       info.site ? { label: 'Website', icon: 'external', run: () => openExternal(info.site) } : null,
-      a.id.match(/^(claude|codex|gemini|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
+      a.id.match(/^(claude|codex|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
     ], r.right, r.bottom + 4, { anchor: e.currentTarget });
   }, html: icon('more', 15) });
 

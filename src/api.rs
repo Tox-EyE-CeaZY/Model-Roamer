@@ -994,7 +994,7 @@ async fn patch_agent(State(core): State<CoreRef>, Path(id): Path<String>, Json(b
 async fn add_custom_agent(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
     let mut list = core.settings()["custom_agents"].as_array().cloned().unwrap_or_default();
     let id = util::slug(&s(&b, "id").replace(' ', "-"), 24);
-    if ["claude", "codex", "gemini", "antigravity"].contains(&id.as_str()) {
+    if ["claude", "codex", "antigravity"].contains(&id.as_str()) {
         return Err(bad("That id belongs to a built-in agent."));
     }
     if s(&b, "command").is_empty() {

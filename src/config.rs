@@ -21,14 +21,13 @@ pub fn defaults() -> Value {
         "agents": {
             "claude": { "enabled": true, "model": "opus", "effort": "", "autonomy": "full", "max_parallel": 3, "path": "", "extra_args": [] },
             "codex": { "enabled": true, "model": "", "effort": "", "autonomy": "full", "max_parallel": 3, "path": "", "extra_args": [] },
-            "gemini": { "enabled": true, "model": "", "effort": "", "autonomy": "full", "max_parallel": 3, "path": "", "extra_args": [] },
             "antigravity": { "enabled": true, "model": "", "effort": "", "autonomy": "full", "max_parallel": 2, "path": "", "extra_args": [] }
         },
         "custom_agents": [],
         "routing": crate::agents::default_routing(),
         "default_lead": "claude",
         "default_lead_model": "opus",
-        "lead_fallback": ["claude", "gemini", "codex", "antigravity"],
+        "lead_fallback": ["claude", "codex", "antigravity"],
         "auto_fallback": true,
         "cross_review": true,
 
@@ -61,6 +60,54 @@ pub fn defaults() -> Value {
 }
 
 /// Merge `over` onto `base` (objects merge key by key; everything else replaces).
+/// Gemini CLI stopped being a built-in agent (Antigravity runs the same Gemini models). Saved settings, project
+/// routing and open threads that named it move to Antigravity, once.
+pub fn retire_gemini(db: &crate::db::Db) {
+    if db.setting("migrated.gemini") == json!(true) {
+        return;
+    }
+    let swap = |v: &mut Value| {
+        if let Some(o) = v.as_object_mut() {
+            for x in o.values_mut() {
+                if x == "gemini" {
+                    *x = json!("antigravity");
+                }
+            }
+        }
+    };
+    let mut cfg = db.setting("config");
+    if cfg.is_object() {
+        // get_mut, not cfg["x"]: indexing a missing key would add it as null and wipe out its default
+        if let Some(o) = cfg.get_mut("agents").and_then(Value::as_object_mut) {
+            o.remove("gemini");
+        }
+        if let Some(r) = cfg.get_mut("routing") {
+            swap(r);
+        }
+        if cfg["default_lead"] == "gemini" {
+            cfg["default_lead"] = json!("antigravity");
+            cfg["default_lead_model"] = json!("");
+        }
+        if let Some(list) = cfg.get_mut("lead_fallback").and_then(Value::as_array_mut) {
+            list.retain(|x| x != "gemini");
+        }
+        let _ = db.set_setting("config", &cfg);
+    }
+    for p in db.all("SELECT id, routing FROM projects", &[]).unwrap_or_default() {
+        let mut r = match &p["routing"] {
+            Value::String(s) => serde_json::from_str(s).unwrap_or(json!({})),
+            v => v.clone(),
+        };
+        if r.as_object().is_some_and(|o| o.values().any(|x| x == "gemini")) {
+            swap(&mut r);
+            let _ = db.exec("UPDATE projects SET routing = ?1 WHERE id = ?2", &[&r.to_string(), &p["id"].as_str().unwrap_or("")]);
+        }
+    }
+    // their CLI sessions can't carry over, so the next turn starts fresh with the thread's history
+    let _ = db.exec("UPDATE threads SET agent = 'antigravity', model = '', session_id = NULL WHERE agent = 'gemini' AND deleted_at IS NULL", &[]);
+    let _ = db.set_setting("migrated.gemini", &json!(true));
+}
+
 pub fn merge(base: &mut Value, over: &Value) {
     match (base, over) {
         (Value::Object(b), Value::Object(o)) => {
@@ -96,6 +143,24 @@ pub fn redact(v: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retires_gemini() {
+        let db = crate::db::Db::memory().unwrap();
+        db.set_setting("config", &json!({ "routing": { "design": "gemini", "core": "claude" }, "default_lead": "gemini", "lead_fallback": ["gemini", "codex"], "agents": { "gemini": {} } })).unwrap();
+        retire_gemini(&db);
+        let c = db.setting("config");
+        assert_eq!(c["routing"]["design"], "antigravity");
+        assert_eq!(c["routing"]["core"], "claude");
+        assert_eq!(c["default_lead"], "antigravity");
+        assert_eq!(c["lead_fallback"], json!(["codex"]));
+        assert!(c["agents"].get("gemini").is_none());
+        // keys it didn't have stay missing, so their defaults still apply
+        db.set_setting("config", &json!({ "theme": "paper" })).unwrap();
+        db.set_setting("migrated.gemini", &json!(false)).unwrap();
+        retire_gemini(&db);
+        assert_eq!(db.setting("config"), json!({ "theme": "paper" }));
+        assert_eq!(defaults()["routing"]["frontend"], "antigravity");
+    }
     #[test]
     fn merges() {
         let mut d = defaults();

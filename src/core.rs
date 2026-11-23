@@ -87,6 +87,7 @@ impl Core {
                 s
             }
         };
+        config::retire_gemini(&db);
         let mut settings = config::defaults();
         config::merge(&mut settings, &db.setting("config"));
         let core = Arc::new(Core {

@@ -27,7 +27,7 @@ export default async function welcome(el) {
       h('div', { class: 'about-mark', html: `<svg viewBox="0 0 40 40" width="64" height="64">${MARK}</svg>` }),
       h('div', { class: 'eyebrow' }, 'Welcome to'),
       h('h1', { class: 'wl-title' }, 'MODEL', h('i', {}, '/'), 'ROAMER'),
-      h('p', { class: 'lede' }, 'One lead agent plans the work and hands pieces to the others: Claude Code, Codex, Gemini CLI and Antigravity, each in its own branch so nobody steps on anybody. You watch, steer and merge.')),
+      h('p', { class: 'lede' }, 'One lead agent plans the work and hands pieces to the others: Claude Code, Codex and Antigravity, each in its own branch so nobody steps on anybody. You watch, steer and merge.')),
     h('ol', { class: 'wl-steps' },
       h('li', {}, h('h3', {}, 'Get the agents ready'), h('p', { class: 'faint' }, 'Install and sign in to the ones you pay for. Model Roamer uses your own subscriptions through their CLIs. You need at least one.'), fleet),
       h('li', {}, h('h3', {}, 'Make a project'), h('p', { class: 'faint' }, 'A folder or GitHub repository plus a lead. Tell the lead what you want; it opens threads for the right agents.'),

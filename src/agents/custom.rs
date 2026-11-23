@@ -10,7 +10,7 @@ pub struct Custom {
 impl Custom {
     pub fn from_json(v: &Value) -> Option<Custom> {
         let id = v["id"].as_str()?.trim();
-        if id.is_empty() || ["claude", "codex", "gemini", "antigravity"].contains(&id) || v["command"].as_str().unwrap_or("").trim().is_empty() {
+        if id.is_empty() || ["claude", "codex", "antigravity"].contains(&id) || v["command"].as_str().unwrap_or("").trim().is_empty() {
             return None;
         }
         Some(Custom { cfg: v.clone() })
@@ -84,7 +84,7 @@ impl AgentAdapter for Custom {
         match self.output() {
             "claude" => super::claude::Claude.parse(line, st),
             "codex" => super::codex::Codex.parse(line, st),
-            "gemini" => super::gemini::Gemini.parse(line, st),
+            "gemini" => super::gemini::parse_line(line, st),
             _ => {
                 if line.trim().is_empty() && st["started"].is_null() {
                     return vec![];

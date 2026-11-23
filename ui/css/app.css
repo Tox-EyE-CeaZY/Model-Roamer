@@ -897,3 +897,12 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
   .plan-w .sb-m-bar.wide { width: 100%; }
   .plan-w { grid-template-columns: 54px minmax(0, 1fr) 66px; }
 }
+
+/* ------------------------------------------------------------ commenting on an artifact */
+.artifact-view .av-frame.commenting { box-shadow: inset 0 0 0 2px var(--accent); }
+.av-comment { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 12px var(--gut); border-top: 1px solid var(--line); background: var(--bg2); }
+.av-comment[hidden] { display: none; }
+.avc-what { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--dim); overflow-wrap: anywhere; }
+.avc-quote { margin: 0; padding: 6px 10px; border-left: 3px solid var(--accent); background: var(--bg3); font-size: 12.5px; color: var(--dim); max-height: 84px; overflow: auto; white-space: pre-wrap; }
+.avc-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.avc-row .sel { max-width: 260px; }

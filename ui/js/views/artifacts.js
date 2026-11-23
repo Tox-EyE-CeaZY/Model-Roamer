@@ -302,13 +302,66 @@ export async function viewer(el, r, ctx) {
   ctx?.setPopTitle?.(a.title);
   const frame = h('div', { class: 'av-frame' });
   const head = h('div', { class: 'av-head' });
+  const cbox = h('div', { class: 'av-comment', hidden: true });
   el.classList.add('artifact-view');
-  el.append(head, frame);
+  el.append(head, frame, cbox);
+  // ---- comments: point at a part (a page element, selected text, a spot on an image), say something, and send it to
+  // the thread that made the artifact or to the project's orchestrator
+  let commenting = false;
+  const pickable = ['html', 'markdown', 'text', 'image', 'svg'].includes(a.kind);
+  const getFrame = () => frame.querySelector('iframe.av-if');
+  const setMode = (on) => {
+    commenting = on;
+    frame.classList.toggle('commenting', on);
+    getFrame()?.contentWindow?.postMessage({ mr: 'mode', on }, '*');
+    drawHead();
+  };
+  function openComment(where, quote) {
+    const dests = [a.thread_id ? ['thread', 'The thread' + (a.thread_title ? ': ' + a.thread_title : '')] : null, a.project_id ? ['lead', 'The orchestrator'] : null].filter(Boolean);
+    if (!dests.length) return toast('This artifact has no thread or project to send a comment to.', { err: true });
+    const saved = localStorage.getItem('mr-art-dest');
+    let dest = dests.some(([v]) => v === saved) ? saved : dests[0][0];
+    const ta = textarea('', { rows: 3, placeholder: 'What should change, or what do you want to know?' });
+    const send = h('button', { class: 'btn primary sm' }, 'Send');
+    const close = () => ((cbox.hidden = true), cbox.replaceChildren());
+    send.onclick = async () => {
+      if (!ta.value.trim()) return ta.focus();
+      send.disabled = true;
+      try {
+        let tid = a.thread_id;
+        if (dest === 'lead') tid = (await get('projects/' + a.project_id)).lead.id;
+        const quoted = quote ? '\n> ' + quote.replace(/\n/g, '\n> ') + '\n' : '';
+        const text = `Comment on the artifact "${a.title}" (${a.kind}, v${a.version}, id ${a.id}).\n${where}\n${quoted}\n${ta.value.trim()}`;
+        await post(`threads/${tid}/messages`, { text });
+        localStorage.setItem('mr-art-dest', dest);
+        toast(dest === 'lead' ? 'Sent to the orchestrator' : 'Sent to the thread');
+        close();
+      } catch (e) {
+        toast(e.message, { err: true });
+        send.disabled = false;
+      }
+    };
+    cbox.replaceChildren(
+      h('div', { class: 'avc-what mono' }, ic('chat', 13), h('span', {}, where)),
+      quote ? h('blockquote', { class: 'avc-quote' }, quote.length > 280 ? quote.slice(0, 280) + '…' : quote) : null,
+      ta,
+      h('div', { class: 'avc-row' }, h('span', { class: 'faint small' }, 'Send to'), select(dests, dest, (v) => (dest = v)), h('span', { class: 'grow' }), h('button', { class: 'btn sm', onclick: close }, 'Cancel'), send));
+    cbox.hidden = false;
+    ta.focus();
+  }
+  const onMsg = (e) => {
+    const f = getFrame();
+    if (!f || e.source !== f.contentWindow || e.data?.mr !== 'pick') return;
+    const d = e.data;
+    openComment(`Part of the page: <${String(d.tag || '').slice(0, 20)}> at \`${String(d.selector || '').slice(0, 240)}\` (about ${+d.x || 0}% across, ${+d.y || 0}% down the view)`, String(d.text || '').slice(0, 300));
+  };
+  addEventListener('message', onMsg);
   const drawHead = () => head.replaceChildren(
     isPop ? null : h('button', { class: 'ibtn', title: 'Back', onclick: () => back('#/artifacts'), html: icon('back', 16) }),
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
     a.agent ? stamp(a.agent, { small: true }) : null,
     h('span', { class: 'grow' }),
+    pickable ? h('button', { class: 'btn sm' + (commenting ? ' primary' : ''), title: a.kind === 'html' || a.kind === 'image' || a.kind === 'svg' ? 'Click a part of it to comment' : 'Select text to comment', onclick: () => setMode(!commenting) }, ic('chat', 13), commenting ? 'Commenting…' : 'Comment') : null,
     h('button', { class: 'btn sm', onclick: () => draw(true) }, ic('reload', 13), 'Reload'),
     a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
     isPop ? null : h('button', { class: 'ibtn', title: 'Open in its own window', onclick: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 16) }),
@@ -326,11 +379,28 @@ export async function viewer(el, r, ctx) {
       }
     } else if (a.kind === 'image') frame.replaceChildren(h('div', { class: 'av-img' }, h('img', { src, alt: a.title })));
     else if (a.kind === 'file') frame.replaceChildren(empty('download', a.entry, a.description || 'A file to download.', h('a', { class: 'btn primary', href: a.url + '?download=1' }, 'Download')));
-    else frame.replaceChildren(h('iframe', { class: 'av-if', src, sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads', title: a.title }));
+    else {
+      const f = h('iframe', { class: 'av-if', src: a.url + '?annotate=1' + (bust ? '&t=' + Date.now() : ''), sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads', title: a.title });
+      f.onload = () => commenting && f.contentWindow.postMessage({ mr: 'mode', on: true }, '*');
+      frame.replaceChildren(f);
+    }
   }
+  // text documents and images: select words, or click a spot
+  frame.addEventListener('mouseup', () => {
+    if (!commenting || (a.kind !== 'markdown' && a.kind !== 'text')) return;
+    const q = String(getSelection() || '').trim();
+    if (q.length > 1) openComment('Part of the text:', q);
+  });
+  frame.addEventListener('click', (e) => {
+    if (!commenting || (a.kind !== 'image' && a.kind !== 'svg')) return;
+    const im = frame.querySelector('img');
+    if (!im || e.target !== im) return;
+    const r = im.getBoundingClientRect();
+    openComment(`A spot on the image: ${Math.round(((e.clientX - r.left) / r.width) * 100)}% across, ${Math.round(((e.clientY - r.top) / r.height) * 100)}% down.`, '');
+  });
   drawHead();
   draw();
-  return listen((ev) => {
+  const off = listen((ev) => {
     if (ev.kind === 'artifact' && ev.data?.id === a.id) {
       if (ev.data.deleted) return frame.replaceChildren(empty('trash', 'This artifact was deleted'));
       a = { ...a, ...ev.data, url: a.url };
@@ -338,6 +408,10 @@ export async function viewer(el, r, ctx) {
       draw(true);
     }
   });
+  return () => {
+    removeEventListener('message', onMsg);
+    off?.();
+  };
 }
 
 export { S, agentName, kicker };

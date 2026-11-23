@@ -303,3 +303,16 @@ pub fn file(core: &Core, id: &str, rel: &str) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     (canon.starts_with(&root) && canon.is_file()).then_some(canon)
 }
+
+/// Page script for commenting: while the viewer switches it on, hovering outlines a part of the page and clicking sends
+/// where it is (a selector, its text, where on the page) to the viewer, which asks what the person wants to say.
+const PICKER: &str = r#"<script>(function(){if(window.__mrPick)return;window.__mrPick=1;var on=false,hi=null,st=document.createElement('style');st.textContent='.__mr-hi{outline:2px solid #b6f23a!important;outline-offset:1px!important;cursor:crosshair!important;background-image:linear-gradient(rgba(182,242,58,.14),rgba(182,242,58,.14))!important}';document.documentElement.appendChild(st);function sel(el){var parts=[];while(el&&el.nodeType==1&&el!==document.body&&el!==document.documentElement){if(el.id){parts.unshift('#'+(window.CSS&&CSS.escape?CSS.escape(el.id):el.id));return parts.join(' > ');}var i=1,s=el;while((s=s.previousElementSibling))if(s.tagName===el.tagName)i++;parts.unshift(el.tagName.toLowerCase()+':nth-of-type('+i+')');el=el.parentNode;}return 'body > '+parts.join(' > ');}function clear(){if(hi){hi.classList.remove('__mr-hi');hi=null;}}addEventListener('mouseover',function(e){if(!on)return;clear();hi=e.target;if(hi.classList)hi.classList.add('__mr-hi');},true);addEventListener('click',function(e){if(!on)return;e.preventDefault();e.stopPropagation();var el=e.target;parent.postMessage({mr:'pick',selector:sel(el),tag:(el.tagName||'').toLowerCase(),text:(el.innerText||el.alt||el.getAttribute('aria-label')||'').trim().replace(/\s+/g,' ').slice(0,300),x:Math.round(e.clientX/innerWidth*100),y:Math.round(e.clientY/innerHeight*100)},'*');},true);addEventListener('message',function(e){if(e.data&&e.data.mr==='mode'){on=!!e.data.on;if(!on)clear();}});})();</script>"#;
+
+/// An HTML page with the comment picker added before its closing body tag (or at the end).
+pub fn with_picker(bytes: Vec<u8>) -> Vec<u8> {
+    let html = String::from_utf8_lossy(&bytes).into_owned();
+    match html.to_ascii_lowercase().rfind("</body>") {
+        Some(i) => format!("{}{}{}", &html[..i], PICKER, &html[i..]).into_bytes(),
+        None => format!("{html}{PICKER}").into_bytes(),
+    }
+}

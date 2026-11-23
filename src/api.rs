@@ -1070,6 +1070,8 @@ async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String
     let Some(path) = artifacts::file(&core, &id, &rest) else { return StatusCode::NOT_FOUND.into_response() };
     let Ok(bytes) = tokio::fs::read(&path).await else { return StatusCode::NOT_FOUND.into_response() };
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    // the viewer asks for the comment picker: a few lines that let the person point at a part of the page
+    let bytes = if q.get("annotate").is_some() && mime.essence_str() == "text/html" { artifacts::with_picker(bytes) } else { bytes };
     let mut r = Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, "no-cache");
     if q.get("download").is_some() {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "artifact".into());

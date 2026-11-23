@@ -1,0 +1,684 @@
+// A thread: the conversation with one agent, its live work, its decisions, and what to do with its branch.
+// The same component is the project chat on the board (compact) and a thread in its own window (pop-out).
+
+import { h, ago, clock, dayLabel, dur, num, bytes } from '../util.js';
+import { icon } from '../icons.js';
+import { get, post, patch, del, listen, upload } from '../api.js';
+import { S, agentName, agentHue, project as projectOf } from '../store.js';
+import { go, openThread } from '../app.js';
+import { isPop, isDesktop, popOut, setTitle, openExternal, native } from '../native.js';
+import { dialog, toast, showMenu } from '../ui.js';
+import { md, wireMd } from '../md.js';
+import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+
+export default async function threadView(el, r, ctx) {
+  return mountThread(el, r.id, { full: true, ctx });
+}
+
+const TOOL_ICONS = { shell: 'terminal', 'edit files': 'edit', 'web search': 'globe' };
+
+export async function mountThread(el, id, { full, compact, ctx } = {}) {
+  let t;
+  try {
+    t = await get('threads/' + id);
+  } catch (e) {
+    el.replaceChildren(errorBox(e, () => mountThread(el, id, { full, compact, ctx })));
+    return;
+  }
+  const head = h('div', { class: 'th-head' });
+  const decisionsEl = h('div', { class: 'th-decisions' });
+  const log = h('div', { class: 'th-log' });
+  const liveEl = h('div', { class: 'th-live', hidden: true });
+  const scroller = h('div', { class: 'th-scroll' }, h('div', { class: 'th-inner' }, log, liveEl));
+  const composer = makeComposer();
+  const sidebar = full ? h('aside', { class: 'th-side' }) : null;
+  el.classList.add('thread', compact ? 'compact' : 'full');
+  el.replaceChildren(
+    compact ? null : head,
+    h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, scroller, composer.el), sidebar));
+
+  let messages = [], turns = [], activity = {}, hasMore = false;
+  const live = { turn: null, segments: [], cur: '', acts: [], started: 0 };
+
+  // ---------------------------------------------------------- header
+  function drawHead() {
+    const p = t.project;
+    if (full) setTitle(`${t.title} · ${agentName(t.agent)}`);
+    ctx?.setPopTitle?.(t.title);
+    if (compact) return;
+    const running = !!t.running;
+    const isWorker = t.kind === 'worker' || t.kind === 'review';
+    const canBranch = !!t.branch;
+    const title = h('h1', { class: 'th-title', title: 'Rename', tabindex: '0', onclick: rename, onkeydown: (e) => e.key === 'Enter' && rename() }, t.title);
+    head.replaceChildren(
+      h('div', { class: 'th-crumbs mono' },
+        p ? h('a', { href: '#/p/' + p.id, style: { '--ph': p.color } }, h('i', { class: 'sw' }), p.name) : h('a', { href: '#/chats' }, 'Chats'),
+        h('span', {}, '/'),
+        h('span', {}, t.kind === 'lead' ? 'project chat' : t.kind === 'review' ? 'review' : t.kind === 'chat' ? 'chat' : 'thread')),
+      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t)),
+      t.status_note ? h('div', { class: 'th-note' }, ic(t.status === 'blocked' || t.status === 'failed' ? 'warn' : 'info', 14), h('span', {}, t.status_note)) : null,
+      h('div', { class: 'th-acts' },
+        running
+          ? [h('button', { class: 'btn sm', onclick: () => act('pause'), title: 'Pause after stopping this turn' }, ic('pause', 13), 'Pause'), h('button', { class: 'btn sm danger', onclick: () => act('stop'), title: 'Stop (Ctrl+.)' }, ic('stop', 13), 'Stop')]
+          : t.status === 'paused' || t.status === 'limited' || t.status === 'cancelled'
+            ? h('button', { class: 'btn sm primary', onclick: () => act('resume') }, ic('play', 13), 'Resume')
+            : t.status === 'failed'
+              ? h('button', { class: 'btn sm primary', onclick: () => act('retry') }, ic('refresh', 13), 'Retry')
+              : null,
+        canBranch ? h('button', { class: 'btn sm', onclick: () => showDiff() }, ic('diff', 13), 'Changes') : null,
+        canBranch && !t.merged ? h('button', { class: 'btn sm', onclick: () => doMerge() }, ic('merge', 13), 'Merge') : null,
+        canBranch ? h('button', { class: 'btn sm', onclick: () => doPr() }, ic('pr', 13), 'Pull request') : null,
+        isWorker || t.kind === 'chat' ? h('button', { class: 'btn sm', onclick: () => act(t.resolved ? 'reopen' : 'resolve') }, ic(t.resolved ? 'undo' : 'check', 13), t.resolved ? 'Reopen' : 'Resolve') : null,
+        h('span', { class: 'grow' }),
+        !isPop ? h('button', { class: 'ibtn', title: 'Pop out into its own window (Ctrl+Shift+O)', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 16) }) : null,
+        h('button', { class: 'ibtn', title: 'More', onclick: (e) => moreMenu(e.currentTarget), html: icon('more', 16) })));
+  }
+
+  async function rename() {
+    const i = input(t.title);
+    if (!(await dialog({ title: 'Rename thread', body: field('Title', i), ok: 'Rename' }))) return;
+    if (i.value.trim()) t = { ...t, ...(await patch('threads/' + id, { title: i.value.trim() })) };
+    drawHead();
+  }
+
+  function moreMenu(anchor) {
+    const r = anchor.getBoundingClientRect();
+    const isWorker = t.kind === 'worker' || t.kind === 'review';
+    showMenu([
+      { label: 'Rename…', icon: 'edit', run: rename },
+      { label: t.pinned ? 'Unpin' : 'Pin', icon: 'pin', run: async () => ((t = { ...t, ...(await patch('threads/' + id, { pinned: t.pinned ? 0 : 1 })) }), drawHead()) },
+      { label: 'Hand to another agent…', icon: 'agents', run: reassign },
+      isWorker || t.kind === 'chat' ? { label: 'Ask for a review…', icon: 'eye', run: review, disabled: t.kind === 'chat' } : null,
+      { label: 'Start a fresh session', icon: 'refresh', title: 'The agent forgets its session; the next turn gets a recap of this thread instead', run: () => act('new_session').then(() => toast('The next turn starts a fresh session with a recap')) },
+      { sep: true },
+      t.workspace_path ? { label: 'Copy the folder path', icon: 'copy', run: () => navigator.clipboard?.writeText(t.workspace_path).then(() => toast('Copied')) } : null,
+      t.workspace_path && S.me.local ? { label: 'Show the folder', icon: 'folder', run: () => act('reveal') } : null,
+      t.branch ? { label: 'Copy the branch name', icon: 'branch', run: () => navigator.clipboard?.writeText(t.branch).then(() => toast('Copied')) } : null,
+      { label: 'Turn logs…', icon: 'terminal', run: showTurns },
+      { sep: true },
+      t.kind !== 'lead' ? { label: 'Delete thread', icon: 'trash', danger: true, run: remove } : null,
+    ], r.right, r.bottom + 4, { anchor });
+  }
+
+  async function act(action, extra = {}) {
+    try {
+      t = { ...t, ...(await post(`threads/${id}/action`, { action, ...extra })) };
+      drawHead();
+      drawSide();
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+  }
+
+  async function remove() {
+    if (!(await dialog({ title: 'Delete this thread?', text: 'The agent stops, and the thread leaves the board. Its branch stays in git.', ok: 'Delete', danger: true }))) return;
+    try {
+      await del('threads/' + id);
+      toast('Thread deleted', { action: 'Undo', ms: 9000, run: () => post(`threads/${id}/restore`).then(() => openThread(id)) });
+      if (isPop) window.close();
+      else go(t.project_id ? '#/p/' + t.project_id : '#/chats');
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+  }
+
+  async function reassign() {
+    const pick = agentModelPicker({ agentId: t.agent === 'claude' ? 'codex' : 'claude', model: '' });
+    const note = textarea('', { rows: 3, placeholder: 'Optional: why, or what the new agent should know' });
+    if (!(await dialog({ title: 'Hand this thread to another agent', text: 'The new agent picks up with a recap of everything said so far, in the same workspace.', body: h('div', { class: 'dlg-fields' }, field('Agent', pick.el), field('Note', note)), ok: 'Hand over' }))) return;
+    const { agent: a, model: m } = pick.get();
+    act('reassign', { agent: a, model: m, note: note.value });
+  }
+
+  async function review() {
+    const opts = agentOptions().filter(([k]) => k !== t.agent);
+    const a = select(opts, opts[0]?.[0]);
+    const focus = textarea('', { rows: 3, placeholder: 'What should the reviewer look hardest at? Optional.' });
+    if (!(await dialog({ title: 'Ask another agent to review', text: 'A review thread reads this branch’s changes and reports back to the lead. A second pair of eyes from a different model catches different things.', body: h('div', { class: 'dlg-fields' }, field('Reviewer', a), field('Focus', focus)), ok: 'Ask for review' }))) return;
+    try {
+      const r = await post(`threads/${id}/action`, { action: 'review', agent: a.value, focus: focus.value });
+      toast('Review started', { action: 'Open', run: () => openThread(r.id) });
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+  }
+
+  // ---------------------------------------------------------- git: diff, merge, PR
+  async function showDiff() {
+    const body = h('div', { class: 'diffbox' }, loading('Reading the changes'));
+    const p = dialog({ title: `Changes on ${t.branch}`, wide: true, cls: 'xwide', body, ok: t.merged ? null : 'Merge…', cancel: 'Close' });
+    try {
+      const r = await get(`threads/${id}/diff`);
+      body.replaceChildren(r.diff ? renderDiff(r.diff) : h('p', { class: 'faint' }, r.note || 'No changes yet against ' + (r.base || 'the base branch') + '.'));
+    } catch (e) {
+      body.replaceChildren(errorBox(e));
+    }
+    if (await p) doMerge();
+  }
+
+  async function doMerge() {
+    const msg = input(`${t.title} (${t.agent})`);
+    let squash = false;
+    const ok = await dialog({
+      title: 'Merge into ' + (t.base_branch || 'the base branch'),
+      text: 'The branch is merged in the project folder. If git finds a conflict nothing changes, and you can hand the conflict to an agent.',
+      body: h('div', { class: 'dlg-fields' }, field('Commit message', msg), toggle(false, (v) => (squash = v), { label: 'Squash into one commit' })),
+      ok: 'Merge',
+    });
+    if (!ok) return;
+    try {
+      const r = await post(`threads/${id}/merge`, { message: msg.value, squash });
+      toast(`Merged (${String(r.sha).slice(0, 7)})`);
+      t = await get('threads/' + id);
+      drawHead();
+    } catch (e) {
+      const fix = await dialog({ title: 'The merge didn’t go through', text: e.message, ok: 'Ask the agent to fix it', cancel: 'Close' });
+      if (fix) send(`Merging your branch into ${t.base_branch || 'the base branch'} failed:\n\n${e.message}\n\nBring your branch up to date with it (merge or rebase), resolve the conflicts, run the checks again and commit.`);
+    }
+  }
+
+  async function doPr() {
+    const title = input(t.title);
+    const body = textarea(t.instructions ? `## What\n${t.instructions.slice(0, 1500)}\n` : '', { rows: 6 });
+    let draft = false;
+    const ok = await dialog({
+      title: 'Open a pull request',
+      text: `Pushes ${t.branch} to GitHub and opens a pull request into ${t.base_branch || 'the default branch'}.`,
+      wide: true,
+      body: h('div', { class: 'dlg-fields' }, field('Title', title), field('Description', body), toggle(false, (v) => (draft = v), { label: 'Open as a draft' })),
+      ok: 'Open pull request',
+    });
+    if (!ok) return;
+    try {
+      const r = await post(`threads/${id}/pr`, { title: title.value, body: body.value, draft });
+      toast(r.existing ? `Pull request #${r.number} already open` : `Opened pull request #${r.number}`, { action: 'View', ms: 8000, run: () => openExternal(r.url) });
+    } catch (e) {
+      toast(e.message, { err: true, ms: 8000 });
+    }
+  }
+
+  async function showTurns() {
+    const list = h('div', { class: 'turns' });
+    const pane = h('pre', { class: 'logpane' }, 'Pick a turn to see its log.');
+    for (const tu of turns)
+      list.append(h('button', { class: 'turn-i', type: 'button', onclick: async () => {
+        pane.textContent = 'Loading…';
+        pane.textContent = (await get('logs?turn=' + tu.id).catch((e) => ({ text: e.message }))).text;
+      } }, statusChip(tu.status === 'running' ? 'working' : tu.status), h('span', {}, agentName(tu.agent) + (tu.model ? ' · ' + tu.model : '')), h('small', { class: 'faint' }, ago(tu.started_at) + (tu.ended_at ? ' · ' + dur(tu.ended_at - tu.started_at) : ''))));
+    dialog({ title: 'Turns', wide: true, cls: 'xwide', ok: null, cancel: 'Close', body: h('div', { class: 'turns-wrap' }, turns.length ? list : h('p', { class: 'faint' }, 'No turns yet.'), pane) });
+  }
+
+  // ---------------------------------------------------------- side panel
+  function drawSide() {
+    if (!sidebar) return;
+    const u = t.usage || {};
+    const deps = (t.depends_on || '').split(',').filter(Boolean);
+    sidebar.replaceChildren(
+      t.instructions ? h('section', {}, kicker('The task'), h('div', { class: 'md small' }, ...mdNodes(t.instructions))) : null,
+      t.criteria ? h('section', {}, kicker('Done when'), h('div', { class: 'md small' }, ...mdNodes(t.criteria))) : null,
+      h('section', {}, kicker('Workspace'),
+        h('dl', { class: 'facts' },
+          t.task_kind ? [h('dt', {}, 'Kind'), h('dd', {}, (S.taskKinds.find((k) => k.id === t.task_kind) || {}).label || t.task_kind)] : null,
+          t.branch ? [h('dt', {}, 'Branch'), h('dd', { class: 'mono' }, t.branch)] : null,
+          t.base_branch ? [h('dt', {}, 'Into'), h('dd', { class: 'mono' }, t.base_branch)] : null,
+          t.workspace_path ? [h('dt', {}, 'Folder'), h('dd', {}, copyable(t.workspace_path))] : null,
+          [h('dt', {}, 'Started'), h('dd', {}, timeAgo(t.created_at))],
+          t.session_id ? [h('dt', {}, 'Session'), h('dd', { class: 'mono faint', title: t.session_id }, t.session_id.slice(0, 12) + '…')] : null)),
+      deps.length ? h('section', {}, kicker('Waits for'), deps.map((d) => h('button', { class: 'linkbtn', onclick: () => openThread(d) }, ic('thread', 13), d))) : null,
+      t.children?.length ? h('section', {}, kicker('Threads from here'), t.children.map((c) => h('button', { class: 'mini', onclick: () => openThread(c.id) }, h('span', {}, c.title), stamp(c.agent, { small: true }), statusChip(c.status)))) : null,
+      t.artifacts?.length ? h('section', {}, kicker('Artifacts'), t.artifacts.map((a) => h('a', { class: 'mini', href: '#/a/' + a.id }, ic('artifact', 13), h('span', {}, a.title), h('small', { class: 'faint' }, a.kind)))) : null,
+      h('section', {}, kicker('Usage'),
+        h('dl', { class: 'facts' },
+          h('dt', {}, 'Turns'), h('dd', {}, u.turns || 0),
+          h('dt', {}, 'Tokens'), h('dd', {}, num(u.input || 0) + ' in · ' + num(u.output || 0) + ' out'),
+          u.cost ? [h('dt', {}, 'Cost'), h('dd', {}, '$' + Number(u.cost).toFixed(2))] : null)),
+    );
+  }
+
+  // ---------------------------------------------------------- decisions
+  function drawDecisions() {
+    const open = (t.decisions || []).filter((d) => d.answer == null);
+    decisionsEl.replaceChildren(...open.map((d) => decisionCard(d, async (i) => {
+      try {
+        await post('decisions/' + d.id, { choice: i });
+        t.decisions = t.decisions.map((x) => (x.id === d.id ? { ...x, answer: i } : x));
+        drawDecisions();
+        toast('Answer sent');
+      } catch (e) {
+        toast(e.message, { err: true });
+      }
+    })));
+  }
+
+  // ---------------------------------------------------------- timeline
+  async function loadMessages(before) {
+    const r = await get(`threads/${id}/messages?limit=80` + (before ? '&before=' + before : ''));
+    hasMore = r.messages.length >= 80;
+    turns = r.turns;
+    return r.messages;
+  }
+  async function loadActivity() {
+    const rows = await get(`threads/${id}/activity`);
+    activity = {};
+    for (const a of rows) (activity[a.turn_id] ||= []).push(a);
+  }
+
+  function drawLog() {
+    const atBottom = nearBottom();
+    const frag = [];
+    if (hasMore) frag.push(h('button', { class: 'more-btn', onclick: loadEarlier }, 'Earlier messages'));
+    if (!messages.length) frag.push(emptyThread());
+    // the agent's activity goes under the last message of its turn
+    const lastOfTurn = {};
+    messages.forEach((m) => m.meta?.turn_id && (lastOfTurn[m.meta.turn_id] = m.id));
+    let day = '';
+    for (const m of messages) {
+      const d = dayLabel(m.created_at);
+      if (d !== day) {
+        day = d;
+        frag.push(h('div', { class: 'day' }, h('span', {}, d)));
+      }
+      frag.push(entry(m, lastOfTurn[m.meta?.turn_id] === m.id ? activity[m.meta.turn_id] : null));
+    }
+    log.replaceChildren(...frag);
+    if (atBottom) toBottom();
+  }
+
+  function emptyThread() {
+    if (t.kind === 'lead') return empty('agents', 'Talk to the lead', `Say what you want built. ${agentName(t.agent)} plans it, opens threads for the right agents, watches them and reports back here.`);
+    if (t.kind === 'chat') return empty('chat', 'A fresh chat', `Ask ${agentName(t.agent)} anything. It works in its own folder, so it can make and run files too.`);
+    return empty('thread', 'Nothing yet', 'Messages show up here as the agent starts.');
+  }
+
+  async function loadEarlier() {
+    const first = messages[0];
+    const h0 = scroller.scrollHeight;
+    const older = await loadMessages(first?.created_at);
+    messages = [...older, ...messages];
+    drawLog();
+    scroller.scrollTop = scroller.scrollHeight - h0;
+  }
+
+  function entry(m, acts) {
+    const meta = m.meta || {};
+    if (m.role === 'wake') {
+      const reason = (m.body.match(/reason="([^"]+)"/) || [])[1] || m.author.toLowerCase();
+      const bodyEl = h('pre', { class: 'wake-body', hidden: true }, m.body);
+      return h('div', { class: 'wake' + (m.pending ? ' pending' : ''), dataset: { id: m.id } },
+        h('button', { class: 'wake-h', onclick: () => (bodyEl.hidden = !bodyEl.hidden) }, ic('bolt', 12), h('span', {}, wakeLabel(reason, m)), m.pending ? h('em', {}, 'queued') : null, h('time', {}, clock(m.created_at))),
+        bodyEl);
+    }
+    if (m.role === 'system') {
+      if (meta.artifact) return artifactCard(meta.artifact, m);
+      if (meta.decision) {
+        const d = (t.decisions || []).find((x) => x.id === meta.decision.id) || meta.decision;
+        return h('div', { class: 'sys-entry' }, ic('question', 14), h('div', {}, h('b', {}, 'Asked you: '), m.body, d.answer != null ? h('div', { class: 'answered' }, '→ ', (parseOpts(d.options)[d.answer] || {}).label || 'answered') : h('div', { class: 'faint small' }, 'Waiting for your answer above')));
+      }
+      return h('div', { class: 'sys-entry' }, ic('info', 14), h('div', { class: 'md' }, ...mdNodes(m.body)), h('time', {}, clock(m.created_at)));
+    }
+    const isAgent = m.role === 'agent';
+    const who = isAgent ? meta.agent || t.agent : null;
+    const fromLead = !isAgent && /^Lead/.test(m.author);
+    const files = (meta.files || []).filter(Boolean);
+    const e = h('article', { class: 'msg ' + (isAgent ? 'agent' : fromLead ? 'lead-msg' : 'you') + (m.pending ? ' pending' : ''), dataset: { id: m.id }, style: isAgent ? { '--ah': agentHue(who) } : null },
+      h('header', {},
+        isAgent ? stamp(who, { model: meta.model, small: true }) : h('b', { class: 'who' }, m.author || 'You'),
+        meta.kickoff ? h('span', { class: 'tag' }, 'kickoff') : null,
+        meta.from_thread ? h('button', { class: 'tag link', onclick: () => openThread(meta.from_thread) }, 'from the lead') : null,
+        m.pending ? h('span', { class: 'tag' }, 'not read yet') : null,
+        h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
+        h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
+      wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
+      files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null,
+      acts?.length ? activityStrip(acts, false) : null);
+    return e;
+  }
+
+  function wakeLabel(reason, m) {
+    const map = {
+      'worker-replied': 'A worker reported back',
+      'worker-finished': 'A worker finished',
+      'person-opened-thread': 'You opened a thread',
+      'person-messaged-thread': 'You wrote to a worker',
+      'person-merged': 'You merged a branch',
+      'decision-answered': 'You answered a decision',
+      restarted: 'Model Roamer restarted',
+      'tool results': 'Tool results',
+      limit: 'An agent hit its limit',
+    };
+    const th = (m.body.match(/title="([^"]+)"/) || [])[1];
+    return (map[reason] || reason.replace(/-/g, ' ')) + (th ? ` · ${th}` : '');
+  }
+
+  function artifactCard(a, m) {
+    return h('div', { class: 'art-entry cut' },
+      ic('artifact', 18),
+      h('div', {}, h('b', {}, a.title), h('small', { class: 'faint' }, (a.kind || '') + (a.description ? ' · ' + a.description : ''))),
+      h('a', { class: 'btn sm', href: '#/a/' + a.id }, 'Open'),
+      h('button', { class: 'ibtn sm', title: 'Open in its own window', onclick: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 14) }),
+      h('time', {}, clock(m.created_at)));
+  }
+
+  // ---------------------------------------------------------- live turn
+  function drawLive() {
+    const on = !!t.running || !!live.turn;
+    liveEl.hidden = !on;
+    if (!on) return;
+    const text = [...live.segments, live.cur].filter(Boolean).join('\n\n');
+    const last = live.acts.slice(-1)[0];
+    liveEl.replaceChildren(
+      h('div', { class: 'live-h', style: { '--ah': agentHue(t.agent) } },
+        h('i', { class: 'pulse' }), stamp(t.agent, { model: t.model, small: true }),
+        h('span', { class: 'live-what' }, last ? actLabel(last) : 'Thinking…'),
+        h('span', { class: 'live-time mono', dataset: { since: live.started || t.running?.started || Date.now() } }, ''),
+        h('button', { class: 'btn xs danger', onclick: () => act('stop'), title: 'Stop (Ctrl+.)' }, 'Stop')),
+      text ? wireMd(h('div', { class: 'md live-text' }, ...mdNodes(text)), openExternal) : null,
+      live.acts.length ? activityStrip(live.acts, true) : null);
+    tick();
+    if (nearBottom(220)) toBottom();
+  }
+  const tick = () => liveEl.querySelectorAll('[data-since]').forEach((x) => (x.textContent = dur(Date.now() - +x.dataset.since)));
+  const ticker = setInterval(tick, 1000);
+
+  // ---------------------------------------------------------- composer
+  function makeComposer() {
+    const ta = h('textarea', { class: 'cmp-in', rows: 1, placeholder: placeholderFor(), spellcheck: 'true' });
+    const files = [];
+    const chips = h('div', { class: 'cmp-files' });
+    const drawChips = () => chips.replaceChildren(...files.map((f, i) => h('span', { class: 'file-chip' + (f.path ? '' : ' up') }, ic('clip', 12), f.name, h('small', {}, f.path ? bytes(f.size) : 'uploading…'), h('button', { title: 'Remove', onclick: () => (files.splice(i, 1), drawChips()), html: icon('close', 11) }))));
+    const fileIn = h('input', { type: 'file', multiple: true, hidden: true, onchange: () => (addFiles([...fileIn.files]), (fileIn.value = '')) });
+    async function addFiles(list) {
+      for (const f of list) {
+        const it = { name: f.name, size: f.size };
+        files.push(it);
+        drawChips();
+        try {
+          Object.assign(it, await upload(f));
+        } catch (e) {
+          files.splice(files.indexOf(it), 1);
+          toast(`Couldn't attach ${f.name}: ${e.message}`, { err: true });
+        }
+        drawChips();
+      }
+    }
+    const sendBtn = h('button', { class: 'cmp-send', title: 'Send (Enter)', onclick: () => go_(), html: icon('send', 17) });
+    async function go_() {
+      const text = ta.value.trim();
+      if (files.some((f) => !f.path)) return toast('Wait for the attachments to finish uploading');
+      if (!text && !files.length) return ta.focus();
+      const sent = { text, files: files.map((f) => f.path) };
+      ta.value = '';
+      files.length = 0;
+      drawChips();
+      grow();
+      try {
+        localStorage.removeItem('mr-draft-' + id);
+      } catch { /* fine */ }
+      await send(sent.text, sent.files, () => {
+        ta.value = sent.text;
+        grow();
+      });
+    }
+    const grow = () => {
+      ta.style.height = 'auto';
+      ta.style.height = Math.min(ta.scrollHeight, 280) + 'px';
+    };
+    ta.oninput = () => {
+      grow();
+      try {
+        localStorage.setItem('mr-draft-' + id, ta.value);
+      } catch { /* fine */ }
+    };
+    ta.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        go_();
+      }
+    };
+    ta.onpaste = (e) => {
+      const fs = [...(e.clipboardData?.files || [])];
+      if (fs.length) {
+        e.preventDefault();
+        addFiles(fs);
+      }
+    };
+    try {
+      ta.value = localStorage.getItem('mr-draft-' + id) || '';
+    } catch { /* fine */ }
+    const el = h('div', { class: 'composer cut', ondragover: (e) => (e.preventDefault(), el.classList.add('drop')), ondragleave: () => el.classList.remove('drop'), ondrop: (e) => (e.preventDefault(), el.classList.remove('drop'), addFiles([...e.dataTransfer.files])) },
+      chips,
+      h('div', { class: 'cmp-row' },
+        h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn,
+        ta, sendBtn),
+      h('div', { class: 'cmp-hint mono' }, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' })));
+    setTimeout(grow);
+    return { el, ta, focus: () => ta.focus() };
+  }
+  function placeholderFor() {
+    if (t.kind === 'lead') return `Tell the lead (${agentName(t.agent)}) what you want…`;
+    if (t.kind === 'chat') return `Message ${agentName(t.agent)}…`;
+    return `Write to ${agentName(t.agent)} directly (the lead hears about it)…`;
+  }
+
+  async function send(text, files = [], restore) {
+    try {
+      const m = await post(`threads/${id}/messages`, { text, files });
+      if (!messages.some((x) => x.id === m.id)) messages.push(m);
+      drawLog();
+      toBottom();
+    } catch (e) {
+      toast(e.message, { err: true });
+      restore?.();
+    }
+  }
+
+  // ---------------------------------------------------------- scrolling
+  const nearBottom = (px = 120) => scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < px;
+  const toBottom = () => requestAnimationFrame(() => (scroller.scrollTop = scroller.scrollHeight));
+
+  // ---------------------------------------------------------- live events
+  const reloadThread = async () => {
+    try {
+      t = await get('threads/' + id);
+      drawHead();
+      drawSide();
+      drawDecisions();
+      drawLive();
+    } catch { /* deleted */ }
+  };
+  let pendingReload = 0;
+  const soon = () => (clearTimeout(pendingReload), (pendingReload = setTimeout(reloadThread, 250)));
+  const unlisten = listen((ev) => {
+    if (ev.kind === 'resync') return refreshAll();
+    if (ev.thread !== id) return;
+    const d = ev.data || {};
+    switch (ev.kind) {
+      case 'message': {
+        if (!messages.some((x) => x.id === d.id)) messages.push(d);
+        else messages = messages.map((x) => (x.id === d.id ? d : x));
+        if (d.role === 'agent') {
+          live.segments = [];
+          live.cur = '';
+        }
+        drawLog();
+        drawLive();
+        break;
+      }
+      case 'delta':
+        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: live.started || Date.now() });
+        if (d.block != null) {
+          live.segments.push(d.block);
+          live.cur = '';
+        } else live.cur += d.text || '';
+        drawLiveSoon();
+        break;
+      case 'activity':
+        (activity[d.turn_id] ||= []).push(d);
+        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now() });
+        live.acts.push(d);
+        drawLiveSoon();
+        break;
+      case 'turn':
+        if (d.state === 'start') {
+          Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now() });
+          t.running = { turn: d.turn_id, started: Date.now() };
+        } else {
+          live.turn = null;
+          t.running = null;
+          get(`threads/${id}/messages?limit=1`).then((r) => ((turns = r.turns), drawLog())).catch(() => {});
+        }
+        drawHead();
+        drawLive();
+        break;
+      case 'running':
+        if (d.running === false) {
+          live.turn = null;
+          t.running = null;
+          drawLive();
+        }
+        soon();
+        break;
+      case 'thread':
+        if (d.deleted) return el.replaceChildren(empty('trash', 'This thread was deleted', '', h('button', { class: 'btn', onclick: () => post(`threads/${id}/restore`).then(() => mountThread(el, id, { full, compact, ctx })) }, 'Undo')));
+        t = { ...t, ...d };
+        drawHead();
+        drawLive();
+        break;
+      case 'decision':
+      case 'artifact':
+      case 'claims':
+        soon();
+        break;
+      case 'progress':
+        t.status_note = d.text;
+        drawHead();
+        break;
+    }
+  });
+  let liveTimer = 0;
+  const drawLiveSoon = () => liveTimer || (liveTimer = requestAnimationFrame(() => ((liveTimer = 0), drawLive())));
+
+  async function refreshAll() {
+    try {
+      [messages] = await Promise.all([loadMessages(), loadActivity()]);
+      t = await get('threads/' + id);
+      drawHead();
+      drawSide();
+      drawDecisions();
+      drawLog();
+      drawLive();
+    } catch (e) {
+      log.replaceChildren(errorBox(e, refreshAll));
+    }
+  }
+
+  // ---------------------------------------------------------- keys
+  const keys = (e) => {
+    if (!el.isConnected) return;
+    const k = (e.ctrlKey || e.metaKey) && e.key;
+    if (k === '.' && t.running) (e.preventDefault(), act('stop'));
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'o' && !isPop) (e.preventDefault(), popOut('#/t/' + id, { key: 't:' + id }));
+  };
+  document.addEventListener('keydown', keys);
+
+  drawHead();
+  log.replaceChildren(loading('Loading the conversation'));
+  await refreshAll();
+  toBottom();
+  if (!compact) composer.focus();
+  if (t.unread) patch('threads/' + id, { unread: 0 }).catch(() => {});
+
+  return () => {
+    unlisten();
+    clearInterval(ticker);
+    document.removeEventListener('keydown', keys);
+  };
+}
+
+// ------------------------------------------------------------ shared pieces
+export function mdNodes(text) {
+  const d = h('div', { html: md(text) });
+  return [...d.childNodes];
+}
+
+function parseOpts(o) {
+  if (Array.isArray(o)) return o;
+  try {
+    return JSON.parse(o || '[]');
+  } catch {
+    return [];
+  }
+}
+
+export function decisionCard(d, answer) {
+  const opts = parseOpts(d.options);
+  return h('div', { class: 'decision cut' },
+    h('div', { class: 'dc-h' }, ic('question', 16), h('span', { class: 'eyebrow' }, 'Your call')),
+    h('h3', {}, d.question),
+    h('div', { class: 'dc-opts' }, opts.map((o, i) => h('button', { class: 'dc-opt' + (i === d.recommended ? ' rec' : ''), onclick: (e) => {
+      e.currentTarget.closest('.decision').classList.add('sent');
+      answer(i);
+    } }, h('b', {}, o.label, i === d.recommended ? h('em', {}, 'recommended') : null), o.consequence ? h('span', {}, o.consequence) : null))));
+}
+
+function actLabel(a) {
+  if (a.kind === 'tool') return (a.title || 'tool') + (a.body ? ': ' + a.body.split('\n')[0].slice(0, 90) : '');
+  if (a.kind === 'thinking') return 'Thinking…';
+  if (a.kind === 'error') return 'Error: ' + (a.title || a.body).slice(0, 80);
+  return a.title || a.kind;
+}
+
+/** The agent's steps in a turn: commands, edits, tool calls and their results. Collapsed to one line until opened. */
+export function activityStrip(acts, open) {
+  const tools = acts.filter((a) => a.kind === 'tool');
+  const errors = acts.filter((a) => a.kind === 'error').length;
+  const names = [...new Set(tools.map((a) => (a.title || '').split(':')[0]))].slice(0, 5);
+  const list = h('div', { class: 'acts', hidden: !open });
+  const draw = () => list.replaceChildren(...acts.slice(-200).map((a) => {
+    const body = a.body || '';
+    const long = body.length > 220 || body.includes('\n');
+    const pre = h('pre', { class: 'act-body', hidden: long && a.kind !== 'thinking' }, body);
+    return h('div', { class: 'act k-' + a.kind },
+      h('button', { class: 'act-h', onclick: () => long && (pre.hidden = !pre.hidden) },
+        h('i', { class: 'act-ic', html: icon(a.kind === 'tool' ? TOOL_ICONS[a.title] || (String(a.title).includes(':') ? 'cpu' : 'bolt') : a.kind === 'result' ? 'right' : a.kind === 'thinking' ? 'sparkle' : a.kind === 'error' ? 'warn' : 'info', 12) }),
+        h('span', { class: 'act-t' }, a.kind === 'result' ? 'result' : a.kind === 'thinking' ? 'thinking' : a.title || a.kind),
+        !long || a.kind === 'thinking' ? null : h('span', { class: 'act-peek' }, body.split('\n')[0].slice(0, 120)),
+        long && a.kind !== 'thinking' ? h('i', { class: 'act-more', html: icon('chevDown', 12) }) : null),
+      !long || a.kind === 'thinking' ? (body ? h('div', { class: 'act-short' }, body) : null) : pre);
+  }));
+  if (open) draw();
+  const head = h('button', { class: 'acts-h', onclick: () => {
+    list.hidden = !list.hidden;
+    if (!list.hidden && !list.childElementCount) draw();
+    head.classList.toggle('open', !list.hidden);
+  } }, ic('terminal', 12), h('span', {}, `${tools.length} step${tools.length === 1 ? '' : 's'}`), names.length ? h('span', { class: 'faint' }, names.join(' · ')) : null, errors ? h('span', { class: 'status hot' }, errors + ' error' + (errors > 1 ? 's' : '')) : null, h('i', { class: 'act-more', html: icon('chevDown', 12) }));
+  if (open) head.classList.add('open');
+  return h('div', { class: 'acts-wrap' }, head, list);
+}
+
+export function renderDiff(text) {
+  const box = h('div', { class: 'diff mono' });
+  const lines = text.split('\n').slice(0, 6000);
+  const files = [];
+  let cur = null;
+  for (const l of lines) {
+    if (l.startsWith('diff --git')) {
+      cur = { name: l.replace(/^diff --git a\/(.*?) b\/.*$/, '$1'), lines: [], add: 0, rem: 0 };
+      files.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    if (/^(index |--- |\+\+\+ |new file|deleted file|similarity|rename )/.test(l)) continue;
+    if (l.startsWith('+')) cur.add++;
+    else if (l.startsWith('-')) cur.rem++;
+    cur.lines.push(l);
+  }
+  if (!files.length) return h('pre', { class: 'diff mono' }, text);
+  for (const f of files) {
+    const body = h('div', { class: 'df-body' }, f.lines.map((l) => h('div', { class: l.startsWith('@@') ? 'hunk' : l.startsWith('+') ? 'add' : l.startsWith('-') ? 'rem' : 'ctx' }, l || ' ')));
+    box.append(h('details', { class: 'df', open: files.length < 12 }, h('summary', {}, h('span', {}, f.name), h('b', { class: 'add' }, '+' + f.add), h('b', { class: 'rem' }, '−' + f.rem)), body));
+  }
+  return box;
+}
+
+export { statusLabel, ago, native, isDesktop, projectOf };

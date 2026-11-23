@@ -308,12 +308,20 @@ export async function viewer(el, r, ctx) {
   // ---- comments: point at a part (a page element, selected text, a spot on an image), say something, and send it to
   // the thread that made the artifact or to the project's orchestrator
   let commenting = false;
+  let how = localStorage.getItem('mr-art-how') === 'spot' ? 'spot' : 'element'; // pages: pick a part, or drop a pin anywhere
   const pickable = ['html', 'markdown', 'text', 'image', 'svg'].includes(a.kind);
   const getFrame = () => frame.querySelector('iframe.av-if');
+  const tellPage = () => getFrame()?.contentWindow?.postMessage({ mr: 'mode', on: commenting, how }, '*');
   const setMode = (on) => {
     commenting = on;
     frame.classList.toggle('commenting', on);
-    getFrame()?.contentWindow?.postMessage({ mr: 'mode', on }, '*');
+    tellPage();
+    drawHead();
+  };
+  const setHow = (v) => {
+    how = v;
+    localStorage.setItem('mr-art-how', v);
+    tellPage();
     drawHead();
   };
   function openComment(where, quote) {
@@ -323,7 +331,11 @@ export async function viewer(el, r, ctx) {
     let dest = dests.some(([v]) => v === saved) ? saved : dests[0][0];
     const ta = textarea('', { rows: 3, placeholder: 'What should change, or what do you want to know?' });
     const send = h('button', { class: 'btn primary sm' }, 'Send');
-    const close = () => ((cbox.hidden = true), cbox.replaceChildren());
+    const close = () => {
+      cbox.hidden = true;
+      cbox.replaceChildren();
+      getFrame()?.contentWindow?.postMessage({ mr: 'clearpin' }, '*');
+    };
     send.onclick = async () => {
       if (!ta.value.trim()) return ta.focus();
       send.disabled = true;
@@ -353,7 +365,9 @@ export async function viewer(el, r, ctx) {
     const f = getFrame();
     if (!f || e.source !== f.contentWindow || e.data?.mr !== 'pick') return;
     const d = e.data;
-    openComment(`Part of the page: <${String(d.tag || '').slice(0, 20)}> at \`${String(d.selector || '').slice(0, 240)}\` (about ${+d.x || 0}% across, ${+d.y || 0}% down the view)`, String(d.text || '').slice(0, 300));
+    const near = `<${String(d.tag || '').slice(0, 20)}> at \`${String(d.selector || '').slice(0, 240)}\``;
+    if (d.how === 'spot') openComment(`A spot on the page: ${+d.x || 0}% across and ${+d.y || 0}% down the whole page (${+d.px || 0}px, ${+d.py || 0}px from the top left), on ${near}`, String(d.text || '').slice(0, 300) ? 'Nearby: ' + String(d.text).slice(0, 300) : '');
+    else openComment(`Part of the page: ${near} (about ${+d.x || 0}% across, ${+d.y || 0}% down the view)`, String(d.text || '').slice(0, 300));
   };
   addEventListener('message', onMsg);
   const drawHead = () => head.replaceChildren(
@@ -361,7 +375,8 @@ export async function viewer(el, r, ctx) {
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
     a.agent ? stamp(a.agent, { small: true }) : null,
     h('span', { class: 'grow' }),
-    pickable ? h('button', { class: 'btn sm' + (commenting ? ' primary' : ''), title: a.kind === 'html' || a.kind === 'image' || a.kind === 'svg' ? 'Click a part of it to comment' : 'Select text to comment', onclick: () => setMode(!commenting) }, ic('chat', 13), commenting ? 'Commenting…' : 'Comment') : null,
+    commenting && a.kind === 'html' ? h('span', { class: 'seg sm', role: 'group', title: 'What a click picks' }, [['element', 'Element', 'Outline and pick a part of the page'], ['spot', 'Spot', 'Drop a pin anywhere on the page']].map(([v, l, t]) => h('button', { class: 'seg-b' + (how === v ? ' on' : ''), type: 'button', title: t, onclick: () => setHow(v) }, l))) : null,
+    pickable ?h('button', { class: 'btn sm' + (commenting ? ' primary' : ''), title: a.kind === 'html' || a.kind === 'image' || a.kind === 'svg' ? 'Click a part of it to comment' : 'Select text to comment', onclick: () => setMode(!commenting) }, ic('chat', 13), commenting ? 'Commenting…' : 'Comment') : null,
     h('button', { class: 'btn sm', onclick: () => draw(true) }, ic('reload', 13), 'Reload'),
     a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
     isPop ? null : h('button', { class: 'ibtn', title: 'Open in its own window', onclick: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 16) }),
@@ -381,7 +396,7 @@ export async function viewer(el, r, ctx) {
     else if (a.kind === 'file') frame.replaceChildren(empty('download', a.entry, a.description || 'A file to download.', h('a', { class: 'btn primary', href: a.url + '?download=1' }, 'Download')));
     else {
       const f = h('iframe', { class: 'av-if', src: a.url + '?annotate=1' + (bust ? '&t=' + Date.now() : ''), sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads', title: a.title });
-      f.onload = () => commenting && f.contentWindow.postMessage({ mr: 'mode', on: true }, '*');
+      f.onload = () => commenting && tellPage();
       frame.replaceChildren(f);
     }
   }

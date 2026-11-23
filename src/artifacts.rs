@@ -304,9 +304,76 @@ pub fn file(core: &Core, id: &str, rel: &str) -> Option<PathBuf> {
     (canon.starts_with(&root) && canon.is_file()).then_some(canon)
 }
 
-/// Page script for commenting: while the viewer switches it on, hovering outlines a part of the page and clicking sends
+/// Page script for commenting. The viewer switches it on in one of two ways: "element" (hover outlines a part of the page,
+/// click picks it) or "spot" (click anywhere to drop a pin; it sends how far across and down the page). Either way it sends
 /// where it is (a selector, its text, where on the page) to the viewer, which asks what the person wants to say.
-const PICKER: &str = r#"<script>(function(){if(window.__mrPick)return;window.__mrPick=1;var on=false,hi=null,st=document.createElement('style');st.textContent='.__mr-hi{outline:2px solid #b6f23a!important;outline-offset:1px!important;cursor:crosshair!important;background-image:linear-gradient(rgba(182,242,58,.14),rgba(182,242,58,.14))!important}';document.documentElement.appendChild(st);function sel(el){var parts=[];while(el&&el.nodeType==1&&el!==document.body&&el!==document.documentElement){if(el.id){parts.unshift('#'+(window.CSS&&CSS.escape?CSS.escape(el.id):el.id));return parts.join(' > ');}var i=1,s=el;while((s=s.previousElementSibling))if(s.tagName===el.tagName)i++;parts.unshift(el.tagName.toLowerCase()+':nth-of-type('+i+')');el=el.parentNode;}return 'body > '+parts.join(' > ');}function clear(){if(hi){hi.classList.remove('__mr-hi');hi=null;}}addEventListener('mouseover',function(e){if(!on)return;clear();hi=e.target;if(hi.classList)hi.classList.add('__mr-hi');},true);addEventListener('click',function(e){if(!on)return;e.preventDefault();e.stopPropagation();var el=e.target;parent.postMessage({mr:'pick',selector:sel(el),tag:(el.tagName||'').toLowerCase(),text:(el.innerText||el.alt||el.getAttribute('aria-label')||'').trim().replace(/\s+/g,' ').slice(0,300),x:Math.round(e.clientX/innerWidth*100),y:Math.round(e.clientY/innerHeight*100)},'*');},true);addEventListener('message',function(e){if(e.data&&e.data.mr==='mode'){on=!!e.data.on;if(!on)clear();}});})();</script>"#;
+const PICKER: &str = r#"<script>(function () {
+  if (window.__mrPick) return;
+  window.__mrPick = 1;
+  var on = false, how = 'element', hi = null, pin = null;
+  var st = document.createElement('style');
+  st.textContent = '.__mr-hi{outline:2px solid #b6f23a!important;outline-offset:1px!important;cursor:crosshair!important;background-image:linear-gradient(rgba(182,242,58,.14),rgba(182,242,58,.14))!important}'
+    + '.__mr-spot,.__mr-spot *{cursor:crosshair!important}'
+    + '#__mr-pin{position:absolute;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;background:rgba(182,242,58,.45);border:2px solid #b6f23a;box-shadow:0 0 0 2px rgba(0,0,0,.5);pointer-events:none;z-index:2147483647}';
+  document.documentElement.appendChild(st);
+  function sel(el) {
+    var parts = [];
+    while (el && el.nodeType == 1 && el !== document.body && el !== document.documentElement) {
+      if (el.id) { parts.unshift('#' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id)); return parts.join(' > '); }
+      var i = 1, s = el;
+      while ((s = s.previousElementSibling)) if (s.tagName === el.tagName) i++;
+      parts.unshift(el.tagName.toLowerCase() + ':nth-of-type(' + i + ')');
+      el = el.parentNode;
+    }
+    return parts.length ? 'body > ' + parts.join(' > ') : 'body';
+  }
+  function words(el) { return (el.innerText || el.alt || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 300); }
+  function clearHi() { if (hi) { hi.classList.remove('__mr-hi'); hi = null; } }
+  function clearPin() { if (pin) { pin.remove(); pin = null; } }
+  function apply() {
+    clearHi();
+    document.documentElement.classList.toggle('__mr-spot', on && how === 'spot');
+    if (!on) clearPin();
+  }
+  addEventListener('mouseover', function (e) {
+    if (!on || how !== 'element') return;
+    clearHi();
+    hi = e.target;
+    if (hi.classList) hi.classList.add('__mr-hi');
+  }, true);
+  addEventListener('click', function (e) {
+    if (!on) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var el = e.target, de = document.documentElement;
+    var msg = { mr: 'pick', how: how, selector: sel(el), tag: (el.tagName || '').toLowerCase(), text: words(el) };
+    if (how === 'spot') {
+      var px = e.pageX, py = e.pageY, w = Math.max(de.scrollWidth, innerWidth), h = Math.max(de.scrollHeight, innerHeight);
+      msg.x = Math.round(px / w * 1000) / 10;
+      msg.y = Math.round(py / h * 1000) / 10;
+      msg.px = Math.round(px);
+      msg.py = Math.round(py);
+      clearPin();
+      pin = document.createElement('div');
+      pin.id = '__mr-pin';
+      pin.style.left = px + 'px';
+      pin.style.top = py + 'px';
+      document.body.appendChild(pin);
+    } else {
+      msg.x = Math.round(e.clientX / innerWidth * 100);
+      msg.y = Math.round(e.clientY / innerHeight * 100);
+    }
+    parent.postMessage(msg, '*');
+  }, true);
+  addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d || d.mr !== 'mode') return;
+    on = !!d.on;
+    how = d.how === 'spot' ? 'spot' : 'element';
+    apply();
+  });
+  addEventListener('message', function (e) { if (e.data && e.data.mr === 'clearpin') clearPin(); });
+})();</script>"#;
 
 /// An HTML page with the comment picker added before its closing body tag (or at the end).
 pub fn with_picker(bytes: Vec<u8>) -> Vec<u8> {

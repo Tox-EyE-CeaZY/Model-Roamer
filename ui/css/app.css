@@ -825,8 +825,14 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
   #side .sd-i.on::before { left: 18%; right: 18%; top: 0; bottom: auto; width: auto; height: 3px; }
   #side .sd-i .sd-n, #side .sd-i .sd-dot { position: absolute; top: 6px; right: calc(50% - 20px); margin: 0; }
   #side .sd-head, #side .sd-projects, #side .sd-foot { display: none; }
-  #statusbar { display: none; }
+  /* the status bar steps aside, but its plan-usage meters stay as a strip above the bottom bar: tap it for details */
+  #statusbar { bottom: calc(54px + env(safe-area-inset-bottom, 0px)); height: 30px; }
+  #statusbar > :not(.sb-right), #statusbar .sb-right > :not(.sb-meters) { display: none; }
+  #statusbar .sb-right, #statusbar .sb-meters { flex: 1; min-width: 0; border-right: 0; }
+  #statusbar .sb-meter { flex: 1; min-width: 0; justify-content: center; padding: 0 6px; }
+  #statusbar .sb-meters:empty { display: none; }
   html.has-sb:not(.fullscreen) #shell { height: calc(100dvh - var(--tbh)); }
+  html.has-sb:not(.fullscreen) #view { padding-bottom: 30px; box-sizing: border-box; }
   .chat-row { flex-wrap: wrap; row-gap: 6px; }
   .cr-main { flex-basis: 100%; order: -1; }
   .p-title { flex-wrap: wrap; row-gap: 6px; }

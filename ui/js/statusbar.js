@@ -135,7 +135,7 @@ function showPop(anchor, q) {
     h('div', { class: 'sb-p-foot' },
       `${plural(q.turns_5h || 0, 'turn')} in the last 5 hours, ${q.turns_7d || 0} this week`,
       q.at ? ` · checked ${dur(Date.now() - q.at)} ago` : '',
-      !unknown ? '' : q.id === 'antigravity' ? '. Antigravity doesn’t share its plan usage, so only its turns are counted.' : '. Not read yet: it is checked at start-up, every ten minutes and after each turn (sign in under Agents if it stays empty).'));
+      !unknown ? '' : '. Not read yet: it is checked at start-up, every ten minutes and after each turn (sign in under Agents if it stays empty).'));
   document.body.append(pop);
   const r = anchor.getBoundingClientRect();
   const w = pop.offsetWidth;

@@ -30,6 +30,31 @@ export default async function usage(el, r) {
       seg([[7, '7 days'], [14, '14 days'], [30, '30 days'], [90, '90 days']], days, (v) => ((days = +v), load()))),
     body);
   let data;
+  // each plan's 5-hour and weekly use: the same figures as the status bar, which a phone doesn't have
+  const plans = h('section', { class: 'panel cut plans' });
+  body.before(plans);
+  async function loadPlans() {
+    try {
+      const a = await get('activity', { quiet: true, timeout: 15000 });
+      const pct = (w) => (w && typeof w.used === 'number' ? Math.round(w.used * 100) : null);
+      const reset = (w) => (w?.resets_at ? 'resets ' + new Date(w.resets_at).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }) : '');
+      const bar = (label, w, lim) => {
+        const v = lim ? 100 : pct(w);
+        return h('div', { class: 'plan-w' + (v >= 90 ? ' hot' : '') },
+          h('span', { class: 'plan-l' }, label),
+          h('span', { class: 'sb-m-bar wide' }, h('i', { style: { width: (v ?? 0) + '%' } })),
+          h('b', {}, v == null ? 'unknown' : lim ? 'OUT' : v + '%'),
+          h('small', { class: 'faint' }, reset(w)));
+      };
+      plans.replaceChildren(kicker('Plan limits', h('small', { class: 'faint' }, 'how much of each plan is used right now')),
+        ...(a.quotas || []).map((q) => h('div', { class: 'plan-row', style: { '--ah': q.hue ?? 200, '--m': `oklch(.72 .16 ${q.hue ?? 200})` } },
+          h('b', { class: 'plan-n' }, q.name),
+          bar('5-hour', q.five_hour, q.limit?.active), bar('Weekly', q.weekly, false),
+          h('small', { class: 'faint plan-f' }, `${q.turns_5h || 0} turns in 5 hours, ${q.turns_7d || 0} this week` + (q.at ? ` · checked ${dur(Date.now() - q.at)} ago` : '')))));
+    } catch { /* the figures just stay as they were */ }
+  }
+  loadPlans();
+  const planTimer = setInterval(loadPlans, 30000);
   async function load() {
     body.replaceChildren(loading());
     try {
@@ -128,7 +153,8 @@ export default async function usage(el, r) {
         h('td', {}, num(t.input_tokens) + ' / ' + num(t.output_tokens)), h('td', {}, t.ended_at ? dur(t.ended_at - t.started_at) : '…'), h('td', { class: 'faint' }, ago(t.started_at)))))));
   }
   await load();
-  return listen((ev) => ev.kind === 'turn' && ev.data?.state === 'end' && load());
+  const off = listen((ev) => (ev.kind === 'turn' && ev.data?.state === 'end' && load()) || (ev.kind === 'quota' && loadPlans()));
+  return () => (off(), clearInterval(planTimer));
 }
 
 function niceTicks(max) {

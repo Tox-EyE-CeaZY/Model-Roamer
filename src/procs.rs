@@ -273,6 +273,28 @@ pub fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").into_owned()
 }
 
+/// Windows' ConPTY asks the terminal for its cursor position (ESC[6n) before it lets the program print anything, and
+/// waits for the answer. With nobody answering (or the page's terminal not ready yet) the child sits there silent,
+/// so answer it here and keep the question out of what is shown.
+const CURSOR_REPLY: &[u8] = b"\x1b[1;1R";
+
+fn take_cursor_query(data: &[u8]) -> (Vec<u8>, bool) {
+    const Q: &[u8] = b"\x1b[6n";
+    let mut out = Vec::with_capacity(data.len());
+    let mut asked = false;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i..].starts_with(Q) {
+            asked = true;
+            i += Q.len();
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    (out, asked)
+}
+
 fn pty_command(r: &Resolved, l: &Launch) -> portable_pty::CommandBuilder {
     let mut cb = portable_pty::CommandBuilder::new(&r.program);
     for a in r.prefix.iter().chain(l.args.iter()) {
@@ -301,11 +323,14 @@ fn stream_pty(r: &Resolved, l: &Launch) -> Result<Stream> {
     let pid = child.process_id();
     let killer = Arc::new(Mutex::new(child.clone_killer()));
     let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("{e}"))?;
-    let mut writer = pair.master.take_writer().map_err(|e| anyhow!("{e}"))?;
+    let writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| anyhow!("{e}"))?));
     if let Some(s) = l.stdin.clone() {
+        let w = writer.clone();
         std::thread::spawn(move || {
-            let _ = writer.write_all(s.as_bytes());
-            let _ = writer.write_all(b"\r\x04");
+            if let Ok(mut w) = w.lock() {
+                let _ = w.write_all(s.as_bytes());
+                let _ = w.write_all(b"\r\x04");
+            }
         });
     }
     let (tx, rx) = mpsc::channel(1024);
@@ -317,7 +342,14 @@ fn stream_pty(r: &Resolved, l: &Launch) -> Result<Stream> {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let (data, asked) = take_cursor_query(&buf[..n]);
+                    if asked {
+                        if let Ok(mut w) = writer.lock() {
+                            let _ = w.write_all(CURSOR_REPLY);
+                            let _ = w.flush();
+                        }
+                    }
+                    pending.push_str(&String::from_utf8_lossy(&data));
                     while let Some(i) = pending.find('\n') {
                         let line = strip_ansi(pending[..i].trim_end_matches('\r'));
                         pending.drain(..=i);
@@ -385,12 +417,21 @@ pub fn terminal(
     let mut reader = pair.master.try_clone_reader().map_err(|e| anyhow!("{e}"))?;
     let writer = pair.master.take_writer().map_err(|e| anyhow!("{e}"))?;
     let term = Arc::new(Term { writer: Mutex::new(writer), killer: Mutex::new(child.clone_killer()), master: Mutex::new(pair.master) });
+    let t2 = term.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => on_data(buf[..n].to_vec()),
+                Ok(n) => {
+                    let (data, asked) = take_cursor_query(&buf[..n]);
+                    if asked {
+                        t2.write(CURSOR_REPLY);
+                    }
+                    if !data.is_empty() {
+                        on_data(data);
+                    }
+                }
             }
         }
     });
@@ -432,5 +473,31 @@ mod tests {
             }
         }
         assert_eq!(got, vec!["a", "b", "done"]);
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    #[test]
+    fn answers_and_hides_cursor_query() {
+        assert_eq!(take_cursor_query(b"a\x1b[6nb"), (b"ab".to_vec(), true));
+        assert_eq!(take_cursor_query(b"plain"), (b"plain".to_vec(), false));
+    }
+    /// npm.cmd (a shim run through cmd.exe) must print through the pseudo-terminal with nobody driving it.
+    #[cfg(windows)]
+    #[test]
+    fn npm_cmd_prints_through_conpty() {
+        let Some(r) = resolve(&["npm"], None) else { return };
+        let mut s = stream(&r, &Launch { args: vec!["--version".into()], pty: true, ..Default::default() }).unwrap();
+        let mut got = String::new();
+        while let Some(l) = s.rx.blocking_recv() {
+            match l {
+                Line::Out(x) => got.push_str(&x),
+                Line::Exit(_) => break,
+                _ => {}
+            }
+        }
+        assert!(got.chars().any(|c| c.is_ascii_digit()), "no output: {got:?}");
     }
 }

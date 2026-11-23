@@ -17,9 +17,11 @@ fn harness(agent: &str) -> String {
         "claude" | "codex" | "gemini" | "antigravity" => agent,
         _ => "custom",
     };
+    // a Windows checkout may have CRLF line endings; the section markers below assume LF
+    let text = HARNESS.replace("\r\n", "\n");
     let marker = format!("## @{key}\n");
-    let Some(start) = HARNESS.find(&marker) else { return String::new() };
-    let rest = &HARNESS[start + marker.len()..];
+    let Some(start) = text.find(&marker) else { return String::new() };
+    let rest = &text[start + marker.len()..];
     let end = rest.find("\n## @").map(|i| i + 1).unwrap_or(rest.len());
     rest[..end].trim().to_string()
 }

@@ -305,7 +305,7 @@ export async function viewer(el, r, ctx) {
   el.classList.add('artifact-view');
   el.append(head, frame);
   // ---- comments: select text (or Alt+click a part of a page, or click an image) and send a note about it
-  let pop = null, cmode = 'text', sendTo = localStorage.getItem('mr-art-comment-to') || 'lead';
+  let pop = null, cmode = a.kind === 'image' ? 'spot' : 'text', sendTo = localStorage.getItem('mr-art-comment-to') || 'lead';
   const closePop = () => (pop?.remove(), (pop = null));
   function comment({ quote, where, x, y }) {
     closePop();
@@ -360,7 +360,7 @@ export async function viewer(el, r, ctx) {
     tip.style.top = Math.max(8, y - box.top + 6) + 'px';
   }
   // what a click points at: some selected text, a whole element, or one spot (pages), as the person chooses
-  const modes = () => (a.kind === 'html' ? [['text', 'Select text'], ['element', 'Pick element'], ['spot', 'Pick spot']] : a.kind === 'markdown' || a.kind === 'text' ? [['text', 'Select text'], ['element', 'Pick paragraph']] : []);
+  const modes = () => (a.kind === 'html' ? [['text', 'Select text'], ['element', 'Pick element'], ['spot', 'Pick spot'], ['lasso', 'Lasso']] : a.kind === 'image' ? [['spot', 'Pick spot'], ['lasso', 'Lasso']] : a.kind === 'markdown' || a.kind === 'text' ? [['text', 'Select text'], ['element', 'Pick paragraph']] : []);
   const tellPage = () => frame.querySelector('iframe.av-if')?.contentWindow?.postMessage({ mr: 'mode', mode: cmode }, '*');
   const setMode = (m) => ((cmode = m), closePop(), closeTip(), tellPage(), frame.classList.toggle('av-pick', m !== 'text'));
   // text shown in the page itself (markdown, plain text)
@@ -382,10 +382,31 @@ export async function viewer(el, r, ctx) {
   // a picture: click to point at a spot
   frame.addEventListener('click', (e) => {
     const img = e.target.closest?.('.av-img img');
-    if (!img) return;
+    if (!img || cmode === 'lasso') return;
     const r = img.getBoundingClientRect();
     const px = Math.round(((e.clientX - r.left) / r.width) * 100), py = Math.round(((e.clientY - r.top) / r.height) * 100);
     comment({ where: `at ${px}% across, ${py}% down the image`, x: e.clientX, y: e.clientY });
+  });
+  // a picture, lasso: drag a box over the part
+  frame.addEventListener('mousedown', (e) => {
+    const img = e.target.closest?.('.av-img img');
+    if (!img || cmode !== 'lasso') return;
+    e.preventDefault();
+    const r = img.getBoundingClientRect();
+    const box = h('div', { style: 'position:fixed;z-index:40;border:2px dashed var(--accent);background:color-mix(in oklch, var(--accent) 14%, transparent);pointer-events:none' });
+    document.body.append(box);
+    const x0 = e.clientX, y0 = e.clientY;
+    const mv = (m) => Object.assign(box.style, { left: Math.min(x0, m.clientX) + 'px', top: Math.min(y0, m.clientY) + 'px', width: Math.abs(m.clientX - x0) + 'px', height: Math.abs(m.clientY - y0) + 'px' });
+    const up = (m) => {
+      removeEventListener('mousemove', mv);
+      removeEventListener('mouseup', up);
+      box.remove();
+      if (Math.abs(m.clientX - x0) < 5 && Math.abs(m.clientY - y0) < 5) return;
+      const pc = (v, o, n) => Math.max(0, Math.min(100, Math.round(((v - o) / n) * 100)));
+      comment({ where: `the box from ${pc(Math.min(x0, m.clientX), r.left, r.width)}% across, ${pc(Math.min(y0, m.clientY), r.top, r.height)}% down to ${pc(Math.max(x0, m.clientX), r.left, r.width)}% across, ${pc(Math.max(y0, m.clientY), r.top, r.height)}% down the image`, x: m.clientX, y: m.clientY });
+    };
+    addEventListener('mousemove', mv);
+    addEventListener('mouseup', up);
   });
   // a page (HTML): the page tells us what was selected, or Alt+clicked
   const onPage = (ev) => {
@@ -397,6 +418,10 @@ export async function viewer(el, r, ctx) {
       if (!d.text) return closeTip();
       showTip(fr.left + d.x, fr.top + d.y, { quote: d.text, where: d.el ? 'in ' + d.el : '' });
     } else if (d.mr === 'ready') tellPage();
+    else if (d.mr === 'lasso') {
+      const list = (d.els || []).map((x) => `- ${x.el}${x.text ? ': "' + x.text + '"' : ''}`);
+      comment({ quote: list.join('\n'), where: `${list.length} element${list.length === 1 ? '' : 's'} inside a box from ${d.px1}% across, ${d.py1}% down to ${d.px2}% across, ${d.py2}% down the page`, x: fr.left + d.x, y: fr.top + d.y });
+    }
     else if (d.mr === 'pin') {
       const spot = d.mode === 'spot' ? `the spot ${d.px}% across and ${d.py}% down the page, on ${d.el || 'the page'}` : 'the element ' + d.el;
       comment({ quote: d.mode === 'spot' ? '' : d.text, where: spot, x: fr.left + d.x, y: fr.top + d.y });

@@ -42,8 +42,30 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   // shown: how much of the streamed text is on screen; it catches up word by word, so every agent's reply reads as it
   // is written, whether the agent sends tokens (Claude, Gemini) or whole paragraphs (Codex). hold: a finished reply
   // that is still being typed out, moved into the log when the typing reaches its end.
-  const live = { turn: null, segments: [], cur: '', acts: [], started: 0, shown: 0, hold: null };
-  const liveTarget = () => (live.hold ? live.hold.body : [...live.segments, live.cur].filter(Boolean).join('\n\n'));
+  // parts: the turn so far in the order it happened: text the agent wrote and its steps (thinking, tools, results).
+  // Only the trailing text is typed out; text before a step is already on screen.
+  const live = { turn: null, parts: [], started: 0, shown: 0, hold: null };
+  const trailing = () => (live.parts.at(-1)?.k === 'text' ? live.parts.at(-1) : null);
+  const liveTarget = () => (live.hold ? live.hold.body : trailing()?.text || '');
+  const resetLive = (turn, started = Date.now()) => Object.assign(live, { turn, parts: [], started, shown: 0 });
+  /** Text streamed in: added to the open text part, or a new part after a step. A block replaces what streamed. */
+  function liveText(text, block) {
+    const last = trailing();
+    if (last?.open) {
+      if (block) Object.assign(last, { text, open: false });
+      else last.text += text;
+      return;
+    }
+    if (block && last && last.text.trim() === text.trim()) return;
+    live.parts.push({ k: 'text', text, open: !block });
+    live.shown = 0;
+  }
+  function liveStep(a) {
+    if (a.kind === 'text') return liveText(a.body || '', true);
+    const last = trailing();
+    if (last) last.open = false;
+    live.parts.push({ k: 'act', a });
+  }
 
   // ---------------------------------------------------------- header
   function drawHead() {
@@ -283,7 +305,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         day = d;
         frag.push(h('div', { class: 'day' }, h('span', {}, d)));
       }
-      frag.push(entry(m, lastOfTurn[m.meta?.turn_id] === m.id ? activity[m.meta.turn_id] : null));
+      frag.push(entry(m, lastOfTurn[m.meta?.turn_id] === m.id ? turnParts(activity[m.meta.turn_id], m.body) : null));
     }
     log.replaceChildren(...frag);
     if (atBottom) toBottom();
@@ -338,9 +360,9 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         m.pending ? h('span', { class: 'tag' }, 'not read yet') : null,
         h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
         h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
+      acts?.length ? timeline(acts, false) : null,
       wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
-      files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null,
-      acts?.length ? activityStrip(acts, false) : null);
+      files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null);
     return e;
   }
 
@@ -377,15 +399,16 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const full = liveTarget();
     const text = full.slice(0, live.shown);
     if (live.shown < full.length) typeOn();
-    const last = live.acts.slice(-1)[0];
+    const last = live.parts.filter((p) => p.k === 'act').at(-1)?.a;
+    const before = trailing() || live.hold ? live.parts.slice(0, trailing() ? -1 : undefined) : live.parts;
     liveEl.replaceChildren(
       h('div', { class: 'live-h', style: { '--ah': agentHue(t.agent) } },
         h('i', { class: 'pulse' }), stamp(t.agent, { model: t.model, small: true }),
         h('span', { class: 'live-what' }, last ? actLabel(last) : text ? 'Writing…' : 'Thinking…'),
         h('span', { class: 'live-time mono', dataset: { since: live.started || t.running?.started || Date.now() } }, ''),
         h('button', { class: 'btn xs danger', onclick: () => act('stop'), title: 'Stop (Ctrl+.)' }, 'Stop')),
-      text ? wireMd(h('div', { class: 'md live-text' + (live.shown < full.length ? ' typing' : '') }, ...mdNodes(text)), openExternal) : null,
-      live.acts.length ? activityStrip(live.acts, true) : null);
+      before.length ? timeline(before, true) : null,
+      text ? wireMd(h('div', { class: 'md live-text' + (live.shown < full.length ? ' typing' : '') }, ...mdNodes(text)), openExternal) : null);
     tick();
     if (nearBottom(220)) toBottom();
   }
@@ -517,8 +540,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         if (!messages.some((x) => x.id === d.id)) messages.push(d);
         else messages = messages.map((x) => (x.id === d.id ? d : x));
         if (d.role === 'agent') {
-          live.segments = [];
-          live.cur = '';
+          live.parts = [];
           live.shown = 0;
         }
         drawLog();
@@ -526,23 +548,20 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         break;
       }
       case 'delta':
-        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: live.started || Date.now(), shown: 0 });
-        if (d.block != null) {
-          live.segments.push(d.block);
-          live.cur = '';
-        } else live.cur += d.text || '';
+        if (live.turn !== d.turn_id) resetLive(d.turn_id, live.started || Date.now());
+        liveText(d.block ?? d.text ?? '', d.block != null);
         drawLiveSoon();
         break;
       case 'activity':
         (activity[d.turn_id] ||= []).push(d);
-        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now(), shown: 0 });
-        live.acts.push(d);
+        if (live.turn !== d.turn_id) resetLive(d.turn_id);
+        liveStep(d);
         drawLiveSoon();
         break;
       case 'turn':
         if (d.state === 'start') {
           if (live.hold) finishHoldNow();
-          Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now(), shown: 0 });
+          resetLive(d.turn_id);
           t.running = { turn: d.turn_id, started: Date.now() };
         } else {
           live.turn = null;
@@ -575,6 +594,12 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         t.status_note = d.text;
         drawHead();
         break;
+      case 'read': {
+        const ids = new Set(d.ids || []);
+        messages = messages.map((x) => (ids.has(x.id) ? { ...x, pending: d.pending ? 1 : 0 } : x));
+        drawLog();
+        break;
+      }
     }
   });
   let liveTimer = 0;
@@ -606,8 +631,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     if (!live.hold || live.shown < live.hold.body.length) return;
     const m = live.hold;
     live.hold = null;
-    live.segments = [];
-    live.cur = '';
+    live.parts = [];
     live.shown = 0;
     if (!messages.some((x) => x.id === m.id)) messages.push(m);
     drawLog();
@@ -683,6 +707,53 @@ function actLabel(a) {
   if (a.kind === 'thinking') return 'Thinking…';
   if (a.kind === 'error') return 'Error: ' + (a.title || a.body).slice(0, 80);
   return a.title || a.kind;
+}
+
+/** A finished turn's steps in order, as timeline parts. The text that became the reply (everything written after
+ * the last step, or the same text as the reply) is left out: the reply itself is shown below them. */
+export function turnParts(acts, reply) {
+  if (!acts?.length) return null;
+  const lastStep = acts.map((a) => a.kind !== 'text').lastIndexOf(true);
+  const r = (reply || '').trim();
+  const parts = acts
+    .filter((a, i) => a.kind !== 'text' || (i < lastStep && a.body.trim() && a.body.trim() !== r && !r.startsWith(a.body.trim())))
+    .map((a) => (a.kind === 'text' ? { k: 'text', text: a.body } : { k: 'act', a }));
+  return parts.length ? parts : null;
+}
+
+/** A turn as it happened: what the agent wrote between steps, its thinking (folded), and runs of tool calls with
+ * their results (one strip each). While live, the newest thinking and steps stay open. */
+export function timeline(parts, live) {
+  const out = [];
+  let run = [];
+  const flush = (last) => {
+    if (run.length) out.push(activityStrip(run, live && last));
+    run = [];
+  };
+  parts.forEach((p, i) => {
+    const last = i === parts.length - 1;
+    if (p.k === 'text') {
+      flush(false);
+      out.push(wireMd(h('div', { class: 'md tl-text' }, ...mdNodes(p.text)), openExternal));
+    } else if (p.a.kind === 'thinking') {
+      flush(false);
+      out.push(thinkingBlock(p.a.body || '', live && last));
+    } else {
+      run.push(p.a);
+      if (last) flush(true);
+    }
+  });
+  flush(true);
+  return h('div', { class: 'tl' }, ...out);
+}
+
+function thinkingBlock(text, open) {
+  const body = wireMd(h('div', { class: 'md tl-think-body', hidden: !open }, ...mdNodes(text)), openExternal);
+  const head = h('button', { class: 'tl-think-h' + (open ? ' open' : ''), type: 'button', onclick: () => {
+    body.hidden = !body.hidden;
+    head.classList.toggle('open', !body.hidden);
+  } }, ic('sparkle', 12), h('span', {}, 'Thinking'), h('span', { class: 'faint' }, text.replace(/\s+/g, ' ').slice(0, 90)), h('i', { class: 'act-more', html: icon('chevDown', 12) }));
+  return h('div', { class: 'tl-think' }, head, body);
 }
 
 /** The agent's steps in a turn: commands, edits, tool calls and their results. Collapsed to one line until opened. */

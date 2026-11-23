@@ -369,6 +369,19 @@ impl Core {
         self.thread(&id)
     }
 
+    /// Replies that older builds stored as Antigravity's raw stream-json become the text they carried.
+    pub fn repair_raw_messages(&self) {
+        let rows = self
+            .db
+            .all("SELECT m.id, m.body FROM messages m JOIN threads t ON t.id = m.thread_id WHERE m.role = 'agent' AND m.body LIKE '{\"event\"%'", &[])
+            .unwrap_or_default();
+        for r in rows {
+            if let Some(fixed) = r["body"].as_str().and_then(crate::agents::antigravity::repair_body) {
+                let _ = self.db.exec("UPDATE messages SET body = ?1 WHERE id = ?2", &[&fixed, &r["id"].as_str().unwrap_or("")]);
+            }
+        }
+    }
+
     pub fn set_thread(&self, id: &str, fields: &Value) -> Result<Value> {
         let allowed = [
             "title", "agent", "model", "status", "status_note", "task_kind", "instructions", "criteria", "workspace", "branch", "session_id", "session_agent",

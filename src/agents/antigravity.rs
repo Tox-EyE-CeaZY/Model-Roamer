@@ -188,6 +188,27 @@ impl AgentAdapter for Antigravity {
 
 /// One step of agy's work: the reply streaming in, its thinking, or a tool it used. Your own message comes back as a
 /// `user_input` step and is skipped.
+/// The reply text inside a message that was stored as raw stream-json (by builds before the stream was parsed), or
+/// None when the body isn't that.
+pub fn repair_body(body: &str) -> Option<String> {
+    if !body.trim_start().starts_with("{\"event\"") {
+        return None;
+    }
+    let mut st = json!({});
+    let (mut text, mut fin) = (String::new(), None);
+    for v in serde_json::Deserializer::from_str(body).into_iter::<Value>().map_while(Result::ok) {
+        for ev in Antigravity.parse(&v.to_string(), &mut st) {
+            match ev {
+                AgentEvent::Delta(d) => text.push_str(&d),
+                AgentEvent::Final(f) => fin = Some(f),
+                _ => {}
+            }
+        }
+    }
+    let out = fin.unwrap_or(text);
+    (!out.trim().is_empty()).then(|| out.trim().to_string())
+}
+
 fn step_update(u: &Value, st: &mut Value) -> Vec<AgentEvent> {
     let mut out = vec![];
     if let Some(id) = u["conversation_id"].as_str().filter(|id| st["session"].as_str() != Some(*id)) {
@@ -199,7 +220,8 @@ fn step_update(u: &Value, st: &mut Value) -> Vec<AgentEvent> {
     let done = u["state"].as_str().is_some_and(|x| x.eq_ignore_ascii_case("done"));
     let delta = u["text_delta"].as_str().unwrap_or("");
     match ty {
-        "user_input" | "" => {}
+        // the person's own message and the CLI's internal bookkeeping steps aren't the agent's work
+        "user_input" | "system_message" | "ephemeral_message" | "checkpoint" | "" => {}
         "agent_response" | "response" | "model_response" => {
             if !delta.is_empty() {
                 out.push(AgentEvent::Delta(delta.into()));
@@ -270,6 +292,12 @@ mod tests {
         assert!(ev.iter().any(|e| matches!(e, AgentEvent::Final(t) if t.starts_with("Hello!"))));
     }
 
+    #[test]
+    fn repairs_raw_bodies() {
+        let raw = r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":0,"state":"DONE","step_type":"user_input","text_delta":"hi"}} {"event":"result","result":{"conversation_id":"c","status":"success","response":"pong"}}"#;
+        assert_eq!(repair_body(raw).as_deref(), Some("pong"));
+        assert_eq!(repair_body("plain text"), None);
+    }
     #[test]
     fn shows_tool_steps() {
         let a = Antigravity;

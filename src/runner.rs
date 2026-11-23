@@ -422,6 +422,18 @@ fn recap(core: &CoreRef, thread: &str, exclude: &[String]) -> String {
     s
 }
 
+/// Text the agent streamed before a step (or the turn's end) becomes a segment of its own, kept in the turn's
+/// timeline so the thread can show what it said between steps, in order.
+fn flush_text(core: &CoreRef, t: &Value, turn: &str, cur: &mut String, segments: &mut Vec<String>) {
+    if cur.trim().is_empty() {
+        cur.clear();
+        return;
+    }
+    let x = std::mem::take(cur);
+    add_activity(core, t, turn, "text", "", &x);
+    segments.push(x);
+}
+
 fn add_activity(core: &CoreRef, t: &Value, turn: &str, kind: &str, title: &str, body: &str) {
     let now = util::now_ms();
     let tid = t["id"].as_str().unwrap_or("");
@@ -496,6 +508,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     for id in &input_ids {
         core.db.exec("UPDATE messages SET pending = 0 WHERE id = ?1", &[id])?;
     }
+    core.bus.emit("read", t["project_id"].as_str(), Some(thread), json!({ "ids": input_ids, "pending": false }));
 
     core.set_status(thread, "working", "")?;
     let workspace = match prepare_workspace(core, &t, project.as_ref()).await {
@@ -635,13 +648,15 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                             if !x.trim().is_empty() {
                                 segments.push(x.clone());
                                 core.bus.emit("delta", pid.as_deref(), Some(thread), json!({ "turn_id": turn_id, "block": x }));
+                                add_activity(core, &t, &turn_id, "text", "", &x);
                             }
                         }
-                        AgentEvent::Thinking(x) => add_activity(core, &t, &turn_id, "thinking", "Thinking", &x),
+                        AgentEvent::Thinking(x) => {
+                            flush_text(core, &t, &turn_id, &mut cur, &mut segments);
+                            add_activity(core, &t, &turn_id, "thinking", "Thinking", &x);
+                        }
                         AgentEvent::ToolUse { id: _, name, input } => {
-                            if !cur.trim().is_empty() {
-                                segments.push(std::mem::take(&mut cur));
-                            }
+                            flush_text(core, &t, &turn_id, &mut cur, &mut segments);
                             last_tool_seg = segments.len();
                             add_activity(core, &t, &turn_id, "tool", &name, &input);
                         }
@@ -655,6 +670,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                         AgentEvent::Final(x) => final_text = Some(x),
                         AgentEvent::Limit { until, message } => limit = Some((until, message)),
                         AgentEvent::Error(e) => {
+                            flush_text(core, &t, &turn_id, &mut cur, &mut segments);
                             add_activity(core, &t, &turn_id, "error", "Error", &e);
                             errs.push(e);
                         }
@@ -666,9 +682,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     }
     drop(permit);
     core.turn_tokens.lock().unwrap_or_else(|p| p.into_inner()).remove(&token);
-    if !cur.trim().is_empty() {
-        segments.push(std::mem::take(&mut cur));
-    }
+    flush_text(core, &t, &turn_id, &mut cur, &mut segments);
     // the reply: what the CLI called final, else the text after its last tool call, else all of it
     let mut reply = final_text.clone().filter(|f| !f.trim().is_empty()).unwrap_or_else(|| {
         let after: Vec<String> = segments[last_tool_seg.min(segments.len())..].to_vec();
@@ -875,6 +889,10 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
 fn requeue(core: &CoreRef, ids: &[String]) {
     for id in ids {
         let _ = core.db.exec("UPDATE messages SET pending = 1 WHERE id = ?1", &[id]);
+    }
+    let thread = ids.first().and_then(|id| core.db.one("SELECT thread_id FROM messages WHERE id = ?1", &[id]).ok().flatten());
+    if let Some(tid) = thread.as_ref().and_then(|m| m["thread_id"].as_str()) {
+        core.bus.emit("read", None, Some(tid), json!({ "ids": ids, "pending": true }));
     }
 }
 

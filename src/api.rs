@@ -72,6 +72,7 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/agents/{id}/test", post(test_agent))
         .route("/api/agents/{id}/limit", delete(clear_limit))
         .route("/api/setup", get(setup_status))
+        .route("/api/activity", get(activity))
         .route("/api/terms", get(list_terms).post(start_term))
         .route("/api/terms/{id}", get(term_buffer).delete(stop_term))
         .route("/api/terms/{id}/input", post(term_input))
@@ -265,6 +266,50 @@ async fn state(State(core): State<CoreRef>, Extension(who): Extension<Who>) -> R
         "task_kinds": agents::TASK_KINDS.iter().map(|(k, d)| json!({ "id": k, "label": d })).collect::<Vec<_>>(),
         "data_dir": core.data.display().to_string(),
     })))
+}
+
+/// Everything going on right now, for the status bar: turns running or queued, installs and sign-ins in their
+/// terminals, agent checks, questions waiting on the person, recent failures and agents that need attention.
+async fn activity(State(core): State<CoreRef>) -> R {
+    let running: std::collections::HashMap<String, i64> = core.running.lock().map(|r| r.iter().map(|(k, v)| (k.clone(), v.started)).collect()).unwrap_or_default();
+    let recent = util::now_ms() - 30 * 60 * 1000;
+    let mut threads = core.db.all(
+        "SELECT t.id, t.kind, t.title, t.agent, t.model, t.status, t.status_note, t.project_id, p.name AS project, t.updated_at
+         FROM threads t LEFT JOIN projects p ON p.id = t.project_id
+         WHERE t.deleted_at IS NULL AND t.resolved = 0 AND (t.status IN ('working','queued','blocked','limited') OR (t.status = 'failed' AND t.updated_at > ?1))
+         ORDER BY t.updated_at DESC LIMIT 40",
+        &[&recent],
+    )?;
+    for t in threads.iter_mut() {
+        if let Some(st) = t["id"].as_str().and_then(|id| running.get(id)) {
+            t["started"] = json!(st);
+            t["status"] = json!("working");
+        }
+    }
+    let decisions = core.db.all(
+        "SELECT d.id, d.thread_id, d.project_id, d.question, t.title, t.kind, d.created_at FROM decisions d JOIN threads t ON t.id = d.thread_id
+         WHERE d.answer IS NULL AND t.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 20",
+        &[],
+    )?;
+    let terms = core.terms.lock().map(|m| m.iter().filter(|(_, v)| v.exited.is_none()).map(|(k, v)| json!({ "id": k, "label": v.label, "agent": v.agent, "started": v.started })).collect::<Vec<_>>()).unwrap_or_default();
+    let agents: Vec<Value> = core
+        .cached_status()
+        .into_iter()
+        .filter(|a| a["config"]["enabled"] != false && a["installed"] != false)
+        .filter_map(|a| {
+            let state = if a["pending"] == true {
+                "checking"
+            } else if a["limit"]["active"] == true {
+                "limit"
+            } else if a["auth"]["signed_in"] == "no" {
+                "signin"
+            } else {
+                return None;
+            };
+            Some(json!({ "id": a["id"], "name": a["info"]["name"], "state": state, "note": a["limit"]["note"] }))
+        })
+        .collect();
+    Ok(Json(json!({ "threads": threads, "decisions": decisions, "terms": terms, "agents": agents, "update": crate::update::staged_tag() })))
 }
 
 async fn get_settings(State(core): State<CoreRef>) -> R {

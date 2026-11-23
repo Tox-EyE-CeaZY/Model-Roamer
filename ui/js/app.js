@@ -426,6 +426,7 @@ async function start() {
   }
   connect();
   side();
+  if (!isPop) import('./statusbar.js').then((m) => m.initStatusBar()).catch((e) => console.error(e));
   addEventListener('hashchange', render);
   render();
 }

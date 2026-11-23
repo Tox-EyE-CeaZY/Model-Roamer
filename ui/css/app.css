@@ -670,3 +670,50 @@ html.pairing .tb-search, html.pairing .tb-where { visibility: hidden; }
 .h-aside { grid-template-columns: minmax(0, 1fr); }
 .mini-list, .fleet, .run-list, .attn-list, .lane-cards, .chat-list, .mem-list, .conn-list, .dev-list { grid-template-columns: minmax(0, 1fr); }
 .attn-list { grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); }
+
+/* ------------------------------------------------------------ status bar (main window only) */
+#statusbar { position: relative; z-index: 19; flex: none; height: 26px; display: flex; align-items: stretch; background: var(--bg); border-top: 1px solid var(--line); font: 600 10.5px var(--f-mono); letter-spacing: .04em; color: var(--dim); user-select: none; }
+html.fullscreen #statusbar { display: none; }
+html.has-sb #toasts { bottom: 40px; }
+.sb-nav { flex: none; width: 24px; display: grid; place-items: center; color: var(--faint); transition: color .15s, background .15s; }
+.sb-ticker { flex: 1; min-width: 0; display: flex; align-items: stretch; overflow: hidden; }
+.sb-it { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 0 8px; color: var(--dim); text-align: left; white-space: nowrap; }
+.sb-it.in { animation: sb-in .32s var(--ease); }
+@keyframes sb-in { from { opacity: 0; transform: translateY(8px); } }
+.sb-it b { flex: none; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; padding: 1px 7px; transform: skewX(-14deg); background: var(--bg3); color: var(--ink); }
+.sb-it.live b { background: var(--accent); color: var(--accent-ink); }
+.sb-it.hot b { background: var(--hot); color: #000; }
+.sb-it.acc b { background: color-mix(in oklch, var(--accent) 30%, var(--bg3)); }
+.sb-it.live > .ico { color: var(--accent); animation: blink 1.4s steps(2) infinite; }
+.sb-it.hot > .ico { color: var(--hot); }
+.sb-it.quiet > .ico { color: var(--accent); }
+.sb-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--ink); font: 500 12px var(--f-display); letter-spacing: 0; }
+.sb-sub { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--faint); }
+.sb-sub::before { content: '· '; }
+.sb-time { flex: none; color: var(--faint); font-variant-numeric: tabular-nums; }
+.sb-count { flex: none; padding: 0 6px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.sb-right { flex: none; display: flex; align-items: stretch; border-left: 1px solid var(--line); }
+.sb-seg { display: flex; align-items: center; gap: 6px; padding: 0 10px; color: var(--dim); white-space: nowrap; border-right: 1px solid var(--line); text-transform: uppercase; transition: color .15s, background .15s; }
+.sb-seg:last-child { border-right: 0; }
+.sb-seg.live { color: var(--accent); }
+.sb-seg.hot { color: var(--hot); }
+.sb-seg.dim { color: var(--faint); }
+.sb-dot { width: 6px; height: 6px; background: var(--accent); transform: rotate(45deg); }
+.sb-dot.off { background: var(--hot); animation: blink 1s steps(2) infinite; }
+@media (hover: hover) { .sb-nav:hover, .sb-count:hover, button.sb-seg:hover, a.sb-seg:hover, button.sb-it:hover { background: var(--bg3); color: var(--ink); } }
+@media (max-width: 760px) { .sb-sub, .sb-seg.dim, .sb-nav { display: none; } }
+html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
+@media (prefers-reduced-motion: reduce) { .sb-it.in, .sb-it.live > .ico { animation: none; } }
+
+/* ------------------------------------------------------------ a turn's timeline: text, thinking and steps in order */
+.tl { display: grid; gap: 8px; margin: 6px 0 10px; }
+.tl .acts-wrap { margin-top: 0; }
+.tl-text { color: var(--dim); }
+.tl-think-h { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 4px 8px; font: 600 10.5px var(--f-mono); color: var(--dim); border-left: 2px solid color-mix(in oklch, var(--accent) 45%, transparent); background: var(--bg2); }
+.tl-think-h > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.tl-think-h > span.faint { font-weight: 500; }
+.tl-think-h .act-more { flex: none; transition: transform .2s; }
+.tl-think-h.open .act-more { transform: rotate(180deg); }
+.tl-think-h.open > span.faint { display: none; }
+.tl-think-body { margin: 6px 0 0 10px; padding-left: 10px; border-left: 1px dashed var(--line2); color: var(--faint); font-size: 13px; font-style: italic; }
+@media (hover: hover) { .tl-think-h:hover { color: var(--ink); } }

@@ -473,6 +473,8 @@ pre.doc { margin: 0; padding: 24px var(--gut); white-space: pre-wrap; font-size:
 
 /* terminal panel */
 .term-back { z-index: 500; }
+/* a question asked from the terminal panel ("Stop it and close?") opens above it, not hidden behind */
+.term-back ~ .dlg-back:not(.term-back) { z-index: 600; }
 .term-dlg { --c: 16px; --fill: #0b1214; --bd: var(--accent); width: min(1000px, 100%); height: min(680px, calc(100vh - 40px)); display: flex; flex-direction: column; padding: 12px; gap: 8px; animation: rise .3s var(--spring); }
 .term-h { display: flex; align-items: center; gap: 10px; color: #dfe9e4; }
 .term-h b { font: 700 14px var(--f-display); }

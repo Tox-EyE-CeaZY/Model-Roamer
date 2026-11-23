@@ -22,6 +22,7 @@ const VIEWS = {
   settings: () => import('./views/settings.js'),
   pair: () => import('./views/pair.js'),
   welcome: () => import('./views/welcome.js'),
+  browse: () => import('./views/browse.js'),
 };
 
 const NAV = [
@@ -52,6 +53,25 @@ export const go = (hash) => {
   if (location.hash === hash) render();
   else location.hash = hash;
 };
+
+// Where we are in this window's history: each page we open is stamped with its place, so "back" can tell a page we
+// came from inside the app (go back to it, exactly as it was) from the first one (go to the fallback instead).
+let navAt = 0, navStarted = false;
+function stampNav() {
+  try {
+    if (history.state?.i == null) history.replaceState({ ...(history.state || {}), i: navStarted ? navAt + 1 : 0 }, '');
+    navAt = history.state?.i ?? navAt;
+    navStarted = true;
+  } catch { /* fine */ }
+}
+stampNav();
+addEventListener('hashchange', stampNav);
+addEventListener('popstate', stampNav);
+/** Back to the page we came from; with nowhere to go back to (opened straight on this page), to the fallback. */
+export function back(fallback = '#/') {
+  if (navAt > 0) history.back();
+  else go(fallback);
+}
 
 /** Open a thread: in this window, or in one of its own when the person likes pop-outs (or asks for one). */
 export function openThread(id, { pop } = {}) {
@@ -214,10 +234,18 @@ export function newProject() {
 }
 
 // ------------------------------------------------------------ router
-let cleanup = null, seq = 0;
+let cleanup = null, seq = 0, routeHook = null, lastRoute = null;
 let tb;
 async function render() {
   const r = parseRoute();
+  // inside one project's board, opening or closing a thread beside the chat doesn't rebuild the page
+  const prev = lastRoute;
+  lastRoute = r;
+  if (routeHook && prev && prev.view === 'project' && r.view === 'project' && prev.id === r.id && prev.tab === r.tab) {
+    closeMenu();
+    return routeHook(r);
+  }
+  routeHook = null;
   const my = ++seq;
   const el = $('#view');
   closeMenu();
@@ -236,7 +264,7 @@ async function render() {
     if (my !== seq) return;
     const box = h('div', { class: 'v v-' + r.view });
     el.replaceChildren(box);
-    cleanup = (await mod.default(box, r, { setPopTitle: (t) => tb?.popTitle && (tb.popTitle.textContent = t) })) || null;
+    cleanup = (await mod.default(box, r, { setPopTitle: (t) => tb?.popTitle && (tb.popTitle.textContent = t), onRoute: (fn) => (routeHook = fn) })) || null;
     if (r.view !== 'thread' && r.view !== 'project') setTitle(r.view === 'home' ? 'Model Roamer' : `${r.view[0].toUpperCase() + r.view.slice(1)} · Model Roamer`);
   } catch (e) {
     console.error(e);
@@ -299,9 +327,21 @@ export async function palette(initial = '') {
     if (q.trim().length >= 2) {
       try {
         const r = await get('search?q=' + encodeURIComponent(q));
+        // where a thread opens: a chat on its own, anything in a project beside that project's chat
+        const open = (t, msg) => {
+          try {
+            if (msg) sessionStorage.setItem('mr-jump', msg + '|' + Date.now());
+          } catch { /* fine */ }
+          if (t.kind === 'chat' || !t.project_id) return go('#/t/' + (t.id || t.thread_id));
+          go('#/p/' + t.project_id + (t.kind === 'lead' ? '' : '?t=' + (t.id || t.thread_id)));
+        };
+        const clean = (x) => (x || '').replace(/\s+/g, ' ').trim();
+        const where = (t) => (t.kind === 'chat' ? 'chat' : projectOf(t.project_id)?.name || 'thread') + (t.kind === 'lead' ? ' · project chat' : '');
         found = [
-          ...r.threads.map((t) => ({ label: t.title, sub: t.kind === 'chat' ? 'chat' : projectOf(t.project_id)?.name || 'thread', icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => openThread(t.id) })),
-          ...r.messages.slice(0, 8).map((m) => ({ label: m.snippet.replace(/\s+/g, ' ').trim(), sub: m.title, icon: 'hash', run: () => openThread(m.thread_id) })),
+          ...r.projects.map((p) => ({ label: p.name, sub: clean(p.snippet) || 'project', icon: 'board', run: () => go('#/p/' + p.id) })),
+          ...r.threads.map((t) => ({ label: t.title, sub: clean(t.snippet) || where(t), icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => open(t) })),
+          ...r.messages.slice(0, 12).map((m) => ({ label: clean(m.snippet), sub: `${m.role === 'agent' ? 'agent' : m.author || 'you'} · ${where(m)}`, icon: 'hash', run: () => open(m, m.id) })),
+          ...r.artifacts.map((a) => ({ label: a.title, sub: clean(a.description) || a.kind + (projectOf(a.project_id) ? ' · ' + projectOf(a.project_id).name : ''), icon: 'artifact', run: () => go('#/a/' + a.id) })),
           ...r.memory.slice(0, 6).map((m) => ({ label: m.name, sub: m.description || 'memory', icon: 'memory', run: () => go('#/memory?open=' + m.id) })),
         ];
       } catch { /* offline: actions still work */ }
@@ -426,6 +466,9 @@ async function start() {
   }
   connect();
   side();
+  // a phone can install the app to its home screen (needs https or localhost; harmless elsewhere)
+  if (!isDesktop && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  if (!isPop) import('./statusbar.js').then((m) => m.initStatusBar()).catch((e) => console.error(e));
   addEventListener('hashchange', render);
   render();
 }

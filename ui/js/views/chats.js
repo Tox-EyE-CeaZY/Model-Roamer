@@ -3,7 +3,7 @@
 import { h, ago } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen } from '../api.js';
-import { S, agentName } from '../store.js';
+import { S, agentName, chatPick } from '../store.js';
 import { openThread, go } from '../app.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { ic, stamp, statusChip, empty, loading, errorBox, field, input, textarea, agentModelPicker, pickFolder } from '../common.js';
@@ -62,30 +62,17 @@ export default async function chats(el) {
   return un;
 }
 
+/** A new chat opens straight away on the session's model; the first message is typed in the chat itself. */
 export async function newChat() {
-  const pick = agentModelPicker({ agentId: S.settings.default_lead || 'claude', model: S.agents[S.settings.default_lead || 'claude']?.config?.model ?? '' });
-  const text = textarea('', { rows: 4, placeholder: 'First message (you can also send it in the chat)' });
-  const folder = input('', { placeholder: 'Optional: a folder to work in. Empty: a fresh folder of its own.' });
-  let made = null;
-  const ok = await dialog({
-    title: 'New chat',
-    body: h('div', { class: 'dlg-fields' }, field('Agent', pick.el), field('Message', text),
-      field('Folder', h('div', { class: 'row' }, folder, h('button', { class: 'btn', type: 'button', onclick: async () => {
-        const f = await pickFolder({ start: folder.value });
-        if (f) folder.value = f;
-      } }, 'Browse')))),
-    ok: 'Start chat',
-    check: async () => {
-      const { agent: a, model: m } = pick.get();
-      try {
-        made = await post('threads', { agent: a, model: m, text: text.value.trim(), folder: folder.value.trim(), title: text.value.trim().split('\n')[0].slice(0, 60) });
-      } catch (e) {
-        return e.message;
-      }
-    },
-  });
-  if (ok && made) openThread(made.id);
-  return made;
+  try {
+    const { agent: a, model: m } = chatPick();
+    const made = await post('threads', { agent: a, model: m });
+    openThread(made.id);
+    return made;
+  } catch (e) {
+    toast(e.message, { err: true });
+    return null;
+  }
 }
 
 export { agentName, go };

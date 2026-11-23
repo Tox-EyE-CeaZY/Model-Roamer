@@ -9,7 +9,7 @@ import { go } from '../app.js';
 import { openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { runStep } from '../term.js';
-import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, loading, errorBox, empty, kicker } from '../common.js';
+import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
 
 const TABS = [['agents', 'Agents', 'agents'], ['tools', 'Tools', 'terminal'], ['routing', 'Routing', 'route']];
 
@@ -39,14 +39,65 @@ export default async function agents(el, r) {
 }
 
 // ------------------------------------------------------------ agent cards
+let checkingAll = null;
 async function agentCards(el, openId) {
   const grid = h('div', { class: 'ag-grid' });
-  el.append(grid, h('div', { class: 'ag-custom' }, kicker('Your own agents'), h('p', { class: 'faint small' }, 'Any command-line agent that takes a prompt and prints an answer can join the fleet.'), h('button', { class: 'btn', onclick: () => customDialog() }, ic('plus', 13), 'Add an agent')));
+  const buddyBox = h('div', { class: 'ag-custom' });
+  const drawBuddies = () => buddyBox.replaceChildren(
+    kicker('Buddies', h('small', { class: 'faint' }, 'two agents that take turns on one thread')),
+    h('p', { class: 'faint small' }, 'Pair two agents, give each a role, and pick the pair anywhere you would pick one agent. The first does its part, hands over to the second, and so on until they say it’s done or run out of turns.'),
+    ...(S.settings.buddies || []).map((b) => h('div', { class: 'buddy-row' },
+      h('b', {}, b.name),
+      h('span', { class: 'faint small' }, `${agentName(b.a.agent)} ⇄ ${agentName(b.b.agent)} · ${b.max_turns || 4} turns`),
+      h('span', { class: 'grow' }),
+      h('button', { class: 'btn xs', onclick: () => buddyDialog(b) }, 'Edit'),
+      h('button', { class: 'btn xs danger', onclick: () => setSetting({ buddies: (S.settings.buddies || []).filter((x) => x.id !== b.id) }) }, 'Remove'))),
+    h('button', { class: 'btn', onclick: () => buddyDialog() }, ic('plus', 13), 'Add a pair'));
+  drawBuddies();
+  el.append(grid, buddyBox, h('div', { class: 'ag-custom' }, kicker('Your own agents'), h('p', { class: 'faint small' }, 'Any command-line agent that takes a prompt and prints an answer can join the fleet.'), h('button', { class: 'btn', onclick: () => customDialog() }, ic('plus', 13), 'Add an agent')));
   const draw = () => grid.replaceChildren(...agentList().map((a) => card(a)));
   draw();
-  if (agentList().some((a) => a.pending)) get('agents?refresh=1', { timeout: 90000 }).catch(() => {});
+  // the app checks every agent when it starts; ask only if none of that has come back (once per visit, never stacked)
+  if (agentList().every((a) => a.pending) && !checkingAll) {
+    checkingAll = get('agents?refresh=1', { timeout: 90000 }).catch(() => {}).finally(() => (checkingAll = null));
+  }
   if (openId) setTimeout(() => document.getElementById('ag-' + openId)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 100);
-  return watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && draw());
+  return watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && (draw(), drawBuddies()));
+}
+
+async function buddyDialog(b) {
+  const edit = !!b;
+  const name = input(b?.name || '', { placeholder: 'Designer + builder' });
+  const brief = textarea(b?.instructions || '', { placeholder: 'What the two of you are for, and how to hand work back and forth' });
+  const side = (k, label) => {
+    const cur = b?.[k] || { agent: k === 'a' ? 'claude' : 'codex', model: '', role: '' };
+    const role = textarea(cur.role, { rows: 3, placeholder: 'What this one does' });
+    const pick = agentModelPicker({ agentId: cur.agent, model: cur.model, buddies: false });
+    return { label, role, pick };
+  };
+  const A = side('a', 'First'), B = side('b', 'Second');
+  const turns = input(String(b?.max_turns || 4), { type: 'number', min: 2, max: 20 });
+  let start = b?.start === 'b' ? 'b' : 'a';
+  const ok = await dialog({
+    title: edit ? 'Edit pair' : 'Add a pair',
+    wide: true,
+    body: h('div', { class: 'dlg-fields' },
+      field('Name', name),
+      field('What it’s for', brief),
+      h('div', { class: 'row2' },
+        ...[A, B].map((x) => h('div', {}, h('b', { class: 'small' }, x.label + ' buddy'), x.pick.el, field('Its role', x.role)))),
+      h('div', { class: 'row2' }, field('Turns in all', turns, 'Each hand-over is one turn; writing to the thread starts the count again.'), field('Starts with', seg([['a', 'First'], ['b', 'Second']], start, (v) => (start = v))))),
+    ok: edit ? 'Save' : 'Add pair',
+    check: () => {
+      if (!name.value.trim()) return 'Give the pair a name.';
+      if (!A.role.value.trim() || !B.role.value.trim()) return 'Give each buddy a role.';
+    },
+  });
+  if (!ok) return;
+  const id = b?.id || name.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') + '-' + Math.random().toString(36).slice(2, 5);
+  const entry = { id, name: name.value.trim(), instructions: brief.value.trim(), max_turns: Math.max(2, Math.min(20, +turns.value || 4)), start, a: { ...A.pick.get(), role: A.role.value.trim() }, b: { ...B.pick.get(), role: B.role.value.trim() } };
+  const rest = (S.settings.buddies || []).filter((x) => x.id !== id);
+  setSetting({ buddies: edit ? (S.settings.buddies || []).map((x) => (x.id === id ? entry : x)) : [...rest, entry] });
 }
 
 function authOf(a) {
@@ -84,8 +135,9 @@ function card(a) {
       info.mcp === false ? null : { label: 'Add Model Roamer tools to its own config', icon: 'cpu', title: 'Not needed for Model Roamer itself; lets you use the tools from the CLI by hand', run: () => runStep({ what: 'connect', agent: a.id, title: 'Connect Model Roamer tools' }) },
       { sep: true },
       { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
+      a.installed ? { label: 'Refresh models', icon: 'refresh', title: 'Ask the CLI which models it offers now', run: () => post(`agents/${a.id}/models`, {}, { timeout: 90000 }).then((r) => toast(`${(r.info?.models || []).filter((m) => m.id).length} models from ${info.name}`)).catch((e) => toast(e.message, { err: true })) } : null,
       info.site ? { label: 'Website', icon: 'external', run: () => openExternal(info.site) } : null,
-      a.id.match(/^(claude|codex|gemini|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
+      a.id.match(/^(claude|codex|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
     ], r.right, r.bottom + 4, { anchor: e.currentTarget });
   }, html: icon('more', 15) });
 
@@ -99,7 +151,8 @@ function card(a) {
     h('div', { class: 'ag-tags' }, (info.strengths || []).map((s) => h('span', { class: 'tag' }, s)), info.can_lead ? h('span', { class: 'tag acc' }, 'can lead') : null),
     h('dl', { class: 'facts ag-facts' },
       h('dt', {}, 'Program'), h('dd', { class: 'mono' }, a.installed ? [a.version || 'installed', a.path ? h('small', { class: 'faint', title: a.path }, ' · ' + a.path) : null] : a.pending ? 'checking…' : 'not found'),
-      h('dt', {}, 'Account'), h('dd', { class: 'ag-state' }, h('span', { class: 'status ' + authTone }, authIco === 'spin' ? h('span', { class: 'spin' }) : null, authText)),
+      h('dt', {}, 'Account'), h('dd', { class: 'ag-state' }, h('span', { class: 'status ' + authTone }, authIco === 'spin' ? h('span', { class: 'spin' }) : null, authText),
+        a.checked_at && !a.pending ? h('small', { class: 'faint', title: 'Remembered between launches. More › Check again looks now.' }, ' · checked ', timeAgo(a.checked_at)) : null),
       lim ? [h('dt', {}, 'Limit'), h('dd', {}, h('span', { class: 'status hot' }, lim.until ? `At its limit, back ${until(lim.until)}` : 'At its usage limit'), h('button', { class: 'linkbtn small', onclick: () => del(`agents/${a.id}/limit`).then(() => toast('Cleared: queued work goes to it again')) }, 'It’s back, clear it'))] : null,
       a.pty ? [h('dt', {}, 'Needs'), h('dd', { class: 'faint small' }, 'a terminal (ConPTY on Windows), handled for you')] : null),
     testOut,
@@ -134,7 +187,18 @@ async function test(a, out) {
 function drawSettings(el, a) {
   const cfg = a.config || {};
   const save = (p) => patch('agents/' + a.id, p).then(() => toast('Saved', { ms: 1200 })).catch((e) => toast(e.message, { err: true }));
-  const efforts = a.id === 'claude' ? [['', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'Extra high'], ['max', 'Max']] : [['', 'CLI default'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']];
+  // effort levels come from the CLI's model list when it gives them (they differ per model), else a common set
+  const EFFORT = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
+  const effortsFor = (model) => {
+    const ms = a.info?.models || [];
+    const m = ms.find((x) => x.id === model);
+    const lv = m?.efforts?.length ? m.efforts : [...new Set(ms.flatMap((x) => x.efforts || []))];
+    const list = lv.length ? lv : a.id === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high'];
+    return [['', 'CLI default'], ...list.map((e) => [e, EFFORT[e] || e])];
+  };
+  const effortBox = h('span');
+  const drawEffort = (model) => effortBox.replaceChildren(select(effortsFor(model), cfg.effort || '', (v) => save({ effort: (cfg.effort = v) })));
+  drawEffort(cfg.model || '');
   const path = input(cfg.path || '', { placeholder: 'Found automatically. Or the full path to the program.' });
   path.onchange = () => save({ path: path.value.trim() });
   const args = input((cfg.extra_args || []).join(' '), { placeholder: 'Extra arguments for every turn (advanced)' });
@@ -142,8 +206,8 @@ function drawSettings(el, a) {
   const par = input(cfg.max_parallel ?? 3, { type: 'number', min: 1, max: 12, class: 'input num' });
   par.onchange = () => save({ max_parallel: Math.max(1, Math.min(12, +par.value || 1)) });
   el.replaceChildren(
-    field('Model', select(modelOptions(a.id), cfg.model || '', (v) => save({ model: v })), 'Used for new work unless a thread names another.'),
-    a.id === 'claude' || a.id === 'codex' ? field('Effort', select(efforts, cfg.effort || '', (v) => save({ effort: v }))) : null,
+    field('Model', select(modelOptions(a.id), cfg.model || '', (v) => (save({ model: v }), drawEffort(v))), 'Used for new work unless a thread names another. The list comes from the CLI itself: More › Refresh models asks it again.'),
+    a.id === 'claude' || a.id === 'codex' ? field('Effort', effortBox) : null,
     field('Permissions', seg([['full', 'Full auto'], ['edits', 'Edits only'], ['readonly', 'Read only']], cfg.autonomy || 'full', (v) => save({ autonomy: v })), 'Full auto lets it run commands without asking (it works in its own worktree). Read only is for reviews and research.'),
     field('At the same time', par, 'How many turns of this agent may run at once. Subscriptions have limits; lower is gentler on them.'),
     field('Program', path),
@@ -233,7 +297,7 @@ async function routing(el) {
             [f[i - 1], f[i]] = [f[i], f[i - 1]];
             setSetting({ lead_fallback: f }).then(draw);
           }, html: icon('left', 12) }) : null)))),
-        toggle(S.settings.auto_fallback !== false, (v) => setSetting({ auto_fallback: v }), { label: 'When an agent hits its limit, move its waiting work to the next agent (otherwise it waits for the reset)' }),
+        toggle(S.settings.auto_fallback === true, (v) => setSetting({ auto_fallback: v }), { label: 'When an agent runs out of usage, move its work to another agent without asking (otherwise you are asked: move it, or wait for the reset)' }),
         toggle(S.settings.cross_review !== false, (v) => setSetting({ cross_review: v }), { label: 'Have a different agent review finished work before it’s merged' })),
       h('section', { class: 'panel cut' }, kicker('Turns'),
         h('div', { class: 'row3' },

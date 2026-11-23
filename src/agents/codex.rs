@@ -33,9 +33,8 @@ impl AgentAdapter for Codex {
             summary: "Strong, fast engineer for back-end services, APIs, data, infrastructure, scripts and tests.".into(),
             site: "https://developers.openai.com/codex/cli".into(),
             models: vec![
-                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Codex is set to".into() },
-                ModelOpt { id: "gpt-5-codex".into(), label: "GPT-5 Codex".into(), note: "Tuned for coding".into() },
-                ModelOpt { id: "gpt-5".into(), label: "GPT-5".into(), note: "General reasoning".into() },
+                // `codex debug models` fills in the real list; until then, whatever Codex is set to
+                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Codex is set to".into(), ..Default::default() },
             ],
             mcp: true,
             can_lead: true,
@@ -48,7 +47,9 @@ impl AgentAdapter for Codex {
 
     fn launch(&self, spec: &TurnSpec) -> anyhow::Result<Launch> {
         let mut a: Vec<String> = vec!["exec".into(), "--json".into(), "--skip-git-repo-check".into(), "--color".into(), "never".into()];
-        match spec.autonomy {
+        // the lead coordinates: a read-only sandbox, so its commands can look but not change anything (its roamer
+        // tools run in Model Roamer, outside the sandbox)
+        match if spec.lead { Autonomy::ReadOnly } else { spec.autonomy } {
             Autonomy::Full => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
             Autonomy::Edits => a.extend(["--sandbox".into(), "workspace-write".into()]),
             Autonomy::ReadOnly => a.extend(["--sandbox".into(), "read-only".into()]),
@@ -71,6 +72,9 @@ impl AgentAdapter for Codex {
             let env: Vec<String> = m.env.iter().map(|(k, v)| format!("{k} = {}", toml_str(v))).collect();
             a.extend(["-c".into(), format!("mcp_servers.roamer.env={{ {} }}", env.join(", "))]);
             a.extend(["-c".into(), "mcp_servers.roamer.tool_timeout_sec=600".into()]);
+            // Model Roamer's own tools are always allowed: without this, a read-only sandbox (the lead's) refuses them
+            // because no one is there to approve
+            a.extend(["-c".into(), "mcp_servers.roamer.default_tools_approval_mode=\"approve\"".into()]);
         }
         a.extend(spec.extra_args.iter().cloned());
         if let Some(sid) = &spec.session {
@@ -80,11 +84,18 @@ impl AgentAdapter for Codex {
         Ok(Launch { args: a, stdin: Some(with_system(spec)), cwd: Some(spec.cwd.clone()), env: vec![], pty: false })
     }
 
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        Some(ModelsProbe { args: vec!["debug".into(), "models".into()], stdin: None })
+    }
+
     fn parse(&self, line: &str, st: &mut Value) -> Vec<AgentEvent> {
         let Some(v) = json_line(line) else {
             return if line.trim().is_empty() { vec![] } else { vec![AgentEvent::Raw(line.to_string())] };
         };
         let mut out = vec![];
+        if let Some(q) = codex_quota(&v) {
+            out.push(AgentEvent::Quota(q));
+        }
         let ty = v["type"].as_str().unwrap_or("");
         match ty {
             "thread.started" | "session.created" | "session_configured" => {
@@ -99,6 +110,15 @@ impl AgentAdapter for Codex {
                 let done = ty == "item.completed";
                 match it["type"].as_str().or(it["item_type"].as_str()).unwrap_or("") {
                     "agent_message" | "assistant_message" if done => out.push(AgentEvent::Text(s(&it["text"]))),
+                    // partial text, when this Codex sends it: pass on only what is new since the last update
+                    "agent_message" | "assistant_message" => {
+                        let text = s(&it["text"]);
+                        let seen = st["typed"][&id].as_u64().unwrap_or(0) as usize;
+                        if text.len() > seen && text.is_char_boundary(seen) {
+                            out.push(AgentEvent::Delta(text[seen..].to_string()));
+                            st["typed"][&id] = json!(text.len());
+                        }
+                    }
                     "reasoning" if done => out.push(AgentEvent::Thinking(s(&it["text"]))),
                     "command_execution" => {
                         if ty == "item.started" {
@@ -210,6 +230,18 @@ impl AgentAdapter for Codex {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streams_message_updates() {
+        let c = Codex;
+        let mut st = serde_json::json!({});
+        let a = c.parse(r#"{"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"Hel"}}"#, &mut st);
+        let b = c.parse(r#"{"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"Hello there"}}"#, &mut st);
+        let d = c.parse(r#"{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"Hello there"}}"#, &mut st);
+        assert!(matches!(&a[0], AgentEvent::Delta(t) if t == "Hel"));
+        assert!(matches!(&b[0], AgentEvent::Delta(t) if t == "lo there"));
+        assert!(matches!(&d[0], AgentEvent::Text(t) if t == "Hello there"));
+    }
+
     use super::*;
     #[test]
     fn parses_jsonl() {
@@ -226,5 +258,29 @@ mod tests {
         let e = c.parse(r#"{"type":"turn.failed","error":{"message":"You've hit your usage limit. Try again in 3 hours."}}"#, &mut st);
         assert!(matches!(&e[0], AgentEvent::Limit { until: Some(_), .. }));
         assert_eq!(toml_str("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
+    }
+}
+
+#[cfg(test)]
+mod lead_tests {
+    use super::*;
+    use crate::agents::{AgentAdapter, McpLaunch, TurnSpec};
+
+    fn spec(lead: bool) -> TurnSpec {
+        let d = std::env::temp_dir();
+        TurnSpec {
+            prompt: "hi".into(), system: String::new(), session: None, cwd: d.clone(), model: String::new(), effort: String::new(), autonomy: Autonomy::Full,
+            mcp: Some(McpLaunch { command: "model-roamer".into(), args: vec!["mcp".into()], env: vec![] }),
+            extra_dirs: vec![], scratch: d, extra_args: vec![], headless: true, lead,
+        }
+    }
+
+    #[test]
+    fn lead_is_read_only_but_keeps_its_tools() {
+        let a = Codex.launch(&spec(true)).unwrap().args.join(" ");
+        assert!(a.contains("--sandbox read-only") && !a.contains("--dangerously-bypass"));
+        assert!(a.contains("mcp_servers.roamer.default_tools_approval_mode"));
+        let w = Codex.launch(&spec(false)).unwrap().args.join(" ");
+        assert!(w.contains("--dangerously-bypass-approvals-and-sandbox"));
     }
 }

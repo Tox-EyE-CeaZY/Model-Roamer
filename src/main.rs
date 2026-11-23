@@ -16,6 +16,7 @@ mod core;
 mod db;
 #[cfg(feature = "desktop")]
 mod desktop;
+mod forward;
 mod git;
 mod github;
 mod mcp;
@@ -24,6 +25,7 @@ mod net;
 mod os;
 mod procs;
 mod prompts;
+mod quota;
 mod runner;
 mod server;
 mod setup;
@@ -184,13 +186,26 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     }
     runner::recover(&core);
     tokio::spawn(runner::watch_limits(core.clone()));
-    // find out which agents are installed and signed in, in the background
+    // plan usage for the status bar: now, then every ten minutes (and after every turn, in the runner)
+    let cq = core.clone();
+    tokio::spawn(async move {
+        loop {
+            for a in cq.adapters() {
+                cq.refresh_quota(&a.id()).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        }
+    });
+    // what the last run found about each agent shows at once; only agents whose facts may have changed are checked
+    // again, in the background and all at once (so one slow CLI doesn't hold up the others)
+    core.load_remembered_status();
+    core.repair_raw_messages();
+    crate::artifacts::file_unfiled(&core);
     let c = core.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(600)).await;
-        for a in c.adapters() {
-            let _ = c.agent_status(&a.id()).await;
-        }
+        let ids: Vec<String> = c.adapters().iter().map(|a| a.id()).filter(|id| c.needs_check(id)).collect();
+        futures_util::future::join_all(ids.iter().map(|id| c.agent_status(id))).await;
     });
     Ok(core)
 }

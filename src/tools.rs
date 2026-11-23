@@ -32,12 +32,14 @@ const DEFS: &[Def] = &[
         "title": {"type": "string", "description": "Short title, verb first, 3-6 words"},
         "instructions": {"type": "string", "description": "The task: what to do, context, files/areas it owns, what not to touch"},
         "criteria": {"type": "string", "description": "Acceptance criteria: what done looks like and how to verify it"},
-        "agent": {"type": "string", "description": "claude | codex | gemini | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
+        "agent": {"type": "string", "description": "claude | codex | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
         "task_kind": {"type": "string", "description": "plan | core | refactor | review | docs | design | frontend | creative | research | backend | api | data | infra | scripts | tests | general"},
         "model": {"type": "string", "description": "Optional model for that agent"},
         "workspace": {"type": "string", "enum": ["worktree", "shared", "scratch"], "description": "worktree (default when the project has a git repo): its own branch and folder; shared: the project folder itself (read-only work, research); scratch: an empty folder"},
-        "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"}
+        "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"},
+        "allow_limited": {"type": "boolean", "description": "Open the thread even though that agent is out of usage right now (it waits for the reset). Default false: you're told who has room instead."}
     }), &["title", "instructions"]) },
+    Def { name: "agent_status", roles: LEAD, desc: "Each agent's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
     Def { name: "send_message", roles: LEAD, desc: "Send a message to a thread (answers, review notes, new instructions). The thread's agent gets a turn to act on it.", schema: || obj(json!({
         "thread_id": {"type": "string"}, "text": {"type": "string"}
     }), &["thread_id", "text"]) },
@@ -91,14 +93,24 @@ const DEFS: &[Def] = &[
     Def { name: "delete_memory", roles: ALL, desc: "Delete a memory entry that turned out to be wrong or obsolete.", schema: || obj(json!({
         "name": {"type": "string"}, "scope": {"type": "string", "enum": ["project", "global"]}
     }), &["name"]) },
-    Def { name: "publish_artifact", roles: ALL, desc: "Publish something to look at (HTML page, markdown, SVG, image, PDF, text) so the person can open it in Model Roamer on any device. Give a file path in your workspace, or the content itself. Same title updates it.", schema: || obj(json!({
-        "title": {"type": "string"}, "path": {"type": "string", "description": "A file (or a folder with index.html) in your workspace"},
+    Def { name: "publish_artifact", roles: ALL, desc: "Publish something to look at (HTML page, markdown, SVG, image, PDF, text) so the person can open it in Model Roamer on any device. Give a file path in your workspace, or the content itself. Same title updates it. It is filed under this project and thread automatically; pass folder to put it somewhere else.", schema: || obj(json!({
+        "title": {"type": "string"}, "folder": {"type": "string", "description": "Optional folder path, made if missing, e.g. 'Designs/Mockups' (inside the project's folder; a leading / starts from the top of the library)"}, "path": {"type": "string", "description": "A file (or a folder with index.html) in your workspace"},
         "content": {"type": "string", "description": "Or the content itself"}, "kind": {"type": "string", "enum": ["html", "markdown", "svg", "image", "pdf", "text"]},
         "description": {"type": "string"}
     }), &["title"]) },
+    Def { name: "list_artifacts", roles: ALL, desc: "The artifact folders for this project (or your chat) and what is in each, to see how files are organized before publishing or moving.", schema: || obj(json!({}), &[]) },
+    Def { name: "move_artifact", roles: ALL, desc: "Move an artifact (by title or id) into a folder path, made if missing, e.g. 'Reports/2026'. Use it to keep the project's files organized.", schema: || obj(json!({
+        "artifact": {"type": "string"}, "folder": {"type": "string"}
+    }), &["artifact", "folder"]) },
     Def { name: "post_update", roles: ALL, desc: "Show a short progress line on your thread without ending your turn (e.g. 'Tests pass, writing docs').", schema: || obj(json!({
         "text": {"type": "string"}
     }), &["text"]) },
+    Def { name: "message_lead", roles: &["worker", "review"], desc: "Write to the project's lead without ending your turn: ask for more work or a decision, report something it should act on (a blocker, a finding, a need for another agent), or ask for help. The lead is woken, can answer you with send_message, and may open more threads. Keep working on what you can meanwhile.", schema: || obj(json!({
+        "text": {"type": "string"}, "kind": {"type": "string", "enum": ["question", "report", "request"]}
+    }), &["text"]) },
+    Def { name: "set_title", roles: ALL, desc: "Name your chat or thread so the person can find it in a list: lead with the verb of their goal, 3 to 6 words, sentence case, in their words (e.g. 'Fix Safari export button'). Call it after the first exchange and again when the goal changes. Lead: pass thread_id to name a worker's thread.", schema: || obj(json!({
+        "title": {"type": "string"}, "thread_id": {"type": "string"}
+    }), &["title"]) },
     Def { name: "set_status", roles: WORK, desc: "Set your thread's status: review (ready for the lead to check), done, blocked (say why), working.", schema: || obj(json!({
         "status": {"type": "string", "enum": ["working", "review", "done", "blocked"]}, "note": {"type": "string"}
     }), &["status"]) },
@@ -173,8 +185,13 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     };
     tracing::info!(thread = %tid, tool = name, "tool call");
     match name {
+        "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
+            let want = a("agent").to_lowercase();
+            if !want.is_empty() && want != "auto" && core.is_limited(&want) && args["allow_limited"] != true {
+                bail!("{want} is out of usage right now, so nothing was opened. Pick another agent or use agent \"auto\", or pass allow_limited to queue it for the reset.\n\n{}", runner::fleet_now(core));
+            }
             let deps: Vec<String> = args["depends_on"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
             let t = runner::create_worker(
                 core,
@@ -210,7 +227,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "list_threads" => {
             let p = need_project()?;
             let filter = a("status");
-            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, merged, task_kind, updated_at FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
             let rows: Vec<Value> = rows
                 .into_iter()
                 .filter(|r| match filter.as_str() {
@@ -242,7 +259,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             let p = need_project()?;
             Ok(runner::overview(core, &p))
         }
-        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind")).map(|(agent, why)| format!("{agent}: {why}")).unwrap_or_else(|| "No agent is available right now.".into())),
+        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind")).map(|(agent, why)| format!("{agent}: {why}\n\n{}", runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
         "reassign_thread" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
@@ -332,14 +349,77 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         }
         "publish_artifact" => {
             let ws = runner::workspace_of(core, caller);
-            let art = crate::artifacts::publish(core, project.as_deref(), Some(&tid), &a("title"), &a("description"), &a("kind"), args["path"].as_str(), args["content"].as_str(), ws.as_deref())?;
+            let art = crate::artifacts::publish(core, project.as_deref(), Some(&tid), &a("title"), &a("description"), &a("kind"), args["path"].as_str(), args["content"].as_str(), ws.as_deref(), args["folder"].as_str())?;
             runner::post(core, &tid, "system", "Artifact", &format!("Published **{}**", art["title"].as_str().unwrap_or("")), json!({ "artifact": art }), false)?;
-            Ok(format!("Published. The person can open it from the Artifacts shelf (id {}).", art["id"].as_str().unwrap_or("")))
+            let path = art["folder_id"].as_str().map(|f| crate::artifacts::folder_path(core, f)).unwrap_or_default();
+            Ok(format!("Published to {path}. The person can open it from Artifacts (id {}).", art["id"].as_str().unwrap_or("")))
+        }
+        "list_artifacts" => {
+            let root = if project.is_some() { crate::artifacts::root_folder(core, project.as_deref())? } else { crate::artifacts::auto_folder(core, None, Some(&tid))? };
+            let mut out = String::new();
+            for f in crate::artifacts::subtree(core, &root) {
+                if core.db.one("SELECT id FROM folders WHERE id = ?1 AND deleted_at IS NULL", &[&f])?.is_none() {
+                    continue;
+                }
+                let items = core.db.all("SELECT id, title, kind FROM artifacts WHERE folder_id = ?1 AND deleted_at IS NULL ORDER BY lower(title)", &[&f])?;
+                out.push_str(&format!("{}/\n", crate::artifacts::folder_path(core, &f)));
+                for a in items {
+                    out.push_str(&format!("  - {} ({}, {})\n", a["title"].as_str().unwrap_or(""), a["kind"].as_str().unwrap_or(""), a["id"].as_str().unwrap_or("")));
+                }
+            }
+            Ok(if out.is_empty() { "No folders yet.".into() } else { out })
+        }
+        "move_artifact" => {
+            let key = a("artifact");
+            let art = core
+                .db
+                .one("SELECT id, title FROM artifacts WHERE (id = ?1 OR lower(title) = lower(?1)) AND IFNULL(project_id, '') = ?2 AND deleted_at IS NULL ORDER BY id = ?1 DESC LIMIT 1", &[&key, &project.clone().unwrap_or_default()])?
+                .ok_or_else(|| anyhow!("No artifact called {key} here. list_artifacts shows them."))?;
+            let f = crate::artifacts::folder_for_path(core, project.as_deref(), Some(&tid), &a("folder"))?;
+            core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &art["id"].as_str().unwrap_or("")])?;
+            core.bus.emit("artifact", project.as_deref(), None, json!({ "folder": f }));
+            Ok(format!("Moved \"{}\" to {}.", art["title"].as_str().unwrap_or(""), crate::artifacts::folder_path(core, &f)))
         }
         "post_update" => {
             core.set_thread(&tid, &json!({ "status_note": clip(&a("text"), 200) }))?;
             core.bus.emit("progress", project.as_deref(), Some(&tid), json!({ "text": a("text") }));
             Ok("Shown.".into())
+        }
+        "message_lead" => {
+            let p = need_project()?;
+            let lead = core.lead_thread(&p)?;
+            let text = a("text");
+            if text.trim().is_empty() {
+                bail!("Say what you want the lead to know or do.");
+            }
+            let kind = if a("kind").is_empty() { "report".to_string() } else { a("kind") };
+            let body = runner::wake_tag("worker-message", &caller, &format!("This thread wrote to you ({kind}):\n{}", clip(&text, 4000)));
+            runner::post(core, lead["id"].as_str().unwrap_or(""), "wake", "Model Roamer", &body, json!({ "from_thread": tid }), true)?;
+            Ok("Sent to the lead. Carry on with what you can; its answer arrives as a new message here.".into())
+        }
+        "set_title" => {
+            let target = if a("thread_id").is_empty() || a("thread_id") == tid {
+                caller.clone()
+            } else {
+                if role != "lead" {
+                    bail!("You can only name your own thread.");
+                }
+                let t = core.thread(&a("thread_id"))?;
+                same_project(&t)?;
+                t
+            };
+            if target["kind"] == "lead" {
+                bail!("The project chat is named after the project. Name the threads instead.");
+            }
+            if target["title_by"] == "person" {
+                bail!("The person named this thread \"{}\" themselves. Keep their title.", target["title"].as_str().unwrap_or(""));
+            }
+            let title = clean_title(&a("title"));
+            if title.is_empty() {
+                bail!("Give a title of a few words.");
+            }
+            core.set_thread(target["id"].as_str().unwrap_or(""), &json!({ "title": title, "title_by": "agent" }))?;
+            Ok(format!("Named \"{title}\"."))
         }
         "set_status" => {
             let st = a("status");
@@ -441,14 +521,18 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
 
 fn thread_line(t: &Value) -> String {
     format!(
-        "{} · \"{}\" · {} · {}{}{}{}",
+        "{} · \"{}\" · {} · {}{}{}{}{}",
         t["id"].as_str().unwrap_or(""),
         t["title"].as_str().unwrap_or(""),
         t["agent"].as_str().unwrap_or(""),
         t["status"].as_str().unwrap_or(""),
         t["status_note"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" ({s})")).unwrap_or_default(),
         t["branch"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" · branch {s}")).unwrap_or_default(),
-        if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else { "" }
+        if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else { "" },
+        match (t["context"]["used"].as_i64(), t["context"]["window"].as_i64()) {
+            (Some(u), Some(w)) if w > 0 => format!(" · context {}%{}", u * 100 / w, if u * 100 / w >= 80 { " (near compacting)" } else { "" }),
+            _ => String::new(),
+        }
     )
 }
 
@@ -487,10 +571,23 @@ If the Model Roamer tools are not available to you as tool calls, call them by w
 reply (JSON arguments, one block per call):
 
 <roamer-tool name="read_memory">{}</roamer-tool>
-<roamer-tool name="spawn_thread">{"title": "Build the settings page", "instructions": "...", "agent": "gemini"}</roamer-tool>
+<roamer-tool name="spawn_thread">{"title": "Build the settings page", "instructions": "...", "agent": "antigravity"}</roamer-tool>
 
 Model Roamer runs them when your turn ends and sends the results back to you in a new turn. Text outside the blocks
 is your reply. Only use this when the native tools are missing."#;
+
+/// A title as the person will see it in a list: one line, no wrapping quotes or trailing period, at most 60 characters.
+fn clean_title(raw: &str) -> String {
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let t = line.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '*' | '#' | '\u{201c}' | '\u{201d}') || c.is_whitespace());
+    let t = t.trim_end_matches('.').trim();
+    if t.chars().count() <= 60 {
+        return t.to_string();
+    }
+    // cut at a word boundary rather than mid-word
+    let cut: String = t.chars().take(60).collect();
+    cut.rsplit_once(' ').map(|(a, _)| a.trim_end_matches([',', ':', ';', '-']).trim().to_string()).unwrap_or(cut)
+}
 
 #[cfg(test)]
 mod tests {
@@ -508,6 +605,14 @@ mod tests {
         assert!(overlaps("./src/ui/", "src/ui"));
         assert!(!overlaps("src/ui", "src/core"));
         assert!(!overlaps("src/ui2", "src/ui"));
+    }
+    #[test]
+    fn cleans_titles() {
+        assert_eq!(clean_title("  \"Fix Safari export button.\"\nextra"), "Fix Safari export button");
+        assert_eq!(clean_title("**Add dark mode**"), "Add dark mode");
+        let long = clean_title(&"word ".repeat(30));
+        assert!(long.chars().count() <= 60 && !long.ends_with(' '));
+        assert!(list("chat").iter().any(|t| t["name"] == "set_title"));
     }
     #[test]
     fn lists_by_role() {

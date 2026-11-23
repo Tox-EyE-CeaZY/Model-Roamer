@@ -133,7 +133,8 @@ export function dur(ms) {
   if (s < 60) return s + 's';
   const m = Math.floor(s / 60);
   if (m < 60) return m + 'm ' + (s % 60) + 's';
-  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  if (m < 48 * 60) return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  return Math.floor(m / 1440) + 'd ' + Math.floor((m % 1440) / 60) + 'h';
 }
 
 /** "in 2h 10m" until a time in ms */

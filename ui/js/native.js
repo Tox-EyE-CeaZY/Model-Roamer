@@ -17,10 +17,32 @@ export function native(cmd, data = {}) {
 
 export const win = (op, extra) => native('win', { op, ...extra });
 
-/** Open a link in the person's own browser (or a new tab when we are the browser). */
-export function openExternal(url) {
-  if (isDesktop) native('external', { url });
+const LOCAL_URL = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0)(:\d+)?(\/|\?|#|$)/i;
+
+/** A page served on the machine Model Roamer runs on (a dev server or preview an agent started). */
+export const isLocalUrl = (url) => LOCAL_URL.test(String(url || ''));
+
+/** Open a link outside the app: the person's own browser (or a new tab when we are the browser). */
+export function openOutside(url) {
+  if (window.RoamerAndroid) window.RoamerAndroid.openExternal(url);
+  else if (isDesktop) native('external', { url });
   else window.open(url, '_blank', 'noopener');
+}
+
+/**
+ * Open a link. Pages on the server's own localhost can't be reached from another device as "localhost", so they open
+ * in the app's browser, which has the server route them; everything else opens in the person's own browser.
+ */
+export function openExternal(url) {
+  if (isLocalUrl(url)) return openBrowser(url);
+  openOutside(url);
+}
+
+/** The app's own browser, in a window of its own when this one is a pop-out. */
+export function openBrowser(url) {
+  const hash = '#/browse?u=' + encodeURIComponent(url);
+  if (isPop) popOut(hash, { key: 'browse', w: 1100, h: 800 });
+  else location.hash = hash;
 }
 
 /**

@@ -67,7 +67,8 @@ listen((ev) => {
       changed('running');
       break;
     case 'agent':
-      if (ev.data?.id) S.agents[ev.data.id] = { ...S.agents[ev.data.id], ...ev.data };
+      // a status event is the whole status: replacing it drops the "pending" of the placeholder it answers
+      if (ev.data?.id) S.agents[ev.data.id] = { ...ev.data, pending: false };
       changed('agents');
       break;
     case 'limits':
@@ -104,6 +105,22 @@ export function applyLook() {
   r.dataset.density = s.density || 'cozy';
   try {
     localStorage.setItem('mr-look', JSON.stringify({ theme: s.theme, hue: s.hue }));
+  } catch { /* private window */ }
+}
+
+/** The agent and model a new chat starts on: the last one picked while the app has been open, else the primary
+ * (lead) model from Settings. Closing and reopening the app goes back to the primary. */
+export function chatPick() {
+  try {
+    const p = JSON.parse(sessionStorage.getItem('mr-chat-pick') || 'null');
+    if (p?.agent && S.agents[p.agent]) return p;
+  } catch { /* private window */ }
+  const a = S.settings.default_lead || 'claude';
+  return { agent: a, model: S.settings.default_lead_model ?? S.agents[a]?.config?.model ?? '' };
+}
+export function rememberChatPick(agent, model) {
+  try {
+    sessionStorage.setItem('mr-chat-pick', JSON.stringify({ agent, model }));
   } catch { /* private window */ }
 }
 

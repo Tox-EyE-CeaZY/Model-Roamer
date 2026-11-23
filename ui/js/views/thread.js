@@ -4,18 +4,27 @@
 import { h, ago, clock, dayLabel, dur, num, bytes } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen, upload } from '../api.js';
-import { S, agentName, agentHue, project as projectOf } from '../store.js';
-import { go, openThread } from '../app.js';
+import { S, watch, agentName, agentHue, project as projectOf, rememberChatPick } from '../store.js';
+import { go, back, openThread } from '../app.js';
 import { isPop, isDesktop, popOut, setTitle, openExternal, native } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
-import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable, pickFolder } from '../common.js';
+import { runStep } from '../term.js';
 
 export default async function threadView(el, r, ctx) {
   return mountThread(el, r.id, { full: true, ctx });
 }
 
 const TOOL_ICONS = { shell: 'terminal', 'edit files': 'edit', 'web search': 'globe' };
+
+const COMPACT_AT = 90;
+/** The thread's context fill: {used, window, pct, compactions, ...}, or null when its agent doesn't report it. */
+export function ctxOf(t) {
+  const c = t?.context;
+  if (!c || typeof c !== 'object' || c.agent !== t.agent || !c.window) return null;
+  return { ...c, pct: Math.min(999, Math.round((c.used / c.window) * 100)) };
+}
 
 export async function mountThread(el, id, { full, compact, ctx } = {}) {
   let t;
@@ -38,7 +47,34 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, scroller, composer.el), sidebar));
 
   let messages = [], turns = [], activity = {}, hasMore = false;
-  const live = { turn: null, segments: [], cur: '', acts: [], started: 0 };
+  // shown: how much of the streamed text is on screen; it catches up word by word, so every agent's reply reads as it
+  // is written, whether the agent sends tokens (Claude, Antigravity) or whole paragraphs (Codex). hold: a finished reply
+  // that is still being typed out, moved into the log when the typing reaches its end.
+  // parts: the turn so far in the order it happened: text the agent wrote and its steps (thinking, tools, results).
+  // Only the trailing text is typed out; text before a step is already on screen.
+  const live = { turn: null, parts: [], started: 0, shown: 0, hold: null };
+  const steps = stepView(() => t.steps || S.settings.steps || 'collapsed');
+  const trailing = () => (live.parts.at(-1)?.k === 'text' ? live.parts.at(-1) : null);
+  const liveTarget = () => (live.hold ? live.hold.body : trailing()?.text || '');
+  const resetLive = (turn, started = Date.now()) => Object.assign(live, { turn, parts: [], started, shown: 0 });
+  /** Text streamed in: added to the open text part, or a new part after a step. A block replaces what streamed. */
+  function liveText(text, block) {
+    const last = trailing();
+    if (last?.open) {
+      if (block) Object.assign(last, { text, open: false });
+      else last.text += text;
+      return;
+    }
+    if (block && last && last.text.trim() === text.trim()) return;
+    live.parts.push({ k: 'text', text, open: !block });
+    live.shown = 0;
+  }
+  function liveStep(a) {
+    if (a.kind === 'text') return liveText(a.body || '', true);
+    const last = trailing();
+    if (last) last.open = false;
+    live.parts.push({ k: 'act', a });
+  }
 
   // ---------------------------------------------------------- header
   function drawHead() {
@@ -52,10 +88,11 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const title = h('h1', { class: 'th-title', title: 'Rename', tabindex: '0', onclick: rename, onkeydown: (e) => e.key === 'Enter' && rename() }, t.title);
     head.replaceChildren(
       h('div', { class: 'th-crumbs mono' },
+        !isPop && full ? h('button', { class: 'ibtn xs th-back', title: 'Back (Alt+Left)', onclick: () => back(p ? '#/p/' + p.id : '#/chats'), html: icon('back', 14) }) : null,
         p ? h('a', { href: '#/p/' + p.id, style: { '--ph': p.color } }, h('i', { class: 'sw' }), p.name) : h('a', { href: '#/chats' }, 'Chats'),
         h('span', {}, '/'),
         h('span', {}, t.kind === 'lead' ? 'project chat' : t.kind === 'review' ? 'review' : t.kind === 'chat' ? 'chat' : 'thread')),
-      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t)),
+      h('div', { class: 'th-title-row' }, title, stamp(t.agent, { model: t.model, lead: t.kind === 'lead' }), statusChip(t), buddyChip(), ctxChip()),
       t.status_note ? h('div', { class: 'th-note' }, ic(t.status === 'blocked' || t.status === 'failed' ? 'warn' : 'info', 14), h('span', {}, t.status_note)) : null,
       h('div', { class: 'th-acts' },
         running
@@ -72,6 +109,21 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         h('span', { class: 'grow' }),
         !isPop ? h('button', { class: 'ibtn', title: 'Pop out into its own window (Ctrl+Shift+O)', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 16) }) : null,
         h('button', { class: 'ibtn', title: 'More', onclick: (e) => moreMenu(e.currentTarget), html: icon('more', 16) })));
+  }
+
+  /** Buddy threads: which pair, whose turn it is, and how many turns it has used. */
+  function buddyChip() {
+    const b = t.buddy;
+    if (!b || typeof b !== 'object') return null;
+    const def = (S.settings.buddies || []).find((x) => x.id === b.id);
+    const max = def?.max_turns || 4;
+    return h('span', { class: 'ctx-chip buddy', title: `${b.name || 'Buddies'}: two agents taking turns. Turn ${b.turns || 0} of ${max}.` }, '⇄ ' + (b.name || 'Buddies'), h('small', {}, ` ${b.turns || 0}/${max}`));
+  }
+
+  function ctxChip() {
+    const c = ctxOf(t);
+    if (!c || c.pct < 60) return null;
+    return h('span', { class: 'ctx-chip' + (c.pct >= 85 ? ' hot' : ''), title: `${num(c.used)} of ${num(c.window)} tokens in use. It compacts its conversation on its own around ${COMPACT_AT}%.` }, 'Context ' + c.pct + '%');
   }
 
   async function rename() {
@@ -221,18 +273,47 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
           t.task_kind ? [h('dt', {}, 'Kind'), h('dd', {}, (S.taskKinds.find((k) => k.id === t.task_kind) || {}).label || t.task_kind)] : null,
           t.branch ? [h('dt', {}, 'Branch'), h('dd', { class: 'mono' }, t.branch)] : null,
           t.base_branch ? [h('dt', {}, 'Into'), h('dd', { class: 'mono' }, t.base_branch)] : null,
-          t.workspace_path ? [h('dt', {}, 'Folder'), h('dd', {}, copyable(t.workspace_path))] : null,
+          t.workspace_path || t.kind === 'chat' ? [h('dt', {}, 'Folder'), h('dd', {}, t.workspace_path ? copyable(t.workspace_path) : h('span', { class: 'faint' }, 'Its own, made with the first message'),
+            t.kind === 'chat' ? h('div', { class: 'row-btns' },
+              h('button', { class: 'btn xs', onclick: () => changeFolder() }, ic('folder', 12), 'Change…'),
+              (t.workspace || '').startsWith('path:') ? h('button', { class: 'btn xs', onclick: () => changeFolder('') }, 'Use its own') : null) : null)] : null,
           [h('dt', {}, 'Started'), h('dd', {}, timeAgo(t.created_at))],
           t.session_id ? [h('dt', {}, 'Session'), h('dd', { class: 'mono faint', title: t.session_id }, t.session_id.slice(0, 12) + '…')] : null)),
       deps.length ? h('section', {}, kicker('Waits for'), deps.map((d) => h('button', { class: 'linkbtn', onclick: () => openThread(d) }, ic('thread', 13), d))) : null,
       t.children?.length ? h('section', {}, kicker('Threads from here'), t.children.map((c) => h('button', { class: 'mini', onclick: () => openThread(c.id) }, h('span', {}, c.title), stamp(c.agent, { small: true }), statusChip(c.status)))) : null,
       t.artifacts?.length ? h('section', {}, kicker('Artifacts'), t.artifacts.map((a) => h('a', { class: 'mini', href: '#/a/' + a.id }, ic('artifact', 13), h('span', {}, a.title), h('small', { class: 'faint' }, a.kind)))) : null,
+      contextSection(),
       h('section', {}, kicker('Usage'),
         h('dl', { class: 'facts' },
           h('dt', {}, 'Turns'), h('dd', {}, u.turns || 0),
           h('dt', {}, 'Tokens'), h('dd', {}, num(u.input || 0) + ' in · ' + num(u.output || 0) + ' out'),
           u.cost ? [h('dt', {}, 'Cost'), h('dd', {}, '$' + Number(u.cost).toFixed(2))] : null)),
     );
+  }
+
+  /** How full the agent's context is, how near it is to compacting, and when it last did. */
+  function contextSection() {
+    const c = ctxOf(t);
+    if (!c) return h('section', {}, kicker('Context'), h('p', { class: 'faint small' }, t.agent === 'antigravity' ? 'Antigravity doesn’t report this.' : 'Shown after the agent’s first reply.'));
+    return h('section', {}, kicker('Context', h('b', { class: 'ctx-pct' + (c.pct >= 85 ? ' hot' : c.pct >= 65 ? ' warm' : '') }, c.pct + '%')),
+      h('div', { class: 'ctx-bar', title: `Compacts on its own around ${COMPACT_AT}%` }, h('i', { style: { width: Math.min(100, c.pct) + '%' } }), h('em', { style: { left: COMPACT_AT + '%' } })),
+      h('dl', { class: 'facts' },
+        h('dt', {}, 'In use'), h('dd', {}, c.window ? `${num(c.used)} of ${num(c.window)} tokens` : num(c.used) + ' tokens'),
+        h('dt', {}, 'Compacts'), h('dd', {}, c.pct >= COMPACT_AT ? 'about to' : `around ${COMPACT_AT}% (~${num(Math.round(c.window * COMPACT_AT / 100))})`),
+        c.compactions ? [h('dt', {}, 'Compacted'), h('dd', {}, `${c.compactions}×` + (c.compacted_at ? `, last ${ago(c.compacted_at)}` + (c.trigger ? ` (${c.trigger})` : '') : ''))] : null));
+  }
+
+  async function changeFolder(to) {
+    const f = to ?? (await pickFolder({ title: 'Folder this chat works in', start: t.workspace_path || '' }));
+    if (f == null) return;
+    try {
+      t = { ...t, ...(await patch('threads/' + id, { folder: f })) };
+      t = await get('threads/' + id);
+      drawSide();
+      toast(f ? `Works in ${f} from the next message` : 'Back to a folder of its own');
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
   }
 
   // ---------------------------------------------------------- decisions
@@ -278,7 +359,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         day = d;
         frag.push(h('div', { class: 'day' }, h('span', {}, d)));
       }
-      frag.push(entry(m, lastOfTurn[m.meta?.turn_id] === m.id ? activity[m.meta.turn_id] : null));
+      frag.push(entry(m, lastOfTurn[m.meta?.turn_id] === m.id ? turnParts(activity[m.meta.turn_id], m.body) : null));
     }
     log.replaceChildren(...frag);
     if (atBottom) toBottom();
@@ -314,29 +395,52 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         const d = (t.decisions || []).find((x) => x.id === meta.decision.id) || meta.decision;
         return h('div', { class: 'sys-entry' }, ic('question', 14), h('div', {}, h('b', {}, 'Asked you: '), m.body, d.answer != null ? h('div', { class: 'answered' }, '→ ', (parseOpts(d.options)[d.answer] || {}).label || 'answered') : h('div', { class: 'faint small' }, 'Waiting for your answer above')));
       }
-      return h('div', { class: 'sys-entry' }, ic('info', 14), h('div', { class: 'md' }, ...mdNodes(m.body)), h('time', {}, clock(m.created_at)));
+      const fix = meta.action === 'signin' && meta.agent
+        ? h('div', { class: 'sys-acts' },
+          h('button', { class: 'btn xs', onclick: () => runStep({ what: 'login', agent: meta.agent, title: `Sign ${agentName(meta.agent)} in again` }).then((code) => code === 0 && act('retry')) }, ic('login', 12), 'Sign in again'),
+          h('button', { class: 'btn xs', onclick: () => act('retry') }, ic('refresh', 12), 'Retry'))
+        : null;
+      return h('div', { class: 'sys-entry' }, ic('info', 14), h('div', { class: 'md' }, ...mdNodes(m.body), fix), h('time', {}, clock(m.created_at)));
     }
     const isAgent = m.role === 'agent';
     const who = isAgent ? meta.agent || t.agent : null;
     const fromLead = !isAgent && /^Lead/.test(m.author);
+    const fromBuddy = !isAgent && meta.buddy;
     const files = (meta.files || []).filter(Boolean);
-    const e = h('article', { class: 'msg ' + (isAgent ? 'agent' : fromLead ? 'lead-msg' : 'you') + (m.pending ? ' pending' : ''), dataset: { id: m.id }, style: isAgent ? { '--ah': agentHue(who) } : null },
+    const e = h('article', { class: 'msg ' + (isAgent ? 'agent' : fromLead ? 'lead-msg' : fromBuddy ? 'lead-msg buddy-msg' : 'you') + (m.pending ? ' pending' : ''), dataset: { id: m.id }, style: isAgent ? { '--ah': agentHue(who) } : null },
       h('header', {},
         isAgent ? stamp(who, { model: meta.model, small: true }) : h('b', { class: 'who' }, m.author || 'You'),
         meta.kickoff ? h('span', { class: 'tag' }, 'kickoff') : null,
         meta.from_thread ? h('button', { class: 'tag link', onclick: () => openThread(meta.from_thread) }, 'from the lead') : null,
         m.pending ? h('span', { class: 'tag' }, 'not read yet') : null,
+        m.pending && !isAgent && !meta.kickoff ? pendingActions(m) : null,
         h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
         h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
+      acts?.length ? timeline(acts, steps) : null,
       wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
-      files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null,
-      acts?.length ? activityStrip(acts, false) : null);
+      files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null);
     return e;
+  }
+
+  /** What you can do with a message the agent hasn't read yet: change it, take it back, or have it read right now. */
+  function pendingActions(m) {
+    const fail = (e) => toast(e.message, { err: true });
+    return h('span', { class: 'msg-pend' },
+      t.running ? h('button', { class: 'btn xs', title: 'Stop what the agent is doing so it reads this now; it carries on from there', onclick: () => post(`messages/${m.id}/now`).catch(fail) }, ic('bolt', 11), 'Send now') : null,
+      h('button', { class: 'ibtn xs', title: 'Edit before it’s read', onclick: async () => {
+        const ta = textarea(m.body);
+        if (!(await dialog({ title: 'Edit message', body: field('Message', ta), ok: 'Save' }))) return;
+        if (ta.value.trim()) patch('messages/' + m.id, { text: ta.value.trim() }).catch(fail);
+      }, html: icon('edit', 12) }),
+      h('button', { class: 'ibtn xs', title: 'Take it back', onclick: () => del('messages/' + m.id).catch(fail), html: icon('trash', 12) }));
   }
 
   function wakeLabel(reason, m) {
     const map = {
       'worker-replied': 'A worker reported back',
+      'worker-message': 'A thread wrote to you',
+      'agent-limit': 'An agent ran out of usage',
+      'agent-available': 'An agent is available again',
       'worker-finished': 'A worker finished',
       'person-opened-thread': 'You opened a thread',
       'person-messaged-thread': 'You wrote to a worker',
@@ -361,19 +465,22 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
 
   // ---------------------------------------------------------- live turn
   function drawLive() {
-    const on = !!t.running || !!live.turn;
+    const on = !!t.running || !!live.turn || !!live.hold;
     liveEl.hidden = !on;
     if (!on) return;
-    const text = [...live.segments, live.cur].filter(Boolean).join('\n\n');
-    const last = live.acts.slice(-1)[0];
+    const full = liveTarget();
+    const text = full.slice(0, live.shown);
+    if (live.shown < full.length) typeOn();
+    const last = live.parts.filter((p) => p.k === 'act').at(-1)?.a;
+    const before = trailing() || live.hold ? live.parts.slice(0, trailing() ? -1 : undefined) : live.parts;
     liveEl.replaceChildren(
       h('div', { class: 'live-h', style: { '--ah': agentHue(t.agent) } },
         h('i', { class: 'pulse' }), stamp(t.agent, { model: t.model, small: true }),
-        h('span', { class: 'live-what' }, last ? actLabel(last) : 'Thinking…'),
+        h('span', { class: 'live-what' }, last && steps.mode() !== 'hidden' ? actLabel(last) : text ? 'Writing…' : last ? 'Working…' : 'Thinking…'),
         h('span', { class: 'live-time mono', dataset: { since: live.started || t.running?.started || Date.now() } }, ''),
         h('button', { class: 'btn xs danger', onclick: () => act('stop'), title: 'Stop (Ctrl+.)' }, 'Stop')),
-      text ? wireMd(h('div', { class: 'md live-text' }, ...mdNodes(text)), openExternal) : null,
-      live.acts.length ? activityStrip(live.acts, true) : null);
+      before.length ? timeline(before, steps) : null,
+      text ? wireMd(h('div', { class: 'md live-text' + (live.shown < full.length ? ' typing' : '') }, ...mdNodes(text)), openExternal) : null);
     tick();
     if (nearBottom(220)) toBottom();
   }
@@ -401,6 +508,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         drawChips();
       }
     }
+    const stepsBtn = h('button', { class: 'cmp-steps', type: 'button', title: 'How this chat shows the agent’s steps', onclick: (e) => stepsMenu(e.currentTarget) });
     const sendBtn = h('button', { class: 'cmp-send', title: 'Send (Enter)', onclick: () => go_(), html: icon('send', 17) });
     async function go_() {
       const text = ta.value.trim();
@@ -450,9 +558,55 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       h('div', { class: 'cmp-row' },
         h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn,
         ta, sendBtn),
-      h('div', { class: 'cmp-hint mono' }, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' })));
+      h('div', { class: 'cmp-hint mono' }, t.kind === 'chat' ? chatPicker() : null, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' }), stepsBtn));
     setTimeout(grow);
-    return { el, ta, focus: () => ta.focus() };
+    return { el, ta, focus: () => ta.focus(), stepsBtn };
+  }
+  /** A chat's agent and model, changeable any time; the choice carries over to new chats until the app restarts. */
+  /** Steps for this chat: follow the setting, or its own choice (remembered with the thread). */
+  function stepsMenu(anchor) {
+    const r = anchor.getBoundingClientRect();
+    const def = S.settings.steps || 'collapsed';
+    const set = async (v) => {
+      try {
+        t = { ...t, ...(await patch('threads/' + id, { steps: v })) };
+        redrawSteps();
+      } catch (e) {
+        toast(e.message, { err: true });
+      }
+    };
+    showMenu([
+      { header: 'Steps in this chat' },
+      { label: `Use my setting (${def})`, checked: !t.steps, run: () => set('') },
+      { sep: true },
+      ...STEP_MODES.map(([v, label, title]) => ({ label, title, checked: t.steps === v, run: () => set(v) })),
+    ], r.left, r.top - 4, { anchor });
+  }
+  function drawStepsBtn() {
+    const m = steps.mode();
+    composer.stepsBtn.replaceChildren(ic(m === 'hidden' ? 'eye' : 'terminal', 12), h('span', {}, 'Steps: ' + m + (t.steps ? '' : '')));
+    composer.stepsBtn.classList.toggle('own', !!t.steps);
+  }
+  function redrawSteps() {
+    drawStepsBtn();
+    drawLog();
+    drawLive();
+  }
+
+  function chatPicker() {
+    const p = agentModelPicker({ agentId: t.agent, model: t.model || '', onchange: async (a, m) => {
+      if (!a) return;
+      rememberChatPick(a, m);
+      try {
+        t = { ...t, ...(await patch('threads/' + id, { agent: a, model: m })) };
+        composer.ta.placeholder = placeholderFor();
+        drawHead();
+      } catch (e) {
+        toast(e.message, { err: true });
+      }
+    } });
+    p.el.classList.add('cmp-pick');
+    return p.el;
   }
   function placeholderFor() {
     if (t.kind === 'lead') return `Tell the lead (${agentName(t.agent)}) what you want…`;
@@ -488,39 +642,57 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   };
   let pendingReload = 0;
   const soon = () => (clearTimeout(pendingReload), (pendingReload = setTimeout(reloadThread, 250)));
+  let stepsWas = S.settings.steps;
+  const unwatchSteps = watch((w) => {
+    if ((w === 'settings' || w === 'all') && S.settings.steps !== stepsWas) {
+      stepsWas = S.settings.steps;
+      redrawSteps();
+    }
+  });
   const unlisten = listen((ev) => {
     if (ev.kind === 'resync') return refreshAll();
     if (ev.thread !== id) return;
     const d = ev.data || {};
     switch (ev.kind) {
       case 'message': {
+        const typingIt = d.role === 'agent' && !reduced && typeof d.body === 'string' && !messages.some((x) => x.id === d.id) && (live.turn || live.shown) && live.shown < d.body.length;
+        if (typingIt) {
+          // keep what is already on screen if the reply continues it, so typing carries on from there
+          if (!d.body.startsWith(liveTarget().slice(0, live.shown))) live.shown = 0;
+          live.hold = d;
+          drawLive();
+          break;
+        }
+        if (d.deleted) {
+          messages = messages.filter((x) => x.id !== d.id);
+          drawLog();
+          break;
+        }
         if (!messages.some((x) => x.id === d.id)) messages.push(d);
         else messages = messages.map((x) => (x.id === d.id ? d : x));
         if (d.role === 'agent') {
-          live.segments = [];
-          live.cur = '';
+          live.parts = [];
+          live.shown = 0;
         }
         drawLog();
         drawLive();
         break;
       }
       case 'delta':
-        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: live.started || Date.now() });
-        if (d.block != null) {
-          live.segments.push(d.block);
-          live.cur = '';
-        } else live.cur += d.text || '';
+        if (live.turn !== d.turn_id) resetLive(d.turn_id, live.started || Date.now());
+        liveText(d.block ?? d.text ?? '', d.block != null);
         drawLiveSoon();
         break;
       case 'activity':
         (activity[d.turn_id] ||= []).push(d);
-        if (live.turn !== d.turn_id) Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now() });
-        live.acts.push(d);
+        if (live.turn !== d.turn_id) resetLive(d.turn_id);
+        liveStep(d);
         drawLiveSoon();
         break;
       case 'turn':
         if (d.state === 'start') {
-          Object.assign(live, { turn: d.turn_id, segments: [], cur: '', acts: [], started: Date.now() });
+          if (live.hold) finishHoldNow();
+          resetLive(d.turn_id);
           t.running = { turn: d.turn_id, started: Date.now() };
         } else {
           live.turn = null;
@@ -540,9 +712,13 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         break;
       case 'thread':
         if (d.deleted) return el.replaceChildren(empty('trash', 'This thread was deleted', '', h('button', { class: 'btn', onclick: () => post(`threads/${id}/restore`).then(() => mountThread(el, id, { full, compact, ctx })) }, 'Undo')));
-        t = { ...t, ...d };
-        drawHead();
-        drawLive();
+        {
+          const before = t.steps;
+          t = { ...t, ...d };
+          drawHead();
+          if (before !== t.steps) redrawSteps();
+          else drawLive();
+        }
         break;
       case 'decision':
       case 'artifact':
@@ -553,12 +729,52 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         t.status_note = d.text;
         drawHead();
         break;
+      case 'read': {
+        const ids = new Set(d.ids || []);
+        messages = messages.map((x) => (ids.has(x.id) ? { ...x, pending: d.pending ? 1 : 0 } : x));
+        drawLog();
+        break;
+      }
     }
   });
   let liveTimer = 0;
   const drawLiveSoon = () => liveTimer || (liveTimer = requestAnimationFrame(() => ((liveTimer = 0), drawLive())));
+  // Reveal the next words: a few per frame, more when far behind, so a long block finishes in about a second.
+  let typeTimer = 0;
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function typeOn() {
+    if (typeTimer) return;
+    typeTimer = requestAnimationFrame(() => {
+      typeTimer = 0;
+      const full = liveTarget();
+      if (live.shown > full.length) live.shown = full.length; // a block replaced the streamed text with a shorter one
+      const behind = full.length - live.shown;
+      if (behind <= 0) return finishHold();
+      let next = reduced ? full.length : live.shown + Math.max(3, Math.ceil(behind / 40));
+      const space = full.slice(next).search(/\s/); // end on a word boundary
+      next = space < 0 ? full.length : next + space;
+      live.shown = Math.min(full.length, next);
+      drawLive();
+      if (live.shown >= full.length) finishHold();
+    });
+  }
+  function finishHoldNow() {
+    if (live.hold) live.shown = live.hold.body.length;
+    finishHold();
+  }
+  function finishHold() {
+    if (!live.hold || live.shown < live.hold.body.length) return;
+    const m = live.hold;
+    live.hold = null;
+    live.parts = [];
+    live.shown = 0;
+    if (!messages.some((x) => x.id === m.id)) messages.push(m);
+    drawLog();
+    drawLive();
+  }
 
   async function refreshAll() {
+    Object.assign(live, { hold: null, shown: 0 }); // the reload brings every finished reply
     try {
       [messages] = await Promise.all([loadMessages(), loadActivity()]);
       t = await get('threads/' + id);
@@ -582,14 +798,31 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   document.addEventListener('keydown', keys);
 
   drawHead();
+  drawStepsBtn();
   log.replaceChildren(loading('Loading the conversation'));
   await refreshAll();
   toBottom();
+  // arrived from a search hit: bring that message into view
+  try {
+    const [jump, at] = (sessionStorage.getItem('mr-jump') || '').split('|');
+    if (jump) {
+      // a project page mounts several threads: leave the hit for the one that has it, for a few seconds
+      if (Date.now() - +at > 10000) sessionStorage.removeItem('mr-jump');
+      const m = log.querySelector(`[data-id="${CSS.escape(jump)}"]`);
+      if (m) {
+        sessionStorage.removeItem('mr-jump');
+        m.scrollIntoView({ block: 'center' });
+        m.classList.add('found');
+        setTimeout(() => m.classList.remove('found'), 2600);
+      }
+    }
+  } catch { /* fine */ }
   if (!compact) composer.focus();
   if (t.unread) patch('threads/' + id, { unread: 0 }).catch(() => {});
 
   return () => {
     unlisten();
+    unwatchSteps();
     clearInterval(ticker);
     document.removeEventListener('keydown', keys);
   };
@@ -628,8 +861,79 @@ function actLabel(a) {
   return a.title || a.kind;
 }
 
-/** The agent's steps in a turn: commands, edits, tool calls and their results. Collapsed to one line until opened. */
-export function activityStrip(acts, open) {
+/** A finished turn's steps in order, as timeline parts. The text that became the reply (everything written after
+ * the last step, or the same text as the reply) is left out: the reply itself is shown below them. */
+export function turnParts(acts, reply) {
+  if (!acts?.length) return null;
+  const lastStep = acts.map((a) => a.kind !== 'text').lastIndexOf(true);
+  const r = (reply || '').trim();
+  const parts = acts
+    .filter((a, i) => a.kind !== 'text' || (i < lastStep && a.body.trim() && a.body.trim() !== r && !r.startsWith(a.body.trim())))
+    .map((a) => (a.kind === 'text' ? { k: 'text', text: a.body } : { k: 'act', a }));
+  return parts.length ? parts : null;
+}
+
+/** How a thread shows its steps (thinking, tools, commands): its own choice, else the setting, else collapsed. Groups
+ * the person opened (or closed, when expanded) are remembered by key, so live redraws keep them as they left them. */
+export function stepView(modeOf) {
+  const flip = new Set();
+  let was = modeOf();
+  const mode = () => {
+    const m = modeOf();
+    if (m !== was) (flip.clear(), (was = m));
+    return m;
+  };
+  return {
+    mode,
+    open: (key) => (mode() === 'expanded') !== flip.has(key),
+    toggle: (key) => (flip.has(key) ? flip.delete(key) : flip.add(key)),
+    flipped: (key) => flip.has(key),
+  };
+}
+export const STEP_MODES = [['collapsed', 'Collapsed', 'One line per group of steps; open it to see them'], ['expanded', 'Expanded', 'Every step shown as it happens'], ['hidden', 'Hidden', 'Only what the agent writes to you']];
+const actKey = (a) => `${a.turn_id || ''}:${a.created_at || ''}:${a.kind}:${String(a.title || '').slice(0, 24)}`;
+
+/** A turn as it happened: what the agent wrote between steps, its thinking (folded), and runs of tool calls with
+ * their results (one strip each). Steps follow the view: collapsed, expanded or hidden; nothing opens by itself. */
+export function timeline(parts, view) {
+  const hidden = view.mode() === 'hidden';
+  const out = [];
+  let run = [];
+  const flush = () => {
+    if (run.length && !hidden) out.push(activityStrip(run, view));
+    run = [];
+  };
+  for (const p of parts) {
+    if (p.k === 'text') {
+      flush();
+      out.push(wireMd(h('div', { class: 'md tl-text' }, ...mdNodes(p.text)), openExternal));
+    } else if (p.a.kind === 'thinking') {
+      flush();
+      if (!hidden) out.push(thinkingBlock(p.a, view));
+    } else run.push(p.a);
+  }
+  flush();
+  return out.length ? h('div', { class: 'tl' }, ...out) : null;
+}
+
+function thinkingBlock(a, view) {
+  const key = 'think:' + actKey(a);
+  const text = a.body || '';
+  const open = view.open(key);
+  const body = wireMd(h('div', { class: 'md tl-think-body', hidden: !open }, ...mdNodes(text)), openExternal);
+  const head = h('button', { class: 'tl-think-h' + (open ? ' open' : ''), type: 'button', onclick: () => {
+    view.toggle(key);
+    body.hidden = !body.hidden;
+    head.classList.toggle('open', !body.hidden);
+  } }, ic('sparkle', 12), h('span', {}, 'Thinking'), h('span', { class: 'faint' }, text.replace(/\s+/g, ' ').slice(0, 90)), h('i', { class: 'act-more', html: icon('chevDown', 12) }));
+  return h('div', { class: 'tl-think' }, head, body);
+}
+
+/** The agent's steps in a turn: commands, edits, tool calls and their results. One line until opened (or open, when
+ * the view is expanded); a long result stays folded to its first line until clicked. */
+export function activityStrip(acts, view) {
+  const key = 'run:' + actKey(acts[0]);
+  const open = view.open(key);
   const tools = acts.filter((a) => a.kind === 'tool');
   const errors = acts.filter((a) => a.kind === 'error').length;
   const names = [...new Set(tools.map((a) => (a.title || '').split(':')[0]))].slice(0, 5);
@@ -637,9 +941,10 @@ export function activityStrip(acts, open) {
   const draw = () => list.replaceChildren(...acts.slice(-200).map((a) => {
     const body = a.body || '';
     const long = body.length > 220 || body.includes('\n');
-    const pre = h('pre', { class: 'act-body', hidden: long && a.kind !== 'thinking' }, body);
+    const bkey = 'body:' + actKey(a);
+    const pre = h('pre', { class: 'act-body', hidden: long && a.kind !== 'thinking' && !view.flipped(bkey) }, body);
     return h('div', { class: 'act k-' + a.kind },
-      h('button', { class: 'act-h', onclick: () => long && (pre.hidden = !pre.hidden) },
+      h('button', { class: 'act-h', onclick: () => long && (view.toggle(bkey), (pre.hidden = !pre.hidden)) },
         h('i', { class: 'act-ic', html: icon(a.kind === 'tool' ? TOOL_ICONS[a.title] || (String(a.title).includes(':') ? 'cpu' : 'bolt') : a.kind === 'result' ? 'right' : a.kind === 'thinking' ? 'sparkle' : a.kind === 'error' ? 'warn' : 'info', 12) }),
         h('span', { class: 'act-t' }, a.kind === 'result' ? 'result' : a.kind === 'thinking' ? 'thinking' : a.title || a.kind),
         !long || a.kind === 'thinking' ? null : h('span', { class: 'act-peek' }, body.split('\n')[0].slice(0, 120)),
@@ -648,6 +953,7 @@ export function activityStrip(acts, open) {
   }));
   if (open) draw();
   const head = h('button', { class: 'acts-h', onclick: () => {
+    view.toggle(key);
     list.hidden = !list.hidden;
     if (!list.hidden && !list.childElementCount) draw();
     head.classList.toggle('open', !list.hidden);

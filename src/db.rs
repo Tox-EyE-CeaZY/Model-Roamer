@@ -187,6 +187,32 @@ const MIGRATIONS: &[&str] = &[
         last_used INTEGER
     );
     "#,
+    // who named a thread: auto (a default), agent (set_title) or person (renamed in the app, which agents must keep)
+    "ALTER TABLE threads ADD COLUMN title_by TEXT NOT NULL DEFAULT 'auto';",
+    // artifact folders: nested, filed automatically by project and thread (auto_key) or made by the person or an agent
+    r#"
+    CREATE TABLE folders (
+        id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        project_id TEXT,
+        name TEXT NOT NULL,
+        auto_key TEXT,                      -- project:<id> | thread:<id> | chats, for the folders the app files into
+        named_by TEXT NOT NULL DEFAULT 'auto',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER
+    );
+    CREATE INDEX folders_parent ON folders(parent_id);
+    ALTER TABLE artifacts ADD COLUMN folder_id TEXT;
+    "#,
+    // which usage window ran out (five_hour | weekly), and decisions Model Roamer acts on itself when answered
+    "ALTER TABLE limits ADD COLUMN window TEXT NOT NULL DEFAULT ''; ALTER TABLE decisions ADD COLUMN action TEXT;",
+    // how this thread shows its steps: '' follows the setting, or collapsed | expanded | hidden
+    "ALTER TABLE threads ADD COLUMN steps TEXT NOT NULL DEFAULT '';",
+    // how full the agent's context is and when it compacted: {used, window, compactions, compacted_at, trigger, at}
+    "ALTER TABLE threads ADD COLUMN context TEXT;",
+    // a thread run by buddies (two agents taking turns): {id, name, side, turns, started, sessions: {a, b}}
+    "ALTER TABLE threads ADD COLUMN buddy TEXT;",
 ];
 
 #[derive(Clone)]
@@ -253,7 +279,7 @@ impl Db {
                     ValueRef::Text(t) => {
                         let s = String::from_utf8_lossy(t).into_owned();
                         // JSON columns come back parsed
-                        if (n == "meta" || n == "options" || n == "routing") && (s.starts_with('{') || s.starts_with('[')) {
+                        if (n == "meta" || n == "options" || n == "routing" || n == "context" || n == "buddy") && (s.starts_with('{') || s.starts_with('[')) {
                             serde_json::from_str(&s).unwrap_or(Value::String(s))
                         } else {
                             Value::String(s)

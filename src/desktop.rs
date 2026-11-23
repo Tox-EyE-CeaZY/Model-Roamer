@@ -209,18 +209,14 @@ impl Shell {
         }
     }
 
-    fn agents_busy(&self) -> usize {
-        self.core.running.lock().map(|r| r.values().filter(|x| !x.turn_id.is_empty()).count()).unwrap_or(0)
-    }
-
-    /// Closing a window. The last one: quit, or keep running in the tray while agents work.
+    /// Closing a window. The last one hides to the tray (agents, queued work and threads waiting on a usage reset keep
+    /// going) unless the person turned that off; Quit in the tray menu ends everything.
     fn close(&mut self, id: WindowId, flow: &mut ControlFlow) {
         self.save_places();
         let Some(w) = self.wins.get(&id) else { return };
         let last = self.wins.values().filter(|w| w.window.is_visible()).count() <= 1;
         if last {
-            let busy = self.agents_busy();
-            if self.core.settings()["close_to_tray"] != false && (busy > 0 || self.core.settings()["server"]["share"] == true) && self.tray.is_some() {
+            if self.core.settings()["close_to_tray"] != false && self.tray.is_some() {
                 w.window.set_visible(false);
                 self.hidden_to_tray = true;
                 return;
@@ -382,7 +378,7 @@ fn make_tray(proxy: &EventLoopProxy<Ev>) -> Option<tray_icon::TrayIcon> {
             let _ = p2.send_event(Ev::Tray("open".into()));
         }
     }));
-    TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Model Roamer").with_icon(icon).build().ok()
+    TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("Model Roamer keeps running here. Double-click to open.").with_icon(icon).build().ok()
 }
 
 /// Run the windows until the person quits. `core` is already serving on loopback.

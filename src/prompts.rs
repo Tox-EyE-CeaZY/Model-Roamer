@@ -14,17 +14,40 @@ const HARNESS: &str = include_str!("../prompts/harness.md");
 /// The section of harness.md for one agent (custom agents share the generic one).
 fn harness(agent: &str) -> String {
     let key = match agent {
-        "claude" | "codex" | "gemini" | "antigravity" => agent,
+        "claude" | "codex" | "antigravity" => agent,
         _ => "custom",
     };
+    // a Windows checkout may have CRLF line endings; the section markers below assume LF
+    let text = HARNESS.replace("\r\n", "\n");
     let marker = format!("## @{key}\n");
-    let Some(start) = HARNESS.find(&marker) else { return String::new() };
-    let rest = &HARNESS[start + marker.len()..];
+    let Some(start) = text.find(&marker) else { return String::new() };
+    let rest = &text[start + marker.len()..];
     let end = rest.find("\n## @").map(|i| i + 1).unwrap_or(rest.len());
     rest[..end].trim().to_string()
 }
 
 /// What the lead knows about each agent: strengths, sign-in, headroom, what's running.
+/// For a thread run by a buddy pair: who the other half is, what each of them is for, and how the turns pass.
+fn buddy_section(core: &Core, t: &Value) -> String {
+    let b = &t["buddy"];
+    let Some(def) = b["id"].as_str().and_then(|id| core.buddy_def(id)) else { return String::new() };
+    let side = if b["side"] == "b" { "b" } else { "a" };
+    let other = if side == "a" { "b" } else { "a" };
+    let name = |s: &str| def[s]["agent"].as_str().and_then(|a| core.adapter(a)).map(|a| a.info().name).unwrap_or_default();
+    format!(
+        "\n\n## You and your buddy\n\nThis thread is run by a pair of agents, **{}**, taking turns in the same folder. You are **{}**; your buddy is **{}**.\n\n{}\n\n**Your role:** {}\n\n**Your buddy's role:** {}\n\nHow it works: your reply at the end of your turn goes to your buddy as their next message, and theirs comes back to you. Make it a hand-over: what you did, the state of the files, what you want them to do or decide next. Don't repeat their work; build on it. When the work is complete and needs nothing more from your buddy, end your reply with `{}`: the pair stops there. The pair gets {} turns in all ({} used so far); the person may write to it at any time.\n",
+        def["name"].as_str().unwrap_or("Buddies"),
+        name(side),
+        name(other),
+        def["instructions"].as_str().unwrap_or(""),
+        def[side]["role"].as_str().unwrap_or(""),
+        def[other]["role"].as_str().unwrap_or(""),
+        crate::runner::BUDDY_DONE,
+        def["max_turns"].as_i64().unwrap_or(4).clamp(2, 20),
+        b["turns"].as_i64().unwrap_or(0),
+    )
+}
+
 pub fn fleet(core: &Core) -> String {
     let mut out = String::from("## The fleet you can route work to\n\n");
     let running = core.running.lock().map(|r| r.len()).unwrap_or(0);
@@ -107,6 +130,7 @@ pub fn system(core: &Core, c: &Ctx) -> String {
         _ => CHAT.replace("{{WORKSPACE_LINE}}", &ws_line),
     };
     s.push_str(&body.replace("{{PROJECT}}", pname));
+    s.push_str(&buddy_section(core, t));
     s.push_str("\n\n");
     s.push_str(&harness(agent));
     s.push_str("\n\n## Model Roamer tools\n\n");
@@ -143,6 +167,9 @@ pub fn system(core: &Core, c: &Ctx) -> String {
         chrono::Local::now().format("%A %Y-%m-%d %H:%M %Z"),
         crate::os::os_name()
     ));
+    if role != "lead" && t["title_by"].as_str().unwrap_or("auto") == "auto" {
+        s.push_str("\n**Name this thread first.** Its title is still a placeholder. Your very first action this turn, before any other tool or any reply, is to call the Model Roamer tool `set_title` (3 to 6 words, verb first, see \"Naming your thread\"). The person sees the new name the moment you set it. Do it even for a quick question.\n");
+    }
     s
 }
 

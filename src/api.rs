@@ -3,7 +3,7 @@
 use crate::{
     agents, artifacts,
     core::{CoreRef, TermEntry},
-    git, github, memory, net, procs, runner,
+    forward, git, github, memory, net, procs, runner,
     server::{self, bad, ApiErr, Who, R},
     setup, util,
 };
@@ -27,10 +27,16 @@ pub fn router(core: CoreRef) -> Router {
         .route("/", get(|| async { server::asset("index.html") }))
         .route("/ui/{*path}", get(|Path(p): Path<String>| async move { server::asset(&p) }))
         .route("/favicon.ico", get(|| async { server::asset("favicon.svg") }))
+        .route("/manifest.webmanifest", get(|| async { server::asset("manifest.webmanifest") }))
+        .route("/sw.js", get(|| async { server::asset("sw.js") }))
         .route("/auth", get(auth_cookie))
         .route("/a/{id}/{sig}", get(artifact_file))
         .route("/a/{id}/{sig}/", get(artifact_file))
         .route("/a/{id}/{sig}/{*rest}", get(artifact_file))
+        .route("/fwd/{sig}/{port}", any(forward::serve))
+        .route("/fwd/{sig}/{port}/", any(forward::serve))
+        .route("/fwd/{sig}/{port}/{*rest}", any(forward::serve))
+        .route("/api/forward", post(forward_url))
         .route("/api/hello", get(hello))
         .route("/api/pair", post(pair))
         .route("/api/mcp", post(mcp))
@@ -56,6 +62,8 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/threads/{id}/diff", get(thread_diff))
         .route("/api/threads/{id}/merge", post(thread_merge))
         .route("/api/threads/{id}/pr", post(thread_pr))
+        .route("/api/messages/{id}", axum::routing::patch(patch_message).delete(delete_message))
+        .route("/api/messages/{id}/now", post(message_now))
         .route("/api/decisions/{id}", post(answer_decision))
         .route("/api/search", get(search))
         // memory
@@ -65,12 +73,16 @@ pub fn router(core: CoreRef) -> Router {
         // artifacts
         .route("/api/artifacts", get(list_artifacts).post(create_artifact))
         .route("/api/artifacts/{id}", get(get_artifact).patch(patch_artifact).delete(delete_artifact))
+        .route("/api/folders", get(list_folders).post(create_folder))
+        .route("/api/folders/{id}", axum::routing::patch(patch_folder).delete(delete_folder))
         // agents and tools
         .route("/api/agents", get(list_agents).post(add_custom_agent))
         .route("/api/agents/{id}", get(agent_status).patch(patch_agent).delete(remove_custom_agent))
+        .route("/api/agents/{id}/models", post(refresh_agent_models))
         .route("/api/agents/{id}/test", post(test_agent))
         .route("/api/agents/{id}/limit", delete(clear_limit))
         .route("/api/setup", get(setup_status))
+        .route("/api/activity", get(activity))
         .route("/api/terms", get(list_terms).post(start_term))
         .route("/api/terms/{id}", get(term_buffer).delete(stop_term))
         .route("/api/terms/{id}/input", post(term_input))
@@ -264,6 +276,50 @@ async fn state(State(core): State<CoreRef>, Extension(who): Extension<Who>) -> R
         "task_kinds": agents::TASK_KINDS.iter().map(|(k, d)| json!({ "id": k, "label": d })).collect::<Vec<_>>(),
         "data_dir": core.data.display().to_string(),
     })))
+}
+
+/// Everything going on right now, for the status bar: turns running or queued, installs and sign-ins in their
+/// terminals, agent checks, questions waiting on the person, recent failures and agents that need attention.
+async fn activity(State(core): State<CoreRef>) -> R {
+    let running: std::collections::HashMap<String, i64> = core.running.lock().map(|r| r.iter().map(|(k, v)| (k.clone(), v.started)).collect()).unwrap_or_default();
+    let recent = util::now_ms() - 30 * 60 * 1000;
+    let mut threads = core.db.all(
+        "SELECT t.id, t.kind, t.title, t.agent, t.model, t.status, t.status_note, t.project_id, p.name AS project, t.updated_at
+         FROM threads t LEFT JOIN projects p ON p.id = t.project_id
+         WHERE t.deleted_at IS NULL AND t.resolved = 0 AND (t.status IN ('working','queued','blocked','limited') OR (t.status = 'failed' AND t.updated_at > ?1))
+         ORDER BY t.updated_at DESC LIMIT 40",
+        &[&recent],
+    )?;
+    for t in threads.iter_mut() {
+        if let Some(st) = t["id"].as_str().and_then(|id| running.get(id)) {
+            t["started"] = json!(st);
+            t["status"] = json!("working");
+        }
+    }
+    let decisions = core.db.all(
+        "SELECT d.id, d.thread_id, d.project_id, d.question, t.title, t.kind, d.created_at FROM decisions d JOIN threads t ON t.id = d.thread_id
+         WHERE d.answer IS NULL AND t.deleted_at IS NULL ORDER BY d.created_at DESC LIMIT 20",
+        &[],
+    )?;
+    let terms = core.terms.lock().map(|m| m.iter().filter(|(_, v)| v.exited.is_none()).map(|(k, v)| json!({ "id": k, "label": v.label, "agent": v.agent, "started": v.started })).collect::<Vec<_>>()).unwrap_or_default();
+    let agents: Vec<Value> = core
+        .cached_status()
+        .into_iter()
+        .filter(|a| a["config"]["enabled"] != false && a["installed"] != false)
+        .filter_map(|a| {
+            let state = if a["pending"] == true {
+                "checking"
+            } else if a["limit"]["active"] == true {
+                "limit"
+            } else if a["auth"]["signed_in"] == "no" {
+                "signin"
+            } else {
+                return None;
+            };
+            Some(json!({ "id": a["id"], "name": a["info"]["name"], "state": state, "note": a["limit"]["note"] }))
+        })
+        .collect();
+    Ok(Json(json!({ "threads": threads, "decisions": decisions, "terms": terms, "agents": agents, "update": crate::update::staged_tag(), "quotas": core.quotas() })))
 }
 
 async fn get_settings(State(core): State<CoreRef>) -> R {
@@ -538,6 +594,59 @@ async fn patch_thread(State(core): State<CoreRef>, Path(id): Path<String>, Json(
             f.insert(k.into(), v.clone());
         }
     }
+    // a title the person typed is theirs: agents' set_title leaves it alone from now on
+    if f.contains_key("title") {
+        f.insert("title_by".into(), json!("person"));
+    }
+    let t = core.thread(&id)?;
+    // how this thread shows its steps: a view choice, so it doesn't move the thread up the lists
+    if let Some(v) = b.get("steps") {
+        let v = v.as_str().unwrap_or("");
+        if !["", "collapsed", "expanded", "hidden"].contains(&v) {
+            return Err(bad("Steps can be collapsed, expanded or hidden."));
+        }
+        core.db.exec("UPDATE threads SET steps = ?1 WHERE id = ?2", &[&v, &id])?;
+        if f.is_empty() && b.get("agent").is_none() && b.get("folder").is_none() {
+            let t = core.thread(&id)?;
+            core.bus.emit("thread", t["project_id"].as_str(), Some(&id), t.clone());
+            return Ok(Json(t));
+        }
+    }
+    // another agent (a chat's picker): its CLI can't resume the old one's session, so the next turn starts fresh
+    if let Some(a0) = b["agent"].as_str().filter(|a| !a.is_empty() && (a.starts_with("buddy:") || Some(*a) != t["agent"].as_str() || t["buddy"].is_object())) {
+        // a buddy pair (two agents taking turns) or a single agent
+        let (a_s, m_s, pair) = core.pick_agent(a0, b["model"].as_str().unwrap_or("")).map_err(|e| bad(e.to_string()))?;
+        let a = a_s.as_str();
+        core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&pair.as_ref().map(|p| p.to_string()), &id])?;
+        if pair.is_some() {
+            f.insert("model".into(), json!(m_s));
+        }
+        if core.adapter(a).is_none() {
+            return Err(bad(format!("There's no agent called {a}.")));
+        }
+        if core.running.lock().map(|r| r.contains_key(&id)).unwrap_or(false) {
+            return Err(bad("Wait for this turn to finish (or stop it) before switching agents."));
+        }
+        f.insert("agent".into(), json!(a));
+        f.insert("session_id".into(), json!(""));
+        f.insert("session_agent".into(), json!(""));
+        if !f.contains_key("model") {
+            f.insert("model".into(), core.agent_cfg(a)["model"].clone());
+        }
+    }
+    // a chat's folder: a path, or "" for a fresh one of its own
+    if let Some(folder) = b["folder"].as_str() {
+        if t["kind"] != "chat" {
+            return Err(bad("Only a chat's folder can be changed here."));
+        }
+        let folder = folder.trim();
+        if !folder.is_empty() && !std::path::Path::new(folder).is_dir() {
+            return Err(bad(format!("{folder} isn't a folder on this machine.")));
+        }
+        f.insert("workspace".into(), json!(if folder.is_empty() { String::new() } else { format!("path:{folder}") }));
+        f.insert("session_id".into(), json!(""));
+        f.insert("session_agent".into(), json!(""));
+    }
     Ok(Json(core.set_thread(&id, &Value::Object(f))?))
 }
 
@@ -583,6 +692,7 @@ async fn send_message(State(core): State<CoreRef>, Path(id): Path<String>, Exten
         Who::Local => "You".to_string(),
         Who::Device(d) => core.db.one("SELECT name FROM devices WHERE id = ?1", &[d]).ok().flatten().and_then(|r| r["name"].as_str().map(|n| format!("You ({n})"))).unwrap_or_else(|| "You".into()),
     };
+    runner::buddy_reset(&core, &id);
     let m = runner::post(&core, &id, "user", &author, &text, json!({ "files": b["files"] }), true)?;
     // the person spoke to a worker directly: the lead should know
     if matches!(t["kind"].as_str(), Some("worker" | "review")) {
@@ -594,6 +704,51 @@ async fn send_message(State(core): State<CoreRef>, Path(id): Path<String>, Exten
         }
     }
     Ok(Json(m))
+}
+
+/// A message the person wrote that the agent hasn't read yet: only those can still be changed or taken back.
+fn waiting_message(core: &CoreRef, id: &str) -> Result<Value, server::ApiErr> {
+    let m = core.db.one("SELECT * FROM messages WHERE id = ?1", &[&id]).ok().flatten().ok_or_else(|| bad("That message isn't there."))?;
+    if m["pending"] != 1 || m["role"] != "user" || m["meta"]["kickoff"] == true {
+        return Err(bad("The agent has already read that message."));
+    }
+    Ok(m)
+}
+
+async fn patch_message(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
+    let m = waiting_message(&core, &id)?;
+    let text = s(&b, "text");
+    if text.is_empty() {
+        return Err(bad("A message can't be empty. Delete it instead."));
+    }
+    // the agent may pick it up between the check and the write: only change it while it's still waiting
+    if core.db.exec("UPDATE messages SET body = ?1 WHERE id = ?2 AND pending = 1", &[&text, &id])? == 0 {
+        return Err(bad("The agent has already read that message."));
+    }
+    let m = core.db.one("SELECT * FROM messages WHERE id = ?1", &[&id])?.unwrap_or(m);
+    let t = core.thread(m["thread_id"].as_str().unwrap_or(""))?;
+    core.bus.emit("message", t["project_id"].as_str(), t["id"].as_str(), m.clone());
+    Ok(Json(m))
+}
+
+async fn delete_message(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let m = waiting_message(&core, &id)?;
+    if core.db.exec("DELETE FROM messages WHERE id = ?1 AND pending = 1", &[&id])? == 0 {
+        return Err(bad("The agent has already read that message."));
+    }
+    let tid = m["thread_id"].as_str().unwrap_or("").to_string();
+    let t = core.thread(&tid)?;
+    core.bus.emit("message", t["project_id"].as_str(), Some(&tid), json!({ "id": id, "deleted": true }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// "Send now": stop what the agent is doing so it reads this message right away (it keeps its session and carries on
+/// from there). Agents can't take a message in the middle of a turn, so this is the closest there is.
+async fn message_now(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let m = waiting_message(&core, &id)?;
+    let tid = m["thread_id"].as_str().unwrap_or("").to_string();
+    runner::cancel(&core, &tid, "idle", "so it can read your message").await;
+    Ok(Json(core.thread(&tid)?))
 }
 
 async fn thread_activity(State(core): State<CoreRef>, Path(id): Path<String>, q: Q) -> R {
@@ -673,17 +828,28 @@ async fn answer_decision(State(core): State<CoreRef>, Path(id): Path<String>, Js
 async fn search(State(core): State<CoreRef>, q: Q) -> R {
     let text = q.get("q").cloned().unwrap_or_default();
     if text.trim().len() < 2 {
-        return Ok(Json(json!({ "threads": [], "messages": [], "memory": [] })));
+        return Ok(Json(json!({ "threads": [], "messages": [], "memory": [], "projects": [], "artifacts": [] })));
     }
     let like = format!("%{}%", text.trim());
-    let threads = core.db.all("SELECT id, title, agent, status, project_id, kind FROM threads WHERE deleted_at IS NULL AND title LIKE ?1 ORDER BY updated_at DESC LIMIT 20", &[&like])?;
-    let messages = core.db.all(
-        "SELECT m.id, m.thread_id, m.author, substr(m.body, max(1, instr(lower(m.body), lower(?2)) - 60), 200) AS snippet, m.created_at, t.title, t.project_id FROM messages m JOIN threads t ON t.id = m.thread_id
-         WHERE t.deleted_at IS NULL AND m.body LIKE ?1 ORDER BY m.created_at DESC LIMIT 30",
+    let snip = |col: &str| format!("substr({col}, max(1, instr(lower({col}), lower(?2)) - 60), 200)");
+    // a thread matches by its title or by the brief it was given
+    let threads = core.db.all(
+        &format!("SELECT id, title, agent, status, project_id, kind, CASE WHEN title LIKE ?1 THEN '' ELSE {} END AS snippet FROM threads WHERE deleted_at IS NULL AND (title LIKE ?1 OR instructions LIKE ?1 OR criteria LIKE ?1) ORDER BY (title LIKE ?1) DESC, updated_at DESC LIMIT 20", snip("instructions")),
         &[&like, &text.trim()],
     )?;
+    // messages in chats, the project chat and every thread of a project
+    let messages = core.db.all(
+        &format!("SELECT m.id, m.thread_id, m.author, m.role, {} AS snippet, m.created_at, t.title, t.project_id, t.kind FROM messages m JOIN threads t ON t.id = m.thread_id
+         WHERE t.deleted_at IS NULL AND m.role != 'wake' AND m.body LIKE ?1 ORDER BY m.created_at DESC LIMIT 40", snip("m.body")),
+        &[&like, &text.trim()],
+    )?;
+    let projects = core.db.all(
+        &format!("SELECT id, name, CASE WHEN name LIKE ?1 THEN '' ELSE {} END AS snippet FROM projects WHERE deleted_at IS NULL AND (name LIKE ?1 OR instructions LIKE ?1 OR folder LIKE ?1 OR repo_url LIKE ?1) ORDER BY updated_at DESC LIMIT 8", snip("instructions")),
+        &[&like, &text.trim()],
+    )?;
+    let artifacts = core.db.all("SELECT id, title, kind, project_id, description FROM artifacts WHERE deleted_at IS NULL AND (title LIKE ?1 OR description LIKE ?1) ORDER BY updated_at DESC LIMIT 10", &[&like])?;
     let mem = memory::search(&core, q.get("project").map(String::as_str), &text).unwrap_or_default();
-    Ok(Json(json!({ "threads": threads, "messages": messages, "memory": mem })))
+    Ok(Json(json!({ "threads": threads, "messages": messages, "memory": mem, "projects": projects, "artifacts": artifacts })))
 }
 
 // ------------------------------------------------------------------------------------------------ memory
@@ -758,7 +924,11 @@ async fn get_artifact(State(core): State<CoreRef>, Path(id): Path<String>) -> R 
 }
 
 async fn create_artifact(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
-    let a = artifacts::publish(&core, b["project_id"].as_str().filter(|p| !p.is_empty()), None, &s(&b, "title"), &s(&b, "description"), &s(&b, "kind"), b["path"].as_str(), b["content"].as_str(), None)?;
+    let mut a = artifacts::publish(&core, b["project_id"].as_str().filter(|p| !p.is_empty()), None, &s(&b, "title"), &s(&b, "description"), &s(&b, "kind"), b["path"].as_str(), b["content"].as_str(), None, None)?;
+    if let Some(f) = b["folder_id"].as_str().filter(|f| !f.is_empty()) {
+        core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &a["id"].as_str().unwrap_or("")])?;
+        a["folder_id"] = json!(f);
+    }
     Ok(Json(with_urls(&core, a)))
 }
 
@@ -772,9 +942,100 @@ async fn patch_artifact(State(core): State<CoreRef>, Path(id): Path<String>, Jso
     if b["restore"].as_bool() == Some(true) {
         core.db.exec("UPDATE artifacts SET deleted_at = NULL WHERE id = ?1", &[&id])?;
     }
+    if let Some(f) = b.get("folder_id") {
+        let f = f.as_str().filter(|f| !f.is_empty());
+        if let Some(f) = f {
+            core.db.one("SELECT id FROM folders WHERE id = ?1 AND deleted_at IS NULL", &[&f])?.ok_or_else(|| bad("That folder is gone."))?;
+        }
+        core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &id])?;
+    }
     let a = core.db.one("SELECT * FROM artifacts WHERE id = ?1", &[&id])?.unwrap_or_default();
     core.bus.emit("artifact", a["project_id"].as_str(), None, a.clone());
     Ok(Json(with_urls(&core, a)))
+}
+
+/// The folder tree. With ?project=, that project's own folder (made if needed) and everything under it.
+async fn list_folders(State(core): State<CoreRef>, q: Q) -> R {
+    let all = core.db.all(
+        "SELECT f.id, f.parent_id, f.project_id, f.name, f.auto_key, f.named_by, f.updated_at,
+                (SELECT COUNT(*) FROM artifacts a WHERE a.folder_id = f.id AND a.deleted_at IS NULL) AS count
+         FROM folders f WHERE f.deleted_at IS NULL ORDER BY f.auto_key IS NULL, lower(f.name)",
+        &[],
+    )?;
+    let Some(p) = q.get("project").filter(|p| !p.is_empty()) else { return Ok(Json(json!({ "folders": all, "root": null }))) };
+    let root = artifacts::root_folder(&core, Some(p))?;
+    let keep: std::collections::HashSet<String> = artifacts::subtree(&core, &root).into_iter().collect();
+    let mut folders: Vec<Value> = all.into_iter().filter(|f| f["id"].as_str().is_some_and(|i| keep.contains(i))).collect();
+    if !folders.iter().any(|f| f["id"] == root.as_str()) {
+        folders.extend(core.db.one("SELECT id, parent_id, project_id, name, auto_key, named_by, updated_at, 0 AS count FROM folders WHERE id = ?1", &[&root])?);
+    }
+    Ok(Json(json!({ "folders": folders, "root": root })))
+}
+
+async fn create_folder(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
+    let name = s(&b, "name");
+    if name.trim().is_empty() {
+        return Err(bad("Give the folder a name."));
+    }
+    let parent = b["parent_id"].as_str().filter(|p| !p.is_empty());
+    let project = match parent {
+        Some(p) => core.db.one("SELECT project_id FROM folders WHERE id = ?1 AND deleted_at IS NULL", &[&p])?.ok_or_else(|| bad("That folder is gone."))?["project_id"].as_str().map(str::to_string),
+        None => None,
+    };
+    let name: String = name.trim().chars().take(80).collect();
+    if core.db.one("SELECT id FROM folders WHERE IFNULL(parent_id, '') = ?1 AND lower(name) = lower(?2) AND deleted_at IS NULL", &[&parent.unwrap_or(""), &name])?.is_some() {
+        return Err(bad(format!("There's already a folder called {name} here.")));
+    }
+    let id = util::id("fld");
+    let now = util::now_ms();
+    core.db.exec(
+        "INSERT INTO folders(id, parent_id, project_id, name, named_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'person', ?5, ?5)",
+        &[&id, &parent, &project, &name, &now],
+    )?;
+    core.bus.emit("artifact", project.as_deref(), None, json!({ "folder": id }));
+    Ok(Json(core.db.one("SELECT *, 0 AS count FROM folders WHERE id = ?1", &[&id])?.unwrap_or_default()))
+}
+
+async fn patch_folder(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
+    let f = core.db.one("SELECT * FROM folders WHERE id = ?1", &[&id])?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such folder".into()))?;
+    let now = util::now_ms();
+    if b["restore"].as_bool() == Some(true) {
+        // everything deleted with it comes back with it
+        if let Some(at) = f["deleted_at"].as_i64() {
+            for x in artifacts::subtree(&core, &id) {
+                core.db.exec("UPDATE folders SET deleted_at = NULL WHERE id = ?1 AND deleted_at = ?2", &[&x, &at])?;
+                core.db.exec("UPDATE artifacts SET deleted_at = NULL WHERE folder_id = ?1 AND deleted_at = ?2", &[&x, &at])?;
+            }
+        }
+    }
+    if let Some(n) = b["name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
+        let n: String = n.chars().take(80).collect();
+        core.db.exec("UPDATE folders SET name = ?1, named_by = 'person', updated_at = ?2 WHERE id = ?3", &[&n, &now, &id])?;
+    }
+    if let Some(p) = b.get("parent_id") {
+        let p = p.as_str().filter(|p| !p.is_empty());
+        if let Some(p) = p {
+            if artifacts::is_within(&core, p, &id) {
+                return Err(bad("A folder can't go inside itself."));
+            }
+        }
+        core.db.exec("UPDATE folders SET parent_id = ?1, updated_at = ?2 WHERE id = ?3", &[&p, &now, &id])?;
+    }
+    core.bus.emit("artifact", f["project_id"].as_str(), None, json!({ "folder": id }));
+    Ok(Json(core.db.one("SELECT * FROM folders WHERE id = ?1", &[&id])?.unwrap_or_default()))
+}
+
+/// Deletes a folder with everything in it; PATCH {restore: true} brings it all back.
+async fn delete_folder(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let now = util::now_ms();
+    let mut n = 0;
+    for x in artifacts::subtree(&core, &id) {
+        core.db.exec("UPDATE folders SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL", &[&now, &x])?;
+        n += core.db.scalar_i64("SELECT COUNT(*) FROM artifacts WHERE folder_id = ?1 AND deleted_at IS NULL", &[&x])?;
+        core.db.exec("UPDATE artifacts SET deleted_at = ?1 WHERE folder_id = ?2 AND deleted_at IS NULL", &[&now, &x])?;
+    }
+    core.bus.emit("artifact", None, None, json!({ "folder": id, "deleted": true }));
+    Ok(Json(json!({ "ok": true, "artifacts": n })))
 }
 
 async fn delete_artifact(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
@@ -782,6 +1043,12 @@ async fn delete_artifact(State(core): State<CoreRef>, Path(id): Path<String>) ->
     core.db.exec("UPDATE artifacts SET deleted_at = ?1 WHERE id = ?2", &[&now, &id])?;
     core.bus.emit("artifact", None, None, json!({ "id": id, "deleted": true }));
     Ok(Json(json!({ "ok": true })))
+}
+
+/// A page on this machine's localhost, as a link another device can open (served by the server under /fwd/).
+async fn forward_url(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
+    let (path, port) = forward::rewrite(&core, &s(&b, "url"))?;
+    Ok(Json(json!({ "path": path, "port": port })))
 }
 
 async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String, String>>, q: Q) -> Response {
@@ -818,6 +1085,14 @@ async fn agent_status(State(core): State<CoreRef>, Path(id): Path<String>) -> R 
     Ok(Json(core.agent_status(&id).await))
 }
 
+/// Ask the agent's CLI for its models now.
+async fn refresh_agent_models(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    if core.adapter(&id).is_none() {
+        return Err(bad("Unknown agent"));
+    }
+    Ok(Json(core.agent_status_with(&id, true).await))
+}
+
 async fn patch_agent(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
     if core.adapter(&id).is_none() {
         return Err(bad("Unknown agent"));
@@ -839,7 +1114,7 @@ async fn patch_agent(State(core): State<CoreRef>, Path(id): Path<String>, Json(b
 async fn add_custom_agent(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
     let mut list = core.settings()["custom_agents"].as_array().cloned().unwrap_or_default();
     let id = util::slug(&s(&b, "id").replace(' ', "-"), 24);
-    if ["claude", "codex", "gemini", "antigravity"].contains(&id.as_str()) {
+    if ["claude", "codex", "antigravity"].contains(&id.as_str()) {
         return Err(bad("That id belongs to a built-in agent."));
     }
     if s(&b, "command").is_empty() {
@@ -880,6 +1155,7 @@ async fn test_agent(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
         scratch: dir.clone(),
         extra_args: vec![],
         headless: core.headless,
+        lead: false,
     };
     let mut launch = a.launch(&spec)?;
     launch.pty = launch.pty || a.needs_pty();

@@ -6,7 +6,7 @@ import { icon } from '../icons.js';
 import { get, post, del, listen } from '../api.js';
 import { S, watch, setSetting } from '../store.js';
 import { go, switchTo } from '../app.js';
-import { isDesktop, native, openExternal } from '../native.js';
+import { isDesktop, native, openExternal, openOutside } from '../native.js';
 import { dialog, toast } from '../ui.js';
 import { runStep } from '../term.js';
 import { ic, field, input, select, seg, toggle, loading, errorBox, empty, kicker, copyable, timeAgo, pickFolder } from '../common.js';
@@ -61,11 +61,13 @@ function windows(el) {
   const s = S.settings;
   el.replaceChildren(
     h('section', { class: 'panel cut' }, kicker('Threads'),
+      field('Agents’ steps', seg([['collapsed', 'Collapsed'], ['expanded', 'Expanded'], ['hidden', 'Hidden']], s.steps || 'collapsed', (v) => save({ steps: v })),
+        'Thinking, tools and commands. Collapsed shows one line you can open; nothing opens by itself while an agent works. Any chat can choose its own from “Steps” under its message box.'),
       toggle(!!s.popout_threads, (v) => save({ popout_threads: v }), { label: 'Open threads in their own windows (like popping out an email)' }),
       h('p', { class: 'faint small' }, 'Either way: Ctrl+Shift+O, the pop-out button, or a middle click on a thread card opens it in a window of its own. Each window remembers where it was.')),
     isDesktop ? h('section', { class: 'panel cut' }, kicker('This app'),
       toggle(s.restore_windows !== false, (v) => save({ restore_windows: v }), { label: 'Reopen the windows I had open last time' }),
-      toggle(s.close_to_tray !== false, (v) => save({ close_to_tray: v }), { label: 'Keep running in the tray when I close the window while agents are working or sharing is on' })) : null);
+      toggle(s.close_to_tray !== false, (v) => save({ close_to_tray: v }), { label: 'Keep running in the background (in the tray) when I close the window, so agents and waiting work carry on. Quit from the tray icon.' })) : null);
 }
 
 // ------------------------------------------------------------ GitHub
@@ -342,7 +344,7 @@ async function about(el) {
   el.replaceChildren(
     h('section', { class: 'panel cut about' },
       h('div', { class: 'about-mark', html: `<svg viewBox="0 0 40 40" width="56" height="56">${(await import('../icons.js')).MARK}</svg>` }),
-      h('div', {}, h('h2', {}, 'Model Roamer'), h('p', { class: 'faint' }, `Version ${S.version} · ${S.server.os} · ${S.server.headless ? 'server' : isDesktop ? 'desktop' : 'browser'}`), h('p', { class: 'small' }, 'An orchestration studio for Claude Code, Codex, Gemini CLI and Antigravity. Part of the Roamer suite.'))),
+      h('div', {}, h('h2', {}, 'Model Roamer'), h('p', { class: 'faint' }, `Version ${S.version} · ${S.server.os} · ${S.server.headless ? 'server' : isDesktop ? 'desktop' : 'browser'}`), h('p', { class: 'small' }, 'An orchestration studio for Claude Code, Codex and Antigravity. Part of the Roamer suite.'))),
     h('section', { class: 'panel cut' }, kicker('Updates'), upd),
     h('section', { class: 'panel cut' }, kicker('The Roamer suite'), suite),
     h('section', { class: 'panel cut' }, kicker('Data and logs'),
@@ -392,7 +394,7 @@ async function about(el) {
   });
   check();
   get('suite').then((s) => suite.replaceChildren(...s.apps.map((a) => h('div', { class: 'suite-app cut' }, h('b', {}, a.name), h('small', { class: 'faint' }, a.about),
-    h('div', { class: 'row' }, a.open ? h('button', { class: 'btn sm primary', onclick: () => openExternal(a.open) }, 'Open') : a.running === true && a.id === 'model-roamer' ? h('span', { class: 'status acc' }, 'You’re here') : null, h('button', { class: 'btn sm', onclick: () => openExternal(a.repo) }, 'GitHub')))))).catch(() => {});
+    h('div', { class: 'row' }, a.open ? h('button', { class: 'btn sm primary', onclick: () => openOutside(a.open) }, 'Open') : a.running === true && a.id === 'model-roamer' ? h('span', { class: 'status acc' }, 'You’re here') : null, h('button', { class: 'btn sm', onclick: () => openExternal(a.repo) }, 'GitHub')))))).catch(() => {});
   return un;
 }
 

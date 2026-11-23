@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// The lead's built-in tools: reading and research only. No Bash, Edit, Write, NotebookEdit or subagents.
+pub const LEAD_TOOLS: &str = "Read,Glob,Grep,WebFetch,WebSearch";
+
 pub struct Claude;
 
 impl AgentAdapter for Claude {
@@ -15,11 +18,11 @@ impl AgentAdapter for Claude {
             summary: "Best lead. Plans, breaks work down, writes and refactors core code, reviews others' work carefully.".into(),
             site: "https://claude.com/claude-code".into(),
             models: vec![
-                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Claude Code is set to".into() },
-                ModelOpt { id: "opus".into(), label: "Opus (latest)".into(), note: "Most capable; the default lead".into() },
-                ModelOpt { id: "fable".into(), label: "Fable (latest)".into(), note: "Fast and strong".into() },
-                ModelOpt { id: "sonnet".into(), label: "Sonnet (latest)".into(), note: "Balanced".into() },
-                ModelOpt { id: "haiku".into(), label: "Haiku (latest)".into(), note: "Quick small tasks".into() },
+                ModelOpt { id: "".into(), label: "CLI default".into(), note: "Whatever Claude Code is set to".into(), ..Default::default() },
+                ModelOpt { id: "opus".into(), label: "Opus (latest)".into(), note: "Most capable; the default lead".into(), ..Default::default() },
+                ModelOpt { id: "fable".into(), label: "Fable (latest)".into(), note: "Fast and strong".into(), ..Default::default() },
+                ModelOpt { id: "sonnet".into(), label: "Sonnet (latest)".into(), note: "Balanced".into(), ..Default::default() },
+                ModelOpt { id: "haiku".into(), label: "Haiku (latest)".into(), note: "Quick small tasks".into(), ..Default::default() },
             ],
             mcp: true,
             can_lead: true,
@@ -53,6 +56,11 @@ impl AgentAdapter for Claude {
             }
             .into(),
         );
+        if spec.lead {
+            // the lead reads and coordinates; its built-in tools are the read-only ones (its roamer tools are MCP)
+            a.push("--tools".into());
+            a.push(LEAD_TOOLS.into());
+        }
         if !spec.system.trim().is_empty() {
             let f = scratch_file(&spec.scratch, "system.md", &spec.system)?;
             a.push("--append-system-prompt-file".into());
@@ -73,7 +81,26 @@ impl AgentAdapter for Claude {
         }
         a.extend(spec.extra_args.iter().cloned());
         // the prompt goes in on stdin: no quoting trouble, no length cap
-        Ok(Launch { args: a, stdin: Some(spec.prompt.clone()), cwd: Some(spec.cwd.clone()), env: vec![("CLAUDE_CODE_ENTRYPOINT".into(), "model-roamer".into())], pty: false })
+        Ok(Launch { args: a, stdin: Some(spec.prompt.clone()), cwd: Some(spec.cwd.clone()), env: vec![("CLAUDE_CODE_ENTRYPOINT".into(), "model-roamer".into()), ("ENABLE_TOOL_SEARCH".into(), "false".into())], pty: false })
+    }
+
+    /// Claude Code has no "models" command, but its SDK handshake answers with the model picker's list.
+    fn models_probe(&self) -> Option<ModelsProbe> {
+        Some(ModelsProbe {
+            args: vec!["-p".into(), "--input-format".into(), "stream-json".into(), "--output-format".into(), "stream-json".into(), "--verbose".into()],
+            stdin: Some("{\"type\":\"control_request\",\"request_id\":\"models\",\"request\":{\"subtype\":\"initialize\"}}\n".into()),
+        })
+    }
+
+    fn models_read(&self, out: &str) -> Vec<ModelOpt> {
+        out.lines()
+            .filter_map(json_line)
+            .find(|v| v["type"] == "control_response")
+            .map(|v| {
+                let r = if v["response"]["response"].is_object() { &v["response"]["response"] } else { &v["response"] };
+                parse_model_list(&r["models"].to_string())
+            })
+            .unwrap_or_default()
     }
 
     fn parse(&self, line: &str, st: &mut Value) -> Vec<AgentEvent> {
@@ -83,6 +110,10 @@ impl AgentAdapter for Claude {
         let mut out = vec![];
         match v["type"].as_str().unwrap_or("") {
             "system" => {
+                if v["subtype"] == "compact_boundary" {
+                    let m = &v["compact_metadata"];
+                    out.push(AgentEvent::Compacted { trigger: s(&m["trigger"]), before: m["pre_tokens"].as_i64().unwrap_or(0) });
+                }
                 if let Some(id) = v["session_id"].as_str() {
                     if st["sid"].as_str() != Some(id) {
                         st["sid"] = json!(id);
@@ -99,6 +130,13 @@ impl AgentAdapter for Claude {
             "assistant" => {
                 if !v["parent_tool_use_id"].is_null() {
                     return out; // a subagent's inner messages: the tool result says what came of them
+                }
+                // what this request sent is what the context holds now
+                let u = &v["message"]["usage"];
+                let used = u["input_tokens"].as_i64().unwrap_or(0) + u["cache_read_input_tokens"].as_i64().unwrap_or(0) + u["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                if used > 0 {
+                    st["ctx"] = json!(used);
+                    out.push(AgentEvent::Context { used, window: st["window"].as_i64().unwrap_or(0) });
                 }
                 for c in v["message"]["content"].as_array().cloned().unwrap_or_default() {
                     match c["type"].as_str().unwrap_or("") {
@@ -132,12 +170,39 @@ impl AgentAdapter for Claude {
             }
             "rate_limit_event" => {
                 let info = &v["rate_limit_info"];
+                let mut q = json!({});
+                for (k, name) in [("five_hour", "five_hour"), ("seven_day", "weekly")] {
+                    let w = &info["unifiedWindows"][k];
+                    if let Some(u) = w["utilization"].as_f64() {
+                        q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": w["resetsAt"].as_i64().map(epoch_ms) });
+                    }
+                }
+                // older CLIs: one window per event, {rateLimitType, utilization, resetsAt}
+                if q.as_object().is_some_and(|o| o.is_empty()) {
+                    if let Some(u) = info["utilization"].as_f64() {
+                        let name = match info["rateLimitType"].as_str().unwrap_or("") {
+                            "five_hour" => Some("five_hour"),
+                            t if t.starts_with("seven_day") => Some("weekly"),
+                            _ => None,
+                        };
+                        if let Some(name) = name {
+                            q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": info["resetsAt"].as_i64().map(epoch_ms) });
+                        }
+                    }
+                }
+                if q.as_object().is_some_and(|o| !o.is_empty()) {
+                    out.push(AgentEvent::Quota(q));
+                }
                 if info["status"] == "rejected" {
                     let until = info["resetsAt"].as_i64().map(|t| if t < 10_000_000_000 { t * 1000 } else { t });
                     out.push(AgentEvent::Limit { until, message: format!("Claude {} limit reached", s(&info["rateLimitType"]).replace('_', " ")) });
                 }
             }
             "result" => {
+                // the model's window, from the per-model totals
+                if let Some(w) = v["modelUsage"].as_object().and_then(|m| m.values().filter_map(|x| x["contextWindow"].as_i64()).max()) {
+                    out.push(AgentEvent::Context { used: st["ctx"].as_i64().unwrap_or(0), window: w });
+                }
                 let u = &v["usage"];
                 out.push(AgentEvent::Usage {
                     input: u["input_tokens"].as_i64().unwrap_or(0) + u["cache_creation_input_tokens"].as_i64().unwrap_or(0),
@@ -225,5 +290,25 @@ mod tests {
         assert!(e.iter().any(|x| matches!(x, AgentEvent::Final(t) if t == "Done")));
         let e = c.parse(r#"{"type":"result","subtype":"success","is_error":true,"result":"Claude AI usage limit reached|1735689600"}"#, &mut st);
         assert!(e.iter().any(|x| matches!(x, AgentEvent::Limit { .. })));
+    }
+}
+
+#[cfg(test)]
+mod lead_tests {
+    use super::*;
+    use crate::agents::{AgentAdapter, Autonomy, TurnSpec};
+
+    fn spec(lead: bool) -> TurnSpec {
+        let d = std::env::temp_dir();
+        TurnSpec { prompt: "hi".into(), system: String::new(), session: None, cwd: d.clone(), model: String::new(), effort: String::new(), autonomy: Autonomy::Full, mcp: None, extra_dirs: vec![], scratch: d, extra_args: vec![], headless: true, lead }
+    }
+
+    #[test]
+    fn lead_gets_read_only_tools() {
+        let a = Claude.launch(&spec(true)).unwrap().args;
+        let i = a.iter().position(|x| x == "--tools").expect("--tools");
+        assert_eq!(a[i + 1], LEAD_TOOLS);
+        assert!(!LEAD_TOOLS.contains("Bash") && !LEAD_TOOLS.contains("Edit") && !LEAD_TOOLS.contains("Write"));
+        assert!(!Claude.launch(&spec(false)).unwrap().args.contains(&"--tools".to_string()));
     }
 }

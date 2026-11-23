@@ -56,11 +56,16 @@ fn copy_dir(from: &Path, to: &Path, budget: &mut u64) -> Result<()> {
 
 /// Publish (or update, by title within the project) an artifact from a file/folder in the workspace or from content.
 #[allow(clippy::too_many_arguments)]
-pub fn publish(core: &Core, project: Option<&str>, thread: Option<&str>, title: &str, description: &str, kind: &str, path: Option<&str>, content: Option<&str>, workspace: Option<&Path>) -> Result<Value> {
+pub fn publish(core: &Core, project: Option<&str>, thread: Option<&str>, title: &str, description: &str, kind: &str, path: Option<&str>, content: Option<&str>, workspace: Option<&Path>, folder: Option<&str>) -> Result<Value> {
     let title = title.trim();
     if title.is_empty() {
         bail!("Give the artifact a title.");
     }
+    // where it goes: the folder asked for (made if missing), else where it already is, else its thread's folder
+    let asked = match folder.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => Some(folder_for_path(core, project, thread, f)?),
+        None => None,
+    };
     let existing = core.db.one("SELECT * FROM artifacts WHERE title = ?1 AND IFNULL(project_id, '') = ?2 AND deleted_at IS NULL", &[&title, &project.unwrap_or("")])?;
     let id = existing.as_ref().and_then(|e| e["id"].as_str().map(str::to_string)).unwrap_or_else(|| util::id("art"));
     let dir = core.artifacts_dir().join(&id);
@@ -129,18 +134,153 @@ pub fn publish(core: &Core, project: Option<&str>, thread: Option<&str>, title: 
     let now = util::now_ms();
     if existing.is_some() {
         core.db.exec(
-            "UPDATE artifacts SET kind = ?1, entry = ?2, description = CASE WHEN ?3 = '' THEN description ELSE ?3 END, version = version + 1, updated_at = ?4, thread_id = COALESCE(?5, thread_id) WHERE id = ?6",
-            &[&kind, &entry, &description, &now, &thread, &id],
+            "UPDATE artifacts SET kind = ?1, entry = ?2, description = CASE WHEN ?3 = '' THEN description ELSE ?3 END, version = version + 1, updated_at = ?4, thread_id = COALESCE(?5, thread_id), folder_id = COALESCE(?6, folder_id) WHERE id = ?7",
+            &[&kind, &entry, &description, &now, &thread, &asked, &id],
         )?;
     } else {
+        let folder_id = match asked {
+            Some(f) => f,
+            None => auto_folder(core, project, thread)?,
+        };
         core.db.exec(
-            "INSERT INTO artifacts(id, project_id, thread_id, title, kind, entry, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            &[&id, &project, &thread, &title, &kind, &entry, &description, &now],
+            "INSERT INTO artifacts(id, project_id, thread_id, title, kind, entry, description, created_at, updated_at, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+            &[&id, &project, &thread, &title, &kind, &entry, &description, &now, &folder_id],
         )?;
     }
     let a = core.db.one("SELECT * FROM artifacts WHERE id = ?1", &[&id])?.unwrap_or(json!({}));
     core.bus.emit("artifact", project, thread, a.clone());
     Ok(a)
+}
+
+// ------------------------------------------------------------ folders
+
+/// A folder the app keeps filing into (a project's, a thread's, the chats'), made the first time it's needed. Its name
+/// follows the project or thread until the person renames it. A folder the person deleted is made again.
+fn ensure_auto(core: &Core, key: &str, name: &str, parent: Option<&str>, project: Option<&str>) -> Result<String> {
+    let now = util::now_ms();
+    if let Some(f) = core.db.one("SELECT id, name, named_by FROM folders WHERE auto_key = ?1 AND deleted_at IS NULL", &[&key])? {
+        let id = f["id"].as_str().unwrap_or("").to_string();
+        if f["named_by"] == "auto" && f["name"].as_str() != Some(name) && !name.is_empty() {
+            core.db.exec("UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3", &[&name, &now, &id])?;
+        }
+        return Ok(id);
+    }
+    let id = util::id("fld");
+    core.db.exec(
+        "INSERT INTO folders(id, parent_id, project_id, name, auto_key, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        &[&id, &parent, &project, &name, &key, &now],
+    )?;
+    Ok(id)
+}
+
+/// The top folder for a project's files, or the one that holds every chat's.
+pub fn root_folder(core: &Core, project: Option<&str>) -> Result<String> {
+    match project {
+        Some(p) => {
+            let name = core.db.one("SELECT name FROM projects WHERE id = ?1", &[&p])?.and_then(|r| r["name"].as_str().map(str::to_string)).unwrap_or_else(|| "Project".into());
+            ensure_auto(core, &format!("project:{p}"), &name, None, Some(p))
+        }
+        None => ensure_auto(core, "chats", "Chats", None, None),
+    }
+}
+
+/// Where a new artifact goes when nobody says: its project's folder, then its thread's (the lead's go straight in the
+/// project folder), or its chat's folder under Chats.
+pub fn auto_folder(core: &Core, project: Option<&str>, thread: Option<&str>) -> Result<String> {
+    let root = root_folder(core, project)?;
+    let Some(t) = thread.and_then(|t| core.db.one("SELECT id, kind, title FROM threads WHERE id = ?1", &[&t]).ok().flatten()) else { return Ok(root) };
+    if t["kind"] == "lead" {
+        return Ok(root);
+    }
+    let tid = t["id"].as_str().unwrap_or("");
+    ensure_auto(core, &format!("thread:{tid}"), t["title"].as_str().unwrap_or("Thread"), Some(&root), project)
+}
+
+/// A folder by path, made where missing. "Designs/Mockups" is inside the project's folder (a chat's own folder for a
+/// chat); "/Designs" starts from the top of the library.
+pub fn folder_for_path(core: &Core, project: Option<&str>, thread: Option<&str>, path: &str) -> Result<String> {
+    let mut parent: Option<String> = if path.trim_start().starts_with('/') {
+        None
+    } else if project.is_some() {
+        Some(root_folder(core, project)?)
+    } else {
+        Some(auto_folder(core, None, thread)?)
+    };
+    let now = util::now_ms();
+    for seg in path.split(['/', '\\']).map(str::trim).filter(|s| !s.is_empty() && *s != ".") {
+        if seg == ".." {
+            parent = parent.and_then(|p| core.db.one("SELECT parent_id FROM folders WHERE id = ?1", &[&p]).ok().flatten()).and_then(|r| r["parent_id"].as_str().map(str::to_string));
+            continue;
+        }
+        let name: String = seg.chars().take(80).collect();
+        let found = core.db.one(
+            "SELECT id FROM folders WHERE IFNULL(parent_id, '') = ?1 AND lower(name) = lower(?2) AND deleted_at IS NULL",
+            &[&parent.clone().unwrap_or_default(), &name],
+        )?;
+        parent = Some(match found {
+            Some(f) => f["id"].as_str().unwrap_or("").to_string(),
+            None => {
+                let id = util::id("fld");
+                core.db.exec(
+                    "INSERT INTO folders(id, parent_id, project_id, name, named_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'agent', ?5, ?5)",
+                    &[&id, &parent, &project, &name, &now],
+                )?;
+                id
+            }
+        });
+    }
+    parent.ok_or_else(|| anyhow!("Name a folder."))
+}
+
+/// "Project / Thread / Designs"
+pub fn folder_path(core: &Core, id: &str) -> String {
+    let mut names = vec![];
+    let mut cur = Some(id.to_string());
+    while let Some(c) = cur.take() {
+        let Ok(Some(f)) = core.db.one("SELECT name, parent_id FROM folders WHERE id = ?1", &[&c]) else { break };
+        names.push(f["name"].as_str().unwrap_or("").to_string());
+        cur = f["parent_id"].as_str().map(str::to_string);
+        if names.len() > 32 {
+            break;
+        }
+    }
+    names.reverse();
+    names.join(" / ")
+}
+
+/// True when `id` is `ancestor` or sits somewhere inside it (moving a folder there would make a loop).
+pub fn is_within(core: &Core, id: &str, ancestor: &str) -> bool {
+    let mut cur = Some(id.to_string());
+    for _ in 0..64 {
+        let Some(c) = cur.take() else { return false };
+        if c == ancestor {
+            return true;
+        }
+        cur = core.db.one("SELECT parent_id FROM folders WHERE id = ?1", &[&c]).ok().flatten().and_then(|r| r["parent_id"].as_str().map(str::to_string));
+    }
+    false
+}
+
+/// A folder and everything under it, for deleting (and undoing) as one.
+pub fn subtree(core: &Core, id: &str) -> Vec<String> {
+    let mut out = vec![id.to_string()];
+    let mut i = 0;
+    while i < out.len() && out.len() < 5000 {
+        let kids = core.db.all("SELECT id FROM folders WHERE parent_id = ?1", &[&out[i]]).unwrap_or_default();
+        out.extend(kids.iter().filter_map(|k| k["id"].as_str().map(str::to_string)));
+        i += 1;
+    }
+    out
+}
+
+/// Artifacts from before folders existed go where a new one would.
+pub fn file_unfiled(core: &Core) {
+    let rows = core.db.all("SELECT id, project_id, thread_id FROM artifacts WHERE folder_id IS NULL AND deleted_at IS NULL", &[]).unwrap_or_default();
+    for a in rows {
+        if let Ok(f) = auto_folder(core, a["project_id"].as_str(), a["thread_id"].as_str()) {
+            let _ = core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &a["id"].as_str().unwrap_or("")]);
+        }
+    }
 }
 
 /// The file to serve for /a/{id}/{path}, refusing anything outside the artifact's folder.

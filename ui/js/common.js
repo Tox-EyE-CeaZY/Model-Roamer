@@ -90,15 +90,18 @@ export function errorBox(e, retry) {
 
 /** Model choices for an agent (with "CLI default" first), as select options. */
 export function modelOptions(id, { withDefault = true } = {}) {
+  if (String(id).startsWith('buddy:')) return [['', 'Each uses its own model']];
   const ms = agent(id).info?.models || [];
   const opts = ms.map((m) => [m.id, m.label + (m.note ? ' — ' + m.note : '')]);
   return withDefault && !ms.some((m) => m.id === '') ? [['', 'CLI default'], ...opts] : opts;
 }
 
-export function agentOptions({ leadOnly, auto } = {}) {
+export function agentOptions({ leadOnly, auto, buddies = true } = {}) {
   const list = Object.values(S.agents).filter((a) => !leadOnly || a.info?.can_lead !== false);
   const opts = list.map((a) => [a.id, a.info?.name + (a.installed === false ? ' (not installed)' : a.auth?.signed_in === 'no' ? ' (not signed in)' : a.limit?.active ? ' (at its limit)' : '')]);
-  return auto ? [['', 'Let the router choose'], ...opts] : opts;
+  // buddy pairs: two agents that take turns, picked like one agent
+  const pairs = leadOnly || !buddies ? [] : (S.settings.buddies || []).map((b) => ['buddy:' + b.id, '⇄ ' + b.name]);
+  return auto ? [['', 'Let the router choose'], ...opts, ...pairs] : [...opts, ...pairs];
 }
 
 /** An agent + model pair of selects that keep each other in step. */
@@ -111,7 +114,7 @@ export function agentModelPicker({ agentId, model, leadOnly, auto, onchange }) {
   };
   const aSel = select(agentOptions({ leadOnly, auto }), a, (v) => {
     a = v;
-    m = v ? agent(v).config?.model ?? '' : '';
+    m = v && !v.startsWith('buddy:') ? agent(v).config?.model ?? '' : '';
     drawModels();
     onchange?.(a, m);
   });

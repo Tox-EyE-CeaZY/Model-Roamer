@@ -4,7 +4,7 @@ An AI orchestration studio in the Roamer suite, alongside [Board Roamer](https:/
 and [Web Roamer](https://github.com/Tox-EyE-CeaZY/Web-Roamer), with the same look: chamfered panels, the contour-map
 background and the **MODEL/ROAMER** title bar.
 
-One **lead** agent plans the work and runs **worker threads** in Claude Code, Codex, Gemini CLI and Antigravity, all at
+One **lead** agent plans the work and runs **worker threads** in Claude Code, Codex and Antigravity (Google, on the Gemini models), all at
 once, each on its own git branch so they never step on each other. You watch, answer the questions they raise, and
 merge what you like.
 
@@ -29,7 +29,7 @@ need a terminal. Agents › **Install** fetches a CLI for you, and **Sign in** r
 ## What it does
 
 - **Projects** are a folder or a GitHub repository, plus instructions every agent reads. Each has a **lead** (Claude by
-  default; Codex and Gemini can lead too) whose chat sits on the project's board.
+  default; Codex and Antigravity can lead too) whose chat sits on the project's board.
 - **Worker threads**: the lead starts them with the agent and model that suit the job. Each gets its own git worktree
   and branch, and claims the files it is changing, so two workers never edit the same thing. The board shows them in
   lanes: *Needs you*, *Working*, *Paused*, *Done*.

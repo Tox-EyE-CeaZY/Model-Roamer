@@ -11,10 +11,10 @@ import { ic, stamp, seg, loading, errorBox, empty, kicker, statusChip } from '..
 // Series colours, validated for colour-blind separation against the night and paper surfaces (OKLCH L, C, hue).
 // Identity never rests on colour alone: there is always a legend and the table below the chart.
 const SERIES = {
-  dark: { claude: [0.66, 0.16, 45], codex: [0.6, 0.12, 175], gemini: [0.55, 0.17, 262], antigravity: [0.64, 0.16, 330] },
-  light: { claude: [0.62, 0.16, 45], codex: [0.56, 0.11, 175], gemini: [0.5, 0.17, 262], antigravity: [0.6, 0.17, 330] },
+  dark: { claude: [0.66, 0.16, 45], codex: [0.6, 0.12, 175], antigravity: [0.64, 0.16, 330] },
+  light: { claude: [0.62, 0.16, 45], codex: [0.56, 0.11, 175], antigravity: [0.6, 0.17, 330] },
 };
-const ORDER = ['claude', 'codex', 'gemini', 'antigravity'];
+const ORDER = ['claude', 'codex', 'antigravity'];
 function color(agent) {
   const mode = document.documentElement.dataset.theme === 'paper' ? 'light' : 'dark';
   const c = SERIES[mode][agent];

@@ -717,3 +717,31 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
 .tl-think-h.open > span.faint { display: none; }
 .tl-think-body { margin: 6px 0 0 10px; padding-left: 10px; border-left: 1px dashed var(--line2); color: var(--faint); font-size: 13px; font-style: italic; }
 @media (hover: hover) { .tl-think-h:hover { color: var(--ink); } }
+
+/* ------------------------------------------------------------ artifact library: folder tree + open folder */
+.art-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 18px; align-items: start; }
+.p-body > .art-layout { margin: 14px var(--gut) var(--gut); }
+.art-tree { position: sticky; top: 0; display: grid; gap: 1px; padding: 6px 0; border-right: 1px solid var(--line); max-height: calc(100vh - 160px); overflow: auto; }
+.at-row { display: flex; align-items: center; gap: 6px; padding: 5px 8px 5px calc(6px + var(--d, 0) * 14px); font: 500 12.5px var(--f-display); color: var(--dim); cursor: pointer; user-select: none; border-left: 2px solid transparent; }
+.at-row.on { color: var(--ink); background: var(--bg2); border-left-color: var(--accent); }
+.at-row .at-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.at-row small { font: 600 10px var(--f-mono); color: var(--faint); }
+.at-tw { flex: none; width: 14px; height: 14px; display: grid; place-items: center; color: var(--faint); transition: transform .18s var(--ease); }
+.at-tw.open { transform: rotate(90deg); }
+.at-row.top { font-weight: 600; }
+@media (hover: hover) { .at-row:hover { color: var(--ink); background: var(--bg3); } }
+.art-main { min-width: 0; display: grid; gap: 14px; }
+.art-main > .toolbar { flex-wrap: wrap; }
+.art-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; font: 600 11px var(--f-mono); letter-spacing: .04em; min-width: 0; }
+.crumb { padding: 4px 6px; color: var(--dim); max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.crumb.on { color: var(--ink); }
+.crumb-sep { font-style: normal; color: var(--accent); }
+@media (hover: hover) { .crumb:hover { color: var(--ink); background: var(--bg3); } }
+.fld-card { --c: 12px; --fill: color-mix(in oklch, var(--bg2) 94%, transparent); display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; column-gap: 12px; align-items: center; align-content: center; padding: 16px; min-height: 76px; text-align: left; color: var(--accent); transition: transform .2s var(--spring); }
+.fld-card > .ico { grid-row: 1 / 3; }
+.fld-card b { color: var(--ink); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (hover: hover) { .fld-card:hover { --bd: var(--accent); transform: translate(-2px, -2px); } }
+.fld-empty { grid-column: 1 / -1; border: 1px dashed var(--line2); }
+.drop { outline: 2px dashed var(--accent); outline-offset: -2px; background: color-mix(in oklch, var(--accent) 12%, transparent) !important; }
+.dragging { opacity: .45; }
+@media (max-width: 760px) { .art-layout { grid-template-columns: 1fr; } .art-tree { position: static; max-height: 220px; border-right: 0; border-bottom: 1px solid var(--line); } }

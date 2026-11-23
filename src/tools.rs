@@ -91,11 +91,15 @@ const DEFS: &[Def] = &[
     Def { name: "delete_memory", roles: ALL, desc: "Delete a memory entry that turned out to be wrong or obsolete.", schema: || obj(json!({
         "name": {"type": "string"}, "scope": {"type": "string", "enum": ["project", "global"]}
     }), &["name"]) },
-    Def { name: "publish_artifact", roles: ALL, desc: "Publish something to look at (HTML page, markdown, SVG, image, PDF, text) so the person can open it in Model Roamer on any device. Give a file path in your workspace, or the content itself. Same title updates it.", schema: || obj(json!({
-        "title": {"type": "string"}, "path": {"type": "string", "description": "A file (or a folder with index.html) in your workspace"},
+    Def { name: "publish_artifact", roles: ALL, desc: "Publish something to look at (HTML page, markdown, SVG, image, PDF, text) so the person can open it in Model Roamer on any device. Give a file path in your workspace, or the content itself. Same title updates it. It is filed under this project and thread automatically; pass folder to put it somewhere else.", schema: || obj(json!({
+        "title": {"type": "string"}, "folder": {"type": "string", "description": "Optional folder path, made if missing, e.g. 'Designs/Mockups' (inside the project's folder; a leading / starts from the top of the library)"}, "path": {"type": "string", "description": "A file (or a folder with index.html) in your workspace"},
         "content": {"type": "string", "description": "Or the content itself"}, "kind": {"type": "string", "enum": ["html", "markdown", "svg", "image", "pdf", "text"]},
         "description": {"type": "string"}
     }), &["title"]) },
+    Def { name: "list_artifacts", roles: ALL, desc: "The artifact folders for this project (or your chat) and what is in each, to see how files are organized before publishing or moving.", schema: || obj(json!({}), &[]) },
+    Def { name: "move_artifact", roles: ALL, desc: "Move an artifact (by title or id) into a folder path, made if missing, e.g. 'Reports/2026'. Use it to keep the project's files organized.", schema: || obj(json!({
+        "artifact": {"type": "string"}, "folder": {"type": "string"}
+    }), &["artifact", "folder"]) },
     Def { name: "post_update", roles: ALL, desc: "Show a short progress line on your thread without ending your turn (e.g. 'Tests pass, writing docs').", schema: || obj(json!({
         "text": {"type": "string"}
     }), &["text"]) },
@@ -335,9 +339,36 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         }
         "publish_artifact" => {
             let ws = runner::workspace_of(core, caller);
-            let art = crate::artifacts::publish(core, project.as_deref(), Some(&tid), &a("title"), &a("description"), &a("kind"), args["path"].as_str(), args["content"].as_str(), ws.as_deref())?;
+            let art = crate::artifacts::publish(core, project.as_deref(), Some(&tid), &a("title"), &a("description"), &a("kind"), args["path"].as_str(), args["content"].as_str(), ws.as_deref(), args["folder"].as_str())?;
             runner::post(core, &tid, "system", "Artifact", &format!("Published **{}**", art["title"].as_str().unwrap_or("")), json!({ "artifact": art }), false)?;
-            Ok(format!("Published. The person can open it from the Artifacts shelf (id {}).", art["id"].as_str().unwrap_or("")))
+            let path = art["folder_id"].as_str().map(|f| crate::artifacts::folder_path(core, f)).unwrap_or_default();
+            Ok(format!("Published to {path}. The person can open it from Artifacts (id {}).", art["id"].as_str().unwrap_or("")))
+        }
+        "list_artifacts" => {
+            let root = if project.is_some() { crate::artifacts::root_folder(core, project.as_deref())? } else { crate::artifacts::auto_folder(core, None, Some(&tid))? };
+            let mut out = String::new();
+            for f in crate::artifacts::subtree(core, &root) {
+                if core.db.one("SELECT id FROM folders WHERE id = ?1 AND deleted_at IS NULL", &[&f])?.is_none() {
+                    continue;
+                }
+                let items = core.db.all("SELECT id, title, kind FROM artifacts WHERE folder_id = ?1 AND deleted_at IS NULL ORDER BY lower(title)", &[&f])?;
+                out.push_str(&format!("{}/\n", crate::artifacts::folder_path(core, &f)));
+                for a in items {
+                    out.push_str(&format!("  - {} ({}, {})\n", a["title"].as_str().unwrap_or(""), a["kind"].as_str().unwrap_or(""), a["id"].as_str().unwrap_or("")));
+                }
+            }
+            Ok(if out.is_empty() { "No folders yet.".into() } else { out })
+        }
+        "move_artifact" => {
+            let key = a("artifact");
+            let art = core
+                .db
+                .one("SELECT id, title FROM artifacts WHERE (id = ?1 OR lower(title) = lower(?1)) AND IFNULL(project_id, '') = ?2 AND deleted_at IS NULL ORDER BY id = ?1 DESC LIMIT 1", &[&key, &project.clone().unwrap_or_default()])?
+                .ok_or_else(|| anyhow!("No artifact called {key} here. list_artifacts shows them."))?;
+            let f = crate::artifacts::folder_for_path(core, project.as_deref(), Some(&tid), &a("folder"))?;
+            core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &art["id"].as_str().unwrap_or("")])?;
+            core.bus.emit("artifact", project.as_deref(), None, json!({ "folder": f }));
+            Ok(format!("Moved \"{}\" to {}.", art["title"].as_str().unwrap_or(""), crate::artifacts::folder_path(core, &f)))
         }
         "post_update" => {
             core.set_thread(&tid, &json!({ "status_note": clip(&a("text"), 200) }))?;

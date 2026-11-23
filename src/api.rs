@@ -65,6 +65,8 @@ pub fn router(core: CoreRef) -> Router {
         // artifacts
         .route("/api/artifacts", get(list_artifacts).post(create_artifact))
         .route("/api/artifacts/{id}", get(get_artifact).patch(patch_artifact).delete(delete_artifact))
+        .route("/api/folders", get(list_folders).post(create_folder))
+        .route("/api/folders/{id}", axum::routing::patch(patch_folder).delete(delete_folder))
         // agents and tools
         .route("/api/agents", get(list_agents).post(add_custom_agent))
         .route("/api/agents/{id}", get(agent_status).patch(patch_agent).delete(remove_custom_agent))
@@ -808,7 +810,11 @@ async fn get_artifact(State(core): State<CoreRef>, Path(id): Path<String>) -> R 
 }
 
 async fn create_artifact(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
-    let a = artifacts::publish(&core, b["project_id"].as_str().filter(|p| !p.is_empty()), None, &s(&b, "title"), &s(&b, "description"), &s(&b, "kind"), b["path"].as_str(), b["content"].as_str(), None)?;
+    let mut a = artifacts::publish(&core, b["project_id"].as_str().filter(|p| !p.is_empty()), None, &s(&b, "title"), &s(&b, "description"), &s(&b, "kind"), b["path"].as_str(), b["content"].as_str(), None, None)?;
+    if let Some(f) = b["folder_id"].as_str().filter(|f| !f.is_empty()) {
+        core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &a["id"].as_str().unwrap_or("")])?;
+        a["folder_id"] = json!(f);
+    }
     Ok(Json(with_urls(&core, a)))
 }
 
@@ -822,9 +828,100 @@ async fn patch_artifact(State(core): State<CoreRef>, Path(id): Path<String>, Jso
     if b["restore"].as_bool() == Some(true) {
         core.db.exec("UPDATE artifacts SET deleted_at = NULL WHERE id = ?1", &[&id])?;
     }
+    if let Some(f) = b.get("folder_id") {
+        let f = f.as_str().filter(|f| !f.is_empty());
+        if let Some(f) = f {
+            core.db.one("SELECT id FROM folders WHERE id = ?1 AND deleted_at IS NULL", &[&f])?.ok_or_else(|| bad("That folder is gone."))?;
+        }
+        core.db.exec("UPDATE artifacts SET folder_id = ?1 WHERE id = ?2", &[&f, &id])?;
+    }
     let a = core.db.one("SELECT * FROM artifacts WHERE id = ?1", &[&id])?.unwrap_or_default();
     core.bus.emit("artifact", a["project_id"].as_str(), None, a.clone());
     Ok(Json(with_urls(&core, a)))
+}
+
+/// The folder tree. With ?project=, that project's own folder (made if needed) and everything under it.
+async fn list_folders(State(core): State<CoreRef>, q: Q) -> R {
+    let all = core.db.all(
+        "SELECT f.id, f.parent_id, f.project_id, f.name, f.auto_key, f.named_by, f.updated_at,
+                (SELECT COUNT(*) FROM artifacts a WHERE a.folder_id = f.id AND a.deleted_at IS NULL) AS count
+         FROM folders f WHERE f.deleted_at IS NULL ORDER BY f.auto_key IS NULL, lower(f.name)",
+        &[],
+    )?;
+    let Some(p) = q.get("project").filter(|p| !p.is_empty()) else { return Ok(Json(json!({ "folders": all, "root": null }))) };
+    let root = artifacts::root_folder(&core, Some(p))?;
+    let keep: std::collections::HashSet<String> = artifacts::subtree(&core, &root).into_iter().collect();
+    let mut folders: Vec<Value> = all.into_iter().filter(|f| f["id"].as_str().is_some_and(|i| keep.contains(i))).collect();
+    if !folders.iter().any(|f| f["id"] == root.as_str()) {
+        folders.extend(core.db.one("SELECT id, parent_id, project_id, name, auto_key, named_by, updated_at, 0 AS count FROM folders WHERE id = ?1", &[&root])?);
+    }
+    Ok(Json(json!({ "folders": folders, "root": root })))
+}
+
+async fn create_folder(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
+    let name = s(&b, "name");
+    if name.trim().is_empty() {
+        return Err(bad("Give the folder a name."));
+    }
+    let parent = b["parent_id"].as_str().filter(|p| !p.is_empty());
+    let project = match parent {
+        Some(p) => core.db.one("SELECT project_id FROM folders WHERE id = ?1 AND deleted_at IS NULL", &[&p])?.ok_or_else(|| bad("That folder is gone."))?["project_id"].as_str().map(str::to_string),
+        None => None,
+    };
+    let name: String = name.trim().chars().take(80).collect();
+    if core.db.one("SELECT id FROM folders WHERE IFNULL(parent_id, '') = ?1 AND lower(name) = lower(?2) AND deleted_at IS NULL", &[&parent.unwrap_or(""), &name])?.is_some() {
+        return Err(bad(format!("There's already a folder called {name} here.")));
+    }
+    let id = util::id("fld");
+    let now = util::now_ms();
+    core.db.exec(
+        "INSERT INTO folders(id, parent_id, project_id, name, named_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'person', ?5, ?5)",
+        &[&id, &parent, &project, &name, &now],
+    )?;
+    core.bus.emit("artifact", project.as_deref(), None, json!({ "folder": id }));
+    Ok(Json(core.db.one("SELECT *, 0 AS count FROM folders WHERE id = ?1", &[&id])?.unwrap_or_default()))
+}
+
+async fn patch_folder(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
+    let f = core.db.one("SELECT * FROM folders WHERE id = ?1", &[&id])?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such folder".into()))?;
+    let now = util::now_ms();
+    if b["restore"].as_bool() == Some(true) {
+        // everything deleted with it comes back with it
+        if let Some(at) = f["deleted_at"].as_i64() {
+            for x in artifacts::subtree(&core, &id) {
+                core.db.exec("UPDATE folders SET deleted_at = NULL WHERE id = ?1 AND deleted_at = ?2", &[&x, &at])?;
+                core.db.exec("UPDATE artifacts SET deleted_at = NULL WHERE folder_id = ?1 AND deleted_at = ?2", &[&x, &at])?;
+            }
+        }
+    }
+    if let Some(n) = b["name"].as_str().map(str::trim).filter(|n| !n.is_empty()) {
+        let n: String = n.chars().take(80).collect();
+        core.db.exec("UPDATE folders SET name = ?1, named_by = 'person', updated_at = ?2 WHERE id = ?3", &[&n, &now, &id])?;
+    }
+    if let Some(p) = b.get("parent_id") {
+        let p = p.as_str().filter(|p| !p.is_empty());
+        if let Some(p) = p {
+            if artifacts::is_within(&core, p, &id) {
+                return Err(bad("A folder can't go inside itself."));
+            }
+        }
+        core.db.exec("UPDATE folders SET parent_id = ?1, updated_at = ?2 WHERE id = ?3", &[&p, &now, &id])?;
+    }
+    core.bus.emit("artifact", f["project_id"].as_str(), None, json!({ "folder": id }));
+    Ok(Json(core.db.one("SELECT * FROM folders WHERE id = ?1", &[&id])?.unwrap_or_default()))
+}
+
+/// Deletes a folder with everything in it; PATCH {restore: true} brings it all back.
+async fn delete_folder(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
+    let now = util::now_ms();
+    let mut n = 0;
+    for x in artifacts::subtree(&core, &id) {
+        core.db.exec("UPDATE folders SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL", &[&now, &x])?;
+        n += core.db.scalar_i64("SELECT COUNT(*) FROM artifacts WHERE folder_id = ?1 AND deleted_at IS NULL", &[&x])?;
+        core.db.exec("UPDATE artifacts SET deleted_at = ?1 WHERE folder_id = ?2 AND deleted_at IS NULL", &[&now, &x])?;
+    }
+    core.bus.emit("artifact", None, None, json!({ "folder": id, "deleted": true }));
+    Ok(Json(json!({ "ok": true, "artifacts": n })))
 }
 
 async fn delete_artifact(State(core): State<CoreRef>, Path(id): Path<String>) -> R {

@@ -189,6 +189,22 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // who named a thread: auto (a default), agent (set_title) or person (renamed in the app, which agents must keep)
     "ALTER TABLE threads ADD COLUMN title_by TEXT NOT NULL DEFAULT 'auto';",
+    // artifact folders: nested, filed automatically by project and thread (auto_key) or made by the person or an agent
+    r#"
+    CREATE TABLE folders (
+        id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        project_id TEXT,
+        name TEXT NOT NULL,
+        auto_key TEXT,                      -- project:<id> | thread:<id> | chats, for the folders the app files into
+        named_by TEXT NOT NULL DEFAULT 'auto',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER
+    );
+    CREATE INDEX folders_parent ON folders(parent_id);
+    ALTER TABLE artifacts ADD COLUMN folder_id TEXT;
+    "#,
 ];
 
 #[derive(Clone)]

@@ -188,6 +188,7 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     // again, in the background and all at once (so one slow CLI doesn't hold up the others)
     core.load_remembered_status();
     core.repair_raw_messages();
+    crate::artifacts::file_unfiled(&core);
     let c = core.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(600)).await;

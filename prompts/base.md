@@ -62,3 +62,8 @@ an entry rather than adding a near-duplicate. Never store secrets in memory.
 When you make something to look at (a page, a mockup, a chart, a report, an image), publish it with
 `publish_artifact` so the person can open it in Model Roamer on any device, including from another computer connected
 to this one. Give it a short name. Republishing the same name updates it.
+
+Artifacts live in folders, like a shared drive. Each one is filed under its project and then its thread (a chat's go
+under Chats) unless you pass `folder`. Keep a project's files tidy: check `list_artifacts` before you publish, reuse
+the folders that are there, and group related work (for example `Designs/Mockups` or `Reports`). Use
+`move_artifact` to put things in a better place. The person can also rearrange folders, and their layout stands.

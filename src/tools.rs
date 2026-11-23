@@ -40,8 +40,8 @@ const DEFS: &[Def] = &[
         "allow_limited": {"type": "boolean", "description": "Open the thread even though that agent is out of usage right now (it waits for the reset). Default false: you're told who has room instead."}
     }), &["title", "instructions"]) },
     Def { name: "agent_status", roles: LEAD, desc: "Each agent's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
-    Def { name: "send_message", roles: LEAD, desc: "Send a message to a thread (answers, review notes, new instructions). The thread's agent gets a turn to act on it.", schema: || obj(json!({
-        "thread_id": {"type": "string"}, "text": {"type": "string"}
+    Def { name: "send_message", roles: LEAD, desc: "Send a message to a thread (answers, review notes, new instructions). If the thread is mid-turn it is interrupted so it reads the message at once, then carries on with its session (pass interrupt=false to let it finish its turn first).", schema: || obj(json!({
+        "thread_id": {"type": "string"}, "text": {"type": "string"}, "interrupt": {"type": "boolean", "description": "Default true. false queues the message until the thread's current turn ends."}
     }), &["thread_id", "text"]) },
     Def { name: "list_threads", roles: LEAD, desc: "List this project's threads with agent, status, branch and last activity.", schema: || obj(json!({
         "status": {"type": "string", "description": "Optional filter: working | waiting | blocked | review | done | failed | paused | limited | open (anything unresolved)"}
@@ -222,6 +222,11 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
             runner::post(core, t["id"].as_str().unwrap(), "user", &format!("Lead ({})", caller["agent"].as_str().unwrap_or("")), &a("text"), json!({ "from_thread": tid }), true)?;
+            let id = t["id"].as_str().unwrap();
+            if args["interrupt"] != false && runner::turn_active(core, id) {
+                runner::cancel(core, id, "idle", "so it can read the lead's message").await;
+                return Ok("Sent. The thread was mid-turn, so it was interrupted to read it; it picks the message up with its session intact.".into());
+            }
             Ok("Sent. The thread is working on it.".into())
         }
         "list_threads" => {
@@ -286,6 +291,9 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             let note = a("note");
             if !note.is_empty() {
                 runner::post(core, id, "user", "Lead", &note, json!({ "from_thread": tid }), true)?;
+                if runner::turn_active(core, id) {
+                    runner::cancel(core, id, "idle", "so it can read the lead's note").await;
+                }
             } else {
                 runner::schedule(core, id);
             }

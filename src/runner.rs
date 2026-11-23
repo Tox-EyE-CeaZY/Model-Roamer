@@ -1198,6 +1198,11 @@ fn requeue(core: &CoreRef, ids: &[String]) {
 
 // ------------------------------------------------------------------------------------------------ controls
 
+/// Whether the thread has a turn running right now.
+pub fn turn_active(core: &CoreRef, thread: &str) -> bool {
+    core.running.lock().map(|r| r.get(thread).is_some_and(|x| !x.turn_id.is_empty())).unwrap_or(false)
+}
+
 pub async fn cancel(core: &CoreRef, thread: &str, status: &str, reason: &str) {
     let _ = core.set_status(thread, status, reason);
     let tx = core.running.lock().ok().and_then(|r| r.get(thread).map(|x| x.cancel.clone()));

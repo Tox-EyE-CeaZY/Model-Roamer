@@ -308,7 +308,7 @@ export async function viewer(el, r, ctx) {
   // ---- comments: point at a part (a page element, selected text, a spot on an image), say something, and send it to
   // the thread that made the artifact or to the project's orchestrator
   let commenting = false;
-  let how = localStorage.getItem('mr-art-how') === 'spot' ? 'spot' : 'element'; // pages: pick a part, or drop a pin anywhere
+  let how = ['spot', 'area'].includes(localStorage.getItem('mr-art-how')) ? localStorage.getItem('mr-art-how') : 'element'; // pages: pick a part, or drop a pin anywhere
   const pickable = ['html', 'markdown', 'text', 'image', 'svg'].includes(a.kind);
   const getFrame = () => frame.querySelector('iframe.av-if');
   const tellPage = () => getFrame()?.contentWindow?.postMessage({ mr: 'mode', on: commenting, how }, '*');
@@ -366,7 +366,11 @@ export async function viewer(el, r, ctx) {
     if (!f || e.source !== f.contentWindow || e.data?.mr !== 'pick') return;
     const d = e.data;
     const near = `<${String(d.tag || '').slice(0, 20)}> at \`${String(d.selector || '').slice(0, 240)}\``;
-    if (d.how === 'spot') openComment(`A spot on the page: ${+d.x || 0}% across and ${+d.y || 0}% down the whole page (${+d.px || 0}px, ${+d.py || 0}px from the top left), on ${near}`, String(d.text || '').slice(0, 300) ? 'Nearby: ' + String(d.text).slice(0, 300) : '');
+    if (d.how === 'area') {
+      const items = Array.isArray(d.items) ? d.items.slice(0, 30) : [];
+      const list = items.map((i) => `- <${String(i.tag || '').slice(0, 20)}> at \`${String(i.selector || '').slice(0, 200)}\`${i.text ? ': ' + String(i.text).slice(0, 120) : ''}`).join('\n');
+      openComment(`${items.length ? items.length + ' parts' : 'An area'} of the page, picked with a box: ${+d.pw || 0} by ${+d.ph || 0}px at ${+d.px || 0}px, ${+d.py || 0}px from the top left (${+d.x || 0}% across, ${+d.y || 0}% down, ${+d.w || 0}% wide, ${+d.h || 0}% tall).`, list);
+    } else if (d.how === 'spot') openComment(`A spot on the page: ${+d.x || 0}% across and ${+d.y || 0}% down the whole page (${+d.px || 0}px, ${+d.py || 0}px from the top left), on ${near}`, String(d.text || '').slice(0, 300) ? 'Nearby: ' + String(d.text).slice(0, 300) : '');
     else openComment(`Part of the page: ${near} (about ${+d.x || 0}% across, ${+d.y || 0}% down the view)`, String(d.text || '').slice(0, 300));
   };
   addEventListener('message', onMsg);
@@ -375,7 +379,7 @@ export async function viewer(el, r, ctx) {
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
     a.agent ? stamp(a.agent, { small: true }) : null,
     h('span', { class: 'grow' }),
-    commenting && a.kind === 'html' ? h('span', { class: 'seg sm', role: 'group', title: 'What a click picks' }, [['element', 'Element', 'Outline and pick a part of the page'], ['spot', 'Spot', 'Drop a pin anywhere on the page']].map(([v, l, t]) => h('button', { class: 'seg-b' + (how === v ? ' on' : ''), type: 'button', title: t, onclick: () => setHow(v) }, l))) : null,
+    commenting && a.kind === 'html' ? h('span', { class: 'seg sm', role: 'group', title: 'What a click picks' }, [['element', 'Element', 'Outline and pick a part of the page'], ['spot', 'Spot', 'Drop a pin anywhere on the page'], ['area', 'Lasso', 'Drag a box to pick everything inside it']].map(([v, l, t]) => h('button', { class: 'seg-b' + (how === v ? ' on' : ''), type: 'button', title: t, onclick: () => setHow(v) }, l))) : null,
     pickable ?h('button', { class: 'btn sm' + (commenting ? ' primary' : ''), title: a.kind === 'html' || a.kind === 'image' || a.kind === 'svg' ? 'Click a part of it to comment' : 'Select text to comment', onclick: () => setMode(!commenting) }, ic('chat', 13), commenting ? 'Commenting…' : 'Comment') : null,
     h('button', { class: 'btn sm', onclick: () => draw(true) }, ic('reload', 13), 'Reload'),
     a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
@@ -406,12 +410,29 @@ export async function viewer(el, r, ctx) {
     const q = String(getSelection() || '').trim();
     if (q.length > 1) openComment('Part of the text:', q);
   });
-  frame.addEventListener('click', (e) => {
-    if (!commenting || (a.kind !== 'image' && a.kind !== 'svg')) return;
-    const im = frame.querySelector('img');
-    if (!im || e.target !== im) return;
+  // an image: click a spot, or drag a box around a region
+  let dragFrom = null;
+  const imgPct = (im, x, y) => {
     const r = im.getBoundingClientRect();
-    openComment(`A spot on the image: ${Math.round(((e.clientX - r.left) / r.width) * 100)}% across, ${Math.round(((e.clientY - r.top) / r.height) * 100)}% down.`, '');
+    return [Math.max(0, Math.min(100, Math.round(((x - r.left) / r.width) * 100))), Math.max(0, Math.min(100, Math.round(((y - r.top) / r.height) * 100)))];
+  };
+  frame.addEventListener('mousedown', (e) => {
+    const im = frame.querySelector('img');
+    dragFrom = commenting && (a.kind === 'image' || a.kind === 'svg') && im && e.target === im ? [e.clientX, e.clientY] : null;
+    if (dragFrom) e.preventDefault();
+  });
+  frame.addEventListener('mouseup', (e) => {
+    const im = frame.querySelector('img');
+    if (!dragFrom || !im) return;
+    const [x0, y0] = dragFrom;
+    dragFrom = null;
+    if (Math.abs(e.clientX - x0) < 8 && Math.abs(e.clientY - y0) < 8) {
+      const [x, y] = imgPct(im, e.clientX, e.clientY);
+      return openComment(`A spot on the image: ${x}% across, ${y}% down.`, '');
+    }
+    const [ax, ay] = imgPct(im, x0, y0);
+    const [bx, by] = imgPct(im, e.clientX, e.clientY);
+    openComment(`A region of the image: from ${Math.min(ax, bx)}% across, ${Math.min(ay, by)}% down, ${Math.abs(bx - ax)}% wide and ${Math.abs(by - ay)}% tall.`, '');
   });
   drawHead();
   draw();

@@ -315,8 +315,9 @@ fn pty_command(r: &Resolved, l: &Launch) -> portable_pty::CommandBuilder {
 
 fn stream_pty(r: &Resolved, l: &Launch) -> Result<Stream> {
     use portable_pty::{native_pty_system, PtySize};
+    // very wide, so the terminal doesn't wrap long JSON event lines (adapters also rejoin a line that was broken)
     let pair = native_pty_system()
-        .openpty(PtySize { rows: 50, cols: 400, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize { rows: 50, cols: 4000, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| anyhow!("could not open a pseudo-terminal: {e}"))?;
     let mut child = pair.slave.spawn_command(pty_command(r, l)).map_err(|e| anyhow!("starting {}: {e}", r.shown))?;
     drop(pair.slave);

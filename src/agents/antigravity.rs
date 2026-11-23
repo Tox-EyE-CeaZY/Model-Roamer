@@ -69,6 +69,19 @@ impl AgentAdapter for Antigravity {
     }
 
     fn parse(&self, line: &str, st: &mut Value) -> Vec<AgentEvent> {
+        // a JSON event the terminal broke over two lines: keep the start and try again with the next line
+        let joined;
+        let line = if let Some(p) = st["partial"].as_str().filter(|p| !p.is_empty()) {
+            joined = format!("{p}{}", line.trim());
+            st["partial"] = json!("");
+            joined.as_str()
+        } else {
+            line
+        };
+        if line.trim_start().starts_with('{') && json_line(line).is_none() && line.len() < 1_000_000 {
+            st["partial"] = json!(line.trim());
+            return vec![];
+        }
         let Some(v) = json_line(line) else {
             let t = line.trim();
             if t.is_empty() {
@@ -79,6 +92,11 @@ impl AgentAdapter for Antigravity {
             }
             return vec![AgentEvent::Raw(line.to_string())];
         };
+        // stream-json: {"event":"step_update","step_update":{...}} while it works, {"event":"result","result":{...}} at the end
+        if v["event"] == "step_update" {
+            return step_update(&v["step_update"], st);
+        }
+        let v = if v["event"] == "result" { v["result"].clone() } else { v };
         // the json envelope: {conversation_id, status, response, usage}
         if v.get("response").is_some() || v.get("conversation_id").is_some() {
             let mut out = vec![];
@@ -89,7 +107,7 @@ impl AgentAdapter for Antigravity {
             out.push(AgentEvent::Usage {
                 input: u["input_tokens"].as_i64().or(u["prompt_tokens"].as_i64()).unwrap_or(0),
                 output: u["output_tokens"].as_i64().or(u["completion_tokens"].as_i64()).unwrap_or(0),
-                cached: u["cached_tokens"].as_i64().unwrap_or(0),
+                cached: u["cached_tokens"].as_i64().or(u["cache_read_tokens"].as_i64()).unwrap_or(0),
                 cost: 0.0,
             });
             let status = s(&v["status"]).to_lowercase();
@@ -165,5 +183,101 @@ impl AgentAdapter for Antigravity {
         let mut cmd: Vec<String> = vec!["agy".into(), "mcp".into(), "add".into(), "-t".into(), "stdio".into(), "roamer".into(), m.command.clone()];
         cmd.extend(m.args.iter().cloned());
         Some(Step { label: "Give agy Model Roamer's tools".into(), cmd, needs: vec!["agy".into()] })
+    }
+}
+
+/// One step of agy's work: the reply streaming in, its thinking, or a tool it used. Your own message comes back as a
+/// `user_input` step and is skipped.
+fn step_update(u: &Value, st: &mut Value) -> Vec<AgentEvent> {
+    let mut out = vec![];
+    if let Some(id) = u["conversation_id"].as_str().filter(|id| st["session"].as_str() != Some(*id)) {
+        st["session"] = json!(id);
+        out.push(AgentEvent::Session(id.into()));
+    }
+    let ty = u["step_type"].as_str().unwrap_or("");
+    let idx = u["step_index"].to_string();
+    let done = u["state"].as_str().is_some_and(|x| x.eq_ignore_ascii_case("done"));
+    let delta = u["text_delta"].as_str().unwrap_or("");
+    match ty {
+        "user_input" | "" => {}
+        "agent_response" | "response" | "model_response" => {
+            if !delta.is_empty() {
+                out.push(AgentEvent::Delta(delta.into()));
+            }
+        }
+        t if t.contains("think") || t.contains("plan") || t.contains("reason") => {
+            let acc = format!("{}{}", st["think"][&idx].as_str().unwrap_or(""), delta);
+            st["think"][&idx] = json!(acc);
+            if done && !acc.trim().is_empty() {
+                out.push(AgentEvent::Thinking(acc));
+            }
+        }
+        t => {
+            // a tool or action step: show it once when it starts, and its outcome when it's done
+            let what = ["command", "command_line", "tool_name", "title", "description", "path", "query", "url"]
+                .iter()
+                .find_map(|k| u[*k].as_str().filter(|x| !x.is_empty()))
+                .map(str::to_string)
+                .unwrap_or_else(|| delta.to_string());
+            if st["seen"][&idx].is_null() {
+                st["seen"][&idx] = json!(true);
+                out.push(AgentEvent::ToolUse { id: idx.clone(), name: t.replace('_', " "), input: what });
+            }
+            if done {
+                let result = ["output", "result", "stdout", "error"].iter().find_map(|k| u[*k].as_str()).unwrap_or("").to_string();
+                let failed = u["status"].as_str().is_some_and(|x| x.eq_ignore_ascii_case("error") || x.eq_ignore_ascii_case("failed")) || !u["error"].is_null();
+                out.push(AgentEvent::ToolResult { id: idx, output: result, error: failed });
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_step_updates_and_result() {
+        let a = Antigravity;
+        let mut st = json!({});
+        let lines = [
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":0,"state":"DONE","step_type":"user_input"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Hello! What "}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"can I help you with today?"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"\n","usage":{"input_tokens":12809,"output_tokens":44}}}"#,
+        ];
+        let mut text = String::new();
+        let mut sessions = 0;
+        for l in lines {
+            for e in a.parse(l, &mut st) {
+                match e {
+                    AgentEvent::Delta(d) => text.push_str(&d),
+                    AgentEvent::Session(_) => sessions += 1,
+                    AgentEvent::Raw(r) => panic!("raw line leaked: {r}"),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(text, "Hello! What can I help you with today?\n");
+        assert_eq!(sessions, 1);
+        // the result, broken over two lines by the terminal
+        let r1 = r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"Hello! What can I help you with today?\n","usage":{"input_tokens":12809,"#;
+        let r2 = r#""output_tokens":44,"thinking_tokens":30,"cache_read_tokens":0,"total_tokens":12853}}}"#;
+        assert!(a.parse(r1, &mut st).is_empty());
+        let ev = a.parse(r2, &mut st);
+        assert!(ev.iter().any(|e| matches!(e, AgentEvent::Usage { input: 12809, output: 44, .. })));
+        assert!(ev.iter().any(|e| matches!(e, AgentEvent::Final(t) if t.starts_with("Hello!"))));
+    }
+
+    #[test]
+    fn shows_tool_steps() {
+        let a = Antigravity;
+        let mut st = json!({});
+        let start = a.parse(r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":2,"state":"ACTIVE","step_type":"run_command","command":"ls"}}"#, &mut st);
+        assert!(start.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, input, .. } if name == "run command" && input == "ls")));
+        let end = a.parse(r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":2,"state":"DONE","step_type":"run_command","command":"ls","output":"a.txt"}}"#, &mut st);
+        assert!(end.iter().any(|e| matches!(e, AgentEvent::ToolResult { output, .. } if output == "a.txt")));
+        assert!(!end.iter().any(|e| matches!(e, AgentEvent::ToolUse { .. })));
     }
 }

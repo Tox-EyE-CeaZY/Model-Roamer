@@ -193,6 +193,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     if !available(def, role, binding.is_some()) {
         bail!("{name} is for the lead only. Ask the lead in your reply instead.");
     }
+    crate::collab_chat::guard_tool(core, name, args)?;
     let tid = caller["id"].as_str().unwrap_or("").to_string();
     let project = caller["project_id"].as_str().map(str::to_string);
     let a = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();

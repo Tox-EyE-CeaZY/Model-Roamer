@@ -13,6 +13,7 @@ import { openExternal } from '../native.js';
 import { dialog, toast } from '../ui.js';
 import { md } from '../md.js';
 import { ic, field, input, textarea, select, seg, toggle, loading, errorBox, empty, kicker, copyable, statusChip } from '../common.js';
+import { mountChat, chatsPanel, ensureLocal, threadTag } from './collab_chat.js';
 
 const ROLE_LABEL = { collaborator: 'Collaborator', operator: 'Operator', viewer: 'Viewer', owner: 'Owner' };
 
@@ -32,7 +33,8 @@ export async function collaborators(el, r) {
   const inviteBox = h('section', { class: 'panel cut' });
   const peopleBox = h('section', { class: 'panel cut' });
   const rulesBox = h('section', { class: 'panel cut' });
-  el.replaceChildren(top, inviteBox, peopleBox, rulesBox);
+  const chatsBox = h('section', { class: 'panel cut' });
+  el.replaceChildren(top, inviteBox, peopleBox, rulesBox, chatsBox);
 
   let net = null;
   try {
@@ -58,6 +60,7 @@ export async function collaborators(el, r) {
     drawInvite(null);
     drawPeople();
     drawRules();
+    chatsPanel(chatsBox, pid);
   }
 
   function drawInvite(made) {
@@ -176,6 +179,7 @@ export async function collaborators(el, r) {
             try {
               data.rules = await patch(`collab/projects/${pid}/rules`, { [role]: { [p.id]: v } });
               draw2();
+              chatsPanel(chatsBox, pid);
             } catch (e) {
               toast(e.message, { err: true });
             }
@@ -272,7 +276,7 @@ async function joined(el, linkId) {
   const artifacts = new Map();
   let people = st.people || [];
   let cursor = st.cursor;
-  let tab = 'threads', openThread = null, live = 'ok', alive = true;
+  let tab = 'chat', openThread = null, live = 'ok', alive = true, stopChat = null;
   const perms = st.perms || {};
   const me = st.member;
 
@@ -283,7 +287,7 @@ async function joined(el, linkId) {
       h('a', { class: 'linkbtn', href: '#/settings/join' }, ic('left', 13), 'All joined projects'),
       h('div', { class: 'collab-title' }, h('h2', {}, st.project?.name || link.project_name), liveTag),
       h('div', { class: 'collab-title' }, h('p', { class: 'faint small' }, `Hosted by ${st.host?.name || link.host_name} · you are ${ROLE_LABEL[me.role] || me.role} as ${me.name}`), askOperator()),
-      seg([['threads', 'Threads'], ['memory', 'Memory'], ['artifacts', 'Artifacts'], ['people', 'People']], tab, (v) => {
+      seg([['chat', 'Your chat'], ['threads', 'Threads'], ['memory', 'Memory'], ['artifacts', 'Artifacts'], ['people', 'People']], tab, (v) => {
         tab = v;
         openThread = null;
         drawBody();
@@ -308,6 +312,8 @@ async function joined(el, linkId) {
   }
 
   function drawBody() {
+    if (stopChat) stopChat = (stopChat(), null);
+    if (tab === 'chat') return mountChat(body, link).then((s) => (alive && tab === 'chat' ? (stopChat = s) : s()));
     if (tab === 'threads') return openThread ? drawThread(openThread) : drawThreads();
     if (tab === 'memory') return drawMemory();
     if (tab === 'artifacts') return drawArtifacts();
@@ -315,11 +321,12 @@ async function joined(el, linkId) {
   }
 
   function drawThreads() {
-    const list = [...threads.values()].filter((t) => !t.deleted_at);
+    // the person's own chat has its own tab; their own threads open here, on this machine
+    const list = [...threads.values()].filter((t) => !t.deleted_at && !(t.kind === 'chat' && t.user_id === me.user_id));
     body.replaceChildren(
       kicker('Threads', perms.create_threads ? h('button', { class: 'btn xs', onclick: newThread }, ic('plus', 12), 'New thread') : null),
-      list.length ? h('div', { class: 'dev-list' }, list.map((t) => h('button', { class: 'collab-thread', onclick: () => ((openThread = t.id), drawBody()) },
-        h('div', {}, h('b', {}, t.kind === 'lead' ? '★ ' : '', t.title), h('small', { class: 'faint' }, `${t.agent}${t.user_id === me.user_id ? ' · yours' : t.user_id ? ' · ' + personName(t.user_id) : ''} · ${ago(t.updated_at)}`),
+      list.length ? h('div', { class: 'dev-list' }, list.map((t) => h('button', { class: 'collab-thread', onclick: () => (t.user_id === me.user_id ? go('#/t/' + t.id) : ((openThread = t.id), drawBody())) },
+        h('div', {}, h('b', {}, t.kind === 'lead' ? '★ ' : '', t.title), h('small', { class: 'faint' }, `${t.agent}${threadTag(t, me, personName)} · ${ago(t.updated_at)}`),
           t.last_body ? h('small', { class: 'collab-last' }, t.last_body) : null),
         statusChip(t)))) : h('p', { class: 'faint small' }, perms.view_threads ? 'No threads yet.' : 'The owner hasn’t shared threads with you.'));
   }
@@ -327,14 +334,11 @@ async function joined(el, linkId) {
   const personName = (uid) => people.find((p) => p.user_id === uid)?.name || 'someone';
 
   async function newThread() {
-    const title = input('', { placeholder: 'What this thread is for' });
-    const what = textarea('', { placeholder: 'Instructions (optional)' });
-    if (!(await dialog({ title: 'New thread', body: h('div', {}, field('Title', title), field('Instructions', what), h('p', { class: 'faint small' }, 'It belongs to you: your agents run it on this machine.')), ok: 'Create' }))) return;
+    // it opens here, on this machine, and goes up to the host from there
     try {
-      const t = await post(base + 'threads', { title: title.value, instructions: what.value });
-      threads.set(t.id, t);
-      openThread = t.id;
-      drawBody();
+      await ensureLocal(link);
+      const { newThreadDialog } = await import('./project.js');
+      return newThreadDialog(link.id);
     } catch (e) {
       toast(e.message, { err: true });
     }
@@ -503,5 +507,8 @@ async function joined(el, linkId) {
   drawHead();
   drawBody();
   pump();
-  return () => (alive = false);
+  return () => {
+    alive = false;
+    if (stopChat) stopChat();
+  };
 }

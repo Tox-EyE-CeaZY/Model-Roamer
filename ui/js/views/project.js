@@ -40,6 +40,8 @@ export default async function projectView(el, r, ctx) {
   }
   setTitle(`${p.name} · Model Roamer`);
   const tab = r.tab || '';
+  // a project joined from someone else's Model Roamer: its page is the joined view, with the person's own chat
+  if (p.id.startsWith('lnk_') && !tab) return r.q.t ? go('#/t/' + r.q.t) : go('#/settings/join?link=' + encodeURIComponent(p.id));
   const headEl = h('div', { class: 'p-head', style: { '--ph': p.color } });
   const body = h('div', { class: 'p-body' });
   el.append(headEl, body);

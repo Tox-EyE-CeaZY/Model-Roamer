@@ -129,6 +129,7 @@ pub struct NewWorker {
 
 pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Result<Value> {
     let p = core.project(project)?;
+    crate::collab_chat::may_create(core, project)?;
     if w.title.trim().is_empty() || w.instructions.trim().is_empty() {
         bail!("A thread needs a title and instructions.");
     }
@@ -900,6 +901,8 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     };
     let session = (t["session_agent"].as_str() == Some(agent.as_str()) && !t["session_id"].as_str().unwrap_or("").is_empty()).then(|| t["session_id"].as_str().unwrap_or("").to_string());
     let target: Option<Value> = None; // a review's instructions already name the thread it reviews
+    // a joined project: the host's project picture, fresh, and what changed there since the lead's last turn
+    let collab_update = crate::collab_chat::before_turn(core, &t).await;
     let system = prompts::system(core, &prompts::Ctx { thread: &t, project: project.as_ref(), workspace: workspace.display().to_string(), mcp: adapter.info().mcp, target: target.as_ref() });
     let mut prompt = String::new();
     if session.is_none() {
@@ -909,6 +912,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         // every turn, so a session started under older instructions (or one with no system prompt) still knows
         prompt.push_str(LEAD_REMINDER);
     }
+    prompt.push_str(&collab_update);
     prompt.push_str(&format_inputs(&inputs));
     let cfg = core.agent_cfg(&agent);
     let model = t["model"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| cfg["model"].as_str().unwrap_or("").to_string());

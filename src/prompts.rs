@@ -147,6 +147,7 @@ pub fn system(core: &Core, c: &Ctx) -> String {
     s.push_str(&body.replace("{{PROJECT}}", pname));
     s.push_str(&buddy_section(core, t));
     s.push_str(&claims_section(core, t, c.project));
+    s.push_str(&crate::collab_chat::prompt_section(core, t, c.project));
     s.push_str("\n\n");
     s.push_str(&harness(agent));
     s.push_str("\n\n## Model Roamer tools\n\n");

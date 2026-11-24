@@ -1,10 +1,14 @@
-// Voice input for chat composers: live speech-to-text into the textarea via the browser Web Speech API
-// (or the Android WebView native SpeechRecognizer bridge when running in Model Roamer for Android).
-// Supports toggle and push-to-talk modes, live transcript preview, cancel (restoring prior text),
-// keyboard shortcut (Ctrl+Shift+M), clear permission/unsupported errors, and persisted settings.
+// Voice input for chat composers: live speech-to-text into the textarea via:
+//   1) Android native SpeechRecognizer bridge (when running in Model Roamer for Android)
+//   2) Browser Web Speech API (Chrome, Edge, Safari)
+//   3) Automatic free offline fallback (getUserMedia 16 kHz WAV -> local whisper.cpp on the server)
+//      when Web Speech reports network/service-not-allowed (e.g. Windows desktop WebView2) or is absent.
+// Supports toggle and push-to-talk modes, cancel (restoring prior text), keyboard shortcut (Ctrl+Shift+M),
+// optional first-use model download with progress, clear errors, and persisted settings.
 
 import { h } from './util.js';
 import { icon } from './icons.js';
+import { api, get, post, listen } from './api.js';
 import { S, watch, setSetting } from './store.js';
 import { isDesktop, plat } from './native.js';
 import { toast, showMenu, overlaid } from './ui.js';
@@ -56,15 +60,38 @@ export async function saveVoiceSettings(patchObj) {
   return next;
 }
 
-/** Available speech recognition backend: 'android' | 'webspeech' | null. */
-export function voiceBackend() {
-  if (typeof window === 'undefined') return null;
+// Remember if Web Speech failed with network/service-not-allowed in this session (e.g. WebView2)
+let webSpeechBlocked = false;
+export function resetVoiceStateForTest() {
+  webSpeechBlocked = false;
+}
+
+function hasAndroidVoice() {
+  if (typeof window === 'undefined') return false;
   if (window.RoamerAndroid && typeof window.RoamerAndroid.startVoice === 'function') {
     try {
-      if (!window.RoamerAndroid.hasVoice || window.RoamerAndroid.hasVoice()) return 'android';
-    } catch { /* fall through */ }
+      return !window.RoamerAndroid.hasVoice || !!window.RoamerAndroid.hasVoice();
+    } catch {
+      return false;
+    }
   }
-  if (window.SpeechRecognition || window.webkitSpeechRecognition) return 'webspeech';
+  return false;
+}
+
+function hasWebSpeech() {
+  return typeof window !== 'undefined' && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+function hasGetUserMedia() {
+  return typeof navigator !== 'undefined' && typeof navigator.mediaDevices?.getUserMedia === 'function';
+}
+
+/** Available speech recognition backend: 'android' | 'webspeech' | 'local' | null. */
+export function voiceBackend() {
+  if (typeof window === 'undefined') return null;
+  if (hasAndroidVoice()) return 'android';
+  if (hasWebSpeech() && !webSpeechBlocked) return 'webspeech';
+  if (hasGetUserMedia()) return 'local';
   return null;
 }
 
@@ -72,7 +99,7 @@ export function unsupportedReason() {
   if (typeof window !== 'undefined' && window.isSecureContext === false) {
     return 'Voice input needs HTTPS or localhost. Open Model Roamer on this computer or over HTTPS (such as Tailscale HTTPS).';
   }
-  return 'This browser does not support Web Speech recognition. Try Chrome, Edge, or Safari.';
+  return 'This browser does not support Web Speech or microphone recording. Try Chrome, Edge, or Safari.';
 }
 
 /** Merge spoken text cleanly into the textarea around a saved selection range. */
@@ -85,13 +112,68 @@ export function spliceTranscript(before, after, spoken) {
   return { text: left + trail + after, caret: left.length };
 }
 
+/**
+ * Downsample Float32 PCM chunks to 16 kHz mono 16-bit PCM WAV bytes for whisper.cpp.
+ * Pure JS — requires no FFmpeg or native encoder.
+ */
+export function encodeWav(chunks, inputSampleRate = 48000, targetRate = 16000) {
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+  const merged = new Float32Array(totalLen);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+
+  let samples = merged;
+  if (inputSampleRate > 0 && inputSampleRate !== targetRate && merged.length > 0) {
+    const ratio = inputSampleRate / targetRate;
+    const outLen = Math.max(1, Math.round(merged.length / ratio));
+    samples = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const start = Math.floor(i * ratio);
+      const end = Math.min(merged.length, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+      let sum = 0;
+      for (let j = start; j < end; j++) sum += merged[j];
+      samples[i] = sum / (end - start);
+    }
+  }
+
+  const dataBytes = samples.length * 2;
+  const buf = new ArrayBuffer(44 + dataBytes);
+  const v = new DataView(buf);
+  const str = (pos, s) => { for (let i = 0; i < s.length; i++) v.setUint8(pos + i, s.charCodeAt(i)); };
+  str(0, 'RIFF');
+  v.setUint32(4, 36 + dataBytes, true);
+  str(8, 'WAVE');
+  str(12, 'fmt ');
+  v.setUint32(16, 16, true); // PCM chunk size
+  v.setUint16(20, 1, true); // PCM format
+  v.setUint16(22, 1, true); // mono
+  v.setUint32(24, targetRate, true);
+  v.setUint32(28, targetRate * 2, true); // byte rate
+  v.setUint16(32, 2, true); // block align
+  v.setUint16(34, 16, true); // bits per sample
+  str(36, 'data');
+  v.setUint32(40, dataBytes, true);
+
+  let pos = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    pos += 2;
+  }
+  return new Uint8Array(buf);
+}
+
 /** Format elapsed recording seconds as M:SS. */
 function fmtClock(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-/** Human-friendly message for Web Speech API or native bridge error codes. */
+/** Human-friendly message for Web Speech API, getUserMedia, or local fallback error codes. */
 export function describeVoiceError(code, detail = '') {
   switch (code) {
     case 'not-allowed':
@@ -101,9 +183,9 @@ export function describeVoiceError(code, detail = '') {
       };
     case 'service-not-allowed':
       return {
-        text: isDesktop
-          ? 'Speech recognition service is blocked in the desktop WebView. Use Win+H for Windows voice typing, or open Model Roamer in Chrome or Edge.'
-          : 'Speech recognition service is not allowed in this browser or context.',
+        text: detail || (isDesktop
+          ? 'Browser speech service is unavailable in the desktop WebView.'
+          : 'Speech recognition service is not allowed in this browser or context.'),
         retry: false,
       };
     case 'audio-capture':
@@ -113,9 +195,7 @@ export function describeVoiceError(code, detail = '') {
       };
     case 'network':
       return {
-        text: isDesktop
-          ? 'Speech service could not be reached from the desktop WebView. Use Win+H for built-in Windows voice typing, or open Model Roamer in Chrome or Edge.'
-          : 'Speech recognition could not reach its network service. Check your connection and try again.',
+        text: detail || 'Speech recognition could not reach its network service. Check your connection and try again.',
         retry: true,
       };
     case 'language-not-supported':
@@ -143,6 +223,24 @@ let activeVoice = null;
 const mounted = new Set();
 let lastFocused = null;
 let androidListener = null;
+
+// Shared live download status from the backend (/api/voice/setup + WS 'voice' events)
+let localSetup = null;
+const setupSubs = new Set();
+let busWired = false;
+function watchLocalSetup(fn) {
+  if (!busWired) {
+    busWired = true;
+    listen((ev) => {
+      if (ev.kind === 'voice' && ev.data) {
+        localSetup = ev.data;
+        setupSubs.forEach((f) => f(localSetup));
+      }
+    });
+  }
+  setupSubs.add(fn);
+  return () => setupSubs.delete(fn);
+}
 
 // Native Android SpeechRecognizer bridge callback
 if (typeof window !== 'undefined') {
@@ -210,14 +308,6 @@ function wireGlobalShortcut() {
 
 /**
  * Create a voice dictation controller and UI elements for a chat composer.
- *
- * Returns:
- * - `micBtn`: mic icon button for `.cmp-row`
- * - `modeBtn`: compact mode/settings button for `.cmp-hint`
- * - `statusEl`: live listening strip + inline error banner for `.composer`
- * - `stop()`: stop listening (keeping transcript) — call before sending
- * - `cancel()`: abort listening and restore the pre-dictation textarea text
- * - `destroy()`: clean up listeners & any active mic session on unmount
  */
 export function createVoice({ composerEl, ta, onUpdate, onSend }) {
   wireGlobalShortcut();
@@ -227,8 +317,10 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
   const micBtn = h('button', { class: 'ibtn cmp-mic', type: 'button', 'aria-pressed': 'false' });
   const modeBtn = h('button', { class: 'cmp-steps cmp-voice-cfg', type: 'button', title: 'Voice input settings' });
 
-  let state = 'idle'; // 'idle' | 'starting' | 'listening'
+  let state = 'idle'; // 'idle' | 'starting' | 'listening' | 'recording' | 'transcribing'
   let error = null; // { text, retry, soft } | null
+  let setupOffer = null; // backend status object when optional offline download is offered or running
+  let setupPoll = 0;
   let rec = null;
   let startedAt = 0;
   let timer = 0;
@@ -243,14 +335,25 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
   let pointerHolding = false;
   let settingTextarea = false;
 
+  // Local offline recording state (getUserMedia + AudioContext PCM capture)
+  let localStream = null;
+  let localAudioCtx = null;
+  let localProcessor = null;
+  let localSource = null;
+  let localChunks = [];
+  let localSampleRate = 48000;
+  let localLevel = 0;
+  let localAbort = null;
+
   const isSupported = () => !!voiceBackend();
+  const isActive = () => state !== 'idle';
 
   function drawMic() {
     const s = voiceSettings();
     const sup = isSupported();
-    const active = state !== 'idle';
+    const active = isActive();
     micBtn.classList.toggle('listening', active);
-    micBtn.classList.toggle('starting', state === 'starting');
+    micBtn.classList.toggle('starting', state === 'starting' || state === 'transcribing');
     micBtn.classList.toggle('unsupported', !sup);
     micBtn.setAttribute('aria-pressed', String(active));
     micBtn.innerHTML = icon(sup ? 'mic' : 'micOff', 17);
@@ -270,22 +373,47 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     modeBtn.title = `Voice input (${modeWord}${s.auto_send ? ', auto-send' : ''}) — ${shortcutLabel}`;
   }
 
+  function meterBars() {
+    const lv = Math.min(1, localLevel * 4.5);
+    const weights = [0.45, 0.75, 1.0, 0.85, 0.6];
+    return h('span', { class: 'cmp-voice-meter', 'aria-hidden': 'true' },
+      weights.map((w) => h('i', { style: { height: Math.max(20, Math.round(lv * w * 100)) + '%' } })));
+  }
+
   function drawStatus() {
+    if (state === 'transcribing') {
+      statusEl.hidden = false;
+      statusEl.replaceChildren(
+        h('div', { class: 'cmp-voice-bar transcribing', role: 'status', 'aria-live': 'polite' },
+          h('span', { class: 'spin', 'aria-hidden': 'true' }),
+          h('span', { class: 'cmp-voice-lbl mono' }, 'Transcribing offline…'),
+          h('span', { class: 'cmp-voice-live' }, 'Running local whisper.cpp'),
+          h('div', { class: 'cmp-voice-acts' },
+            h('button', { class: 'cmp-voice-btn', type: 'button', title: 'Cancel transcription (Esc)', onclick: () => cancel() }, 'Cancel'))));
+      return;
+    }
+
     if (state !== 'idle') {
       const s = voiceSettings();
       const elapsed = startedAt ? fmtClock(Date.now() - startedAt) : '0:00';
+      const isLocalRec = state === 'recording';
       const label = state === 'starting'
         ? 'Starting mic…'
         : s.mode === 'ptt'
           ? `Holding to talk · ${elapsed}`
-          : `Listening · ${elapsed}`;
-      const preview = interim.trim() || (committed.trim() ? 'Keep speaking…' : 'Speak now — transcript fills the box');
+          : isLocalRec
+            ? `Recording (offline) · ${elapsed}`
+            : `Listening · ${elapsed}`;
+      const preview = isLocalRec
+        ? 'Speak now — click Done to transcribe locally'
+        : interim.trim() || (committed.trim() ? 'Keep speaking…' : 'Speak now — transcript fills the box');
       statusEl.hidden = false;
       statusEl.replaceChildren(
         h('div', { class: 'cmp-voice-bar', role: 'status', 'aria-live': 'polite' },
           h('i', { class: 'cmp-voice-dot', 'aria-hidden': 'true' }),
           h('span', { class: 'cmp-voice-lbl mono' }, label),
-          h('span', { class: 'cmp-voice-live' + (interim.trim() ? ' has' : '') }, preview),
+          isLocalRec ? meterBars() : null,
+          h('span', { class: 'cmp-voice-live' + (!isLocalRec && interim.trim() ? ' has' : '') }, preview),
           h('div', { class: 'cmp-voice-acts' },
             h('button', { class: 'cmp-voice-btn', type: 'button', title: 'Discard this dictation (Esc)', onclick: () => cancel() }, 'Cancel'),
             s.mode === 'toggle'
@@ -293,6 +421,54 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
               : null)));
       return;
     }
+
+    if (setupOffer) {
+      const busy = setupOffer.state === 'downloading' || setupOffer.state === 'extracting';
+      const failed = setupOffer.state === 'error';
+      if (busy) {
+        const pct = Math.max(0, Math.min(100, Number(setupOffer.pct) || 0));
+        statusEl.hidden = false;
+        statusEl.replaceChildren(
+          h('div', { class: 'cmp-voice-dl', role: 'status', 'aria-live': 'polite' },
+            h('div', { class: 'cmp-voice-dl-top' },
+              h('span', { class: 'spin', 'aria-hidden': 'true' }),
+              h('span', { class: 'cmp-voice-dl-t mono' }, setupOffer.detail || 'Downloading offline voice…'),
+              h('span', { class: 'mono faint' }, setupOffer.state === 'extracting' ? 'extracting' : `${pct}%`)),
+            h('div', { class: 'cmp-voice-prog' }, h('i', { style: { width: `${pct}%` } }))));
+        return;
+      }
+      if (failed) {
+        statusEl.hidden = false;
+        statusEl.replaceChildren(
+          h('div', { class: 'cmp-voice-err', role: 'alert' },
+            ic('warn', 14),
+            h('span', {}, setupOffer.error || "Couldn't download offline voice."),
+            setupOffer.can_download
+              ? h('button', { class: 'cmp-voice-btn', type: 'button', onclick: () => triggerLocalSetup() }, 'Retry')
+              : null,
+            h('button', { class: 'ibtn xs', type: 'button', title: 'Dismiss', onclick: () => { setupOffer = null; drawStatus(); }, html: icon('close', 12) })));
+        return;
+      }
+      // Optional first-use offer
+      const mb = setupOffer.model_mb || 141;
+      const missingEngine = !setupOffer.engine_ready;
+      const msg = !setupOffer.can_download
+        ? (setupOffer.detail || "Offline speech engine (whisper.cpp) isn't installed on this machine.")
+        : missingEngine
+          ? `Browser speech isn't available here. Download free offline voice (whisper.cpp + ~${mb} MB model, cached once)?`
+          : `Download the free offline speech model (~${mb} MB, cached on disk) to transcribe locally?`;
+      statusEl.hidden = false;
+      statusEl.replaceChildren(
+        h('div', { class: 'cmp-voice-err soft', role: 'status' },
+          ic('download', 14),
+          h('span', {}, msg),
+          setupOffer.can_download
+            ? h('button', { class: 'cmp-voice-btn done', type: 'button', onclick: () => triggerLocalSetup() }, `Download (~${mb} MB)`)
+            : h('button', { class: 'cmp-voice-btn', type: 'button', onclick: () => checkAndStartLocal(voiceSettings()) }, 'Check again'),
+          h('button', { class: 'ibtn xs', type: 'button', title: 'Dismiss', onclick: () => { setupOffer = null; drawStatus(); }, html: icon('close', 12) })));
+      return;
+    }
+
     if (error) {
       statusEl.hidden = false;
       statusEl.replaceChildren(
@@ -303,6 +479,7 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
           h('button', { class: 'ibtn xs', type: 'button', title: 'Dismiss', onclick: () => { error = null; drawStatus(); }, html: icon('close', 12) })));
       return;
     }
+
     statusEl.hidden = true;
     statusEl.replaceChildren();
   }
@@ -331,14 +508,41 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     settingTextarea = false;
   }
 
-  function cleanupSession({ keepError = false } = {}) {
+  function releaseLocalAudio() {
+    try { localProcessor?.disconnect(); } catch { /* fine */ }
+    try { localSource?.disconnect(); } catch { /* fine */ }
+    localProcessor = null;
+    localSource = null;
+    if (localStream) {
+      try { localStream.getTracks().forEach((tr) => tr.stop()); } catch { /* fine */ }
+      localStream = null;
+    }
+    if (localAudioCtx) {
+      try { localAudioCtx.close(); } catch { /* fine */ }
+      localAudioCtx = null;
+    }
+    localLevel = 0;
+  }
+
+  function stopSetupPoll() {
+    clearInterval(setupPoll);
+    setupPoll = 0;
+  }
+
+  function cleanupSession({ keepError = false, keepSetup = false } = {}) {
     clearInterval(timer);
     timer = 0;
     rec = null;
     androidListener = null;
+    releaseLocalAudio();
+    if (localAbort) {
+      try { localAbort.abort(); } catch { /* fine */ }
+      localAbort = null;
+    }
     if (activeVoice === ctrl) activeVoice = null;
     state = 'idle';
     if (!keepError) error = null;
+    if (!keepSetup) setupOffer = null;
     drawMic();
     drawStatus();
   }
@@ -348,7 +552,6 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     const shouldSend = !suppressAutoSend && voiceSettings().auto_send;
     suppressAutoSend = false;
     if (hadText && !cancelled) {
-      // Promote any lingering interim words on clean stop
       if (interim.trim()) {
         committed = [committed.trim(), interim.trim()].filter(Boolean).join(' ');
         interim = '';
@@ -358,16 +561,217 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     snapshot = null;
     committed = '';
     interim = '';
-    cleanupSession({ keepError: !!error });
+    cleanupSession({ keepError: !!error, keepSetup: !!setupOffer });
     ta.focus();
     if (hadText && !cancelled && shouldSend && !error) {
       onSend?.();
     }
   }
 
+  async function triggerLocalSetup() {
+    error = null;
+    setupOffer = { ...(setupOffer || {}), state: 'downloading', pct: 0, detail: 'Starting download…', can_download: true };
+    drawStatus();
+    try {
+      const st = await post('voice/setup', {});
+      handleSetupUpdate(st);
+      if (st.state === 'downloading' || st.state === 'extracting') startSetupPoll();
+    } catch (e) {
+      setupOffer = { ...(setupOffer || {}), state: 'error', error: e.message || "Couldn't start offline voice download.", can_download: true };
+      drawStatus();
+    }
+  }
+
+  function startSetupPoll() {
+    stopSetupPoll();
+    setupPoll = setInterval(async () => {
+      try {
+        const st = await get('voice/status', { quiet: true });
+        handleSetupUpdate(st);
+      } catch { /* keep waiting for WS or next poll */ }
+    }, 1200);
+  }
+
+  function handleSetupUpdate(st) {
+    if (!st) return;
+    if (st.ready && setupOffer) {
+      stopSetupPoll();
+      setupOffer = null;
+      error = null;
+      drawMic();
+      drawStatus();
+      toast('Offline voice is ready — click the mic or press ' + shortcutLabel, { ms: 4200 });
+      return;
+    }
+    if (setupOffer || st.state === 'downloading' || st.state === 'extracting') {
+      setupOffer = st;
+      if (st.state !== 'downloading' && st.state !== 'extracting') stopSetupPoll();
+      drawStatus();
+    }
+  }
+
+  async function checkAndStartLocal(s) {
+    error = null;
+    let st;
+    try {
+      st = await get('voice/status', { quiet: true });
+    } catch (e) {
+      error = describeVoiceError('unknown', `Couldn't check local voice engine: ${e.message}`);
+      cleanupSession({ keepError: true });
+      return;
+    }
+    if (cancelled) return;
+    if (st.ready) {
+      await startLocalRecording(s);
+      return;
+    }
+    // Not ready yet: present optional download prompt (or ongoing download progress)
+    setupOffer = st;
+    if (st.state === 'downloading' || st.state === 'extracting') startSetupPoll();
+    snapshot = null;
+    cleanupSession({ keepSetup: true });
+  }
+
+  async function startLocalRecording(s) {
+    if (!hasGetUserMedia()) {
+      error = describeVoiceError('unsupported');
+      cleanupSession({ keepError: true });
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+    } catch (e) {
+      const name = e?.name || '';
+      const code = (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError')
+        ? 'not-allowed'
+        : (name === 'NotFoundError' || name === 'DevicesNotFoundError' || name === 'NotReadableError')
+          ? 'audio-capture'
+          : 'unknown';
+      error = describeVoiceError(code, e?.message);
+      cleanupSession({ keepError: true });
+      return;
+    }
+    if (cancelled) {
+      try { stream.getTracks().forEach((tr) => tr.stop()); } catch { /* fine */ }
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) {
+      try { stream.getTracks().forEach((tr) => tr.stop()); } catch { /* fine */ }
+      error = describeVoiceError('unsupported', 'Web Audio API is unavailable in this browser.');
+      cleanupSession({ keepError: true });
+      return;
+    }
+    try {
+      const ctx = new AC();
+      const src = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      localStream = stream;
+      localAudioCtx = ctx;
+      localSource = src;
+      localProcessor = proc;
+      localSampleRate = ctx.sampleRate || 48000;
+      localChunks = [];
+      localLevel = 0;
+
+      proc.onaudioprocess = (ev) => {
+        if (state !== 'recording') return;
+        const ch = ev.inputBuffer.getChannelData(0);
+        localChunks.push(new Float32Array(ch));
+        let sum = 0;
+        for (let i = 0; i < ch.length; i += 4) sum += ch[i] * ch[i];
+        localLevel = Math.sqrt(sum / Math.max(1, ch.length / 4));
+      };
+      src.connect(proc);
+      proc.connect(ctx.destination);
+      if (ctx.state === 'suspended') ctx.resume?.().catch(() => {});
+
+      state = 'recording';
+      startedAt = Date.now();
+      clearInterval(timer);
+      timer = setInterval(() => state === 'recording' && drawStatus(), 200);
+      drawMic();
+      drawStatus();
+    } catch (e) {
+      releaseLocalAudio();
+      error = describeVoiceError('audio-capture', e?.message);
+      cleanupSession({ keepError: true });
+    }
+  }
+
+  async function finishLocalRecording({ keepTextNow = false } = {}) {
+    const chunks = localChunks;
+    const rate = localSampleRate;
+    localChunks = [];
+    clearInterval(timer);
+    timer = 0;
+    releaseLocalAudio();
+
+    if (!chunks.length || cancelled) {
+      finishSession();
+      return;
+    }
+    if (keepTextNow) {
+      // User manually clicked Send before transcription; don't overwrite what they sent
+      snapshot = null;
+      cleanupSession();
+      return;
+    }
+
+    state = 'transcribing';
+    drawMic();
+    drawStatus();
+
+    const wav = encodeWav(chunks, rate, 16000);
+    const s = voiceSettings();
+    const qs = s.lang ? '?lang=' + encodeURIComponent(s.lang) : '';
+    const ctl = new AbortController();
+    localAbort = ctl;
+
+    try {
+      const res = await api('voice/transcribe' + qs, {
+        method: 'POST',
+        body: new Blob([wav], { type: 'audio/wav' }),
+        raw: true,
+        timeout: 90000,
+      });
+      if (cancelled || localAbort !== ctl) return;
+      localAbort = null;
+      const text = (res?.text || '').trim();
+      if (text) {
+        committed = text;
+        interim = '';
+        applyTranscript();
+      } else {
+        error = describeVoiceError('no-speech');
+      }
+      finishSession();
+    } catch (e) {
+      if (cancelled || localAbort !== ctl) return;
+      localAbort = null;
+      const msg = e?.message || 'Local transcription failed.';
+      // If the engine/model disappeared from disk, surface the setup prompt again
+      if (/isn't installed|isn't downloaded/i.test(msg)) {
+        snapshot = null;
+        cleanupSession();
+        checkAndStartLocal(s);
+        return;
+      }
+      error = { text: msg, retry: true };
+      finishSession();
+    }
+  }
+
   function startWebSpeech(s) {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) {
+      if (hasGetUserMedia()) {
+        checkAndStartLocal(s);
+        return;
+      }
       error = describeVoiceError('unsupported');
       cleanupSession({ keepError: true });
       return;
@@ -410,7 +814,20 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
       if (rec !== r) return;
       const code = ev?.error || 'unknown';
       if (cancelled || code === 'aborted') return;
-      // Ignore benign no-speech if we already captured text
+      // Automatic fallback to free local whisper.cpp when Web Speech reports network / service-not-allowed (WebView2)
+      if ((code === 'network' || code === 'service-not-allowed') && !committed.trim() && hasGetUserMedia()) {
+        webSpeechBlocked = true;
+        ignoreEnd = true;
+        rec = null;
+        try { r.abort(); } catch { /* fine */ }
+        clearInterval(timer);
+        timer = 0;
+        state = 'starting';
+        drawMic();
+        drawStatus();
+        checkAndStartLocal(s);
+        return;
+      }
       if (code === 'no-speech' && (committed.trim() || interim.trim())) return;
       const desc = describeVoiceError(code, ev?.message);
       if (desc) error = desc;
@@ -474,6 +891,7 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
   function start() {
     if (state !== 'idle') return;
     error = null;
+    setupOffer = null;
     const backend = voiceBackend();
     if (!backend) {
       error = describeVoiceError('unsupported');
@@ -506,15 +924,20 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
 
     const s = voiceSettings();
     if (backend === 'android') startAndroidSpeech(s);
+    else if (backend === 'local') checkAndStartLocal(s);
     else startWebSpeech(s);
   }
 
   function stop({ keepTextNow = false } = {}) {
     if (state === 'idle') return;
     cancelled = false;
+    if (state === 'recording') {
+      finishLocalRecording({ keepTextNow });
+      return;
+    }
+    if (state === 'transcribing') return;
     if (keepTextNow) {
       suppressAutoSend = true;
-      // Commit text immediately before a manual Send/Enter clears the textarea
       if (interim.trim()) {
         committed = [committed.trim(), interim.trim()].filter(Boolean).join(' ');
         interim = '';
@@ -525,13 +948,9 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
       interim = '';
       if (rec) {
         ignoreEnd = true;
-        try {
-          rec.stop();
-        } catch { /* fine */ }
+        try { rec.stop(); } catch { /* fine */ }
       } else if (androidListener && window.RoamerAndroid?.stopVoice) {
-        try {
-          window.RoamerAndroid.stopVoice();
-        } catch { /* fine */ }
+        try { window.RoamerAndroid.stopVoice(); } catch { /* fine */ }
       }
       cleanupSession();
       return;
@@ -561,15 +980,12 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     snapshot = null;
     committed = '';
     interim = '';
+    localChunks = [];
     if (rec) {
       ignoreEnd = true;
-      try {
-        rec.abort();
-      } catch { /* fine */ }
+      try { rec.abort(); } catch { /* fine */ }
     } else if (androidListener && window.RoamerAndroid?.cancelVoice) {
-      try {
-        window.RoamerAndroid.cancelVoice();
-      } catch { /* fine */ }
+      try { window.RoamerAndroid.cancelVoice(); } catch { /* fine */ }
     }
     cleanupSession();
     ta.focus();
@@ -604,7 +1020,6 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
   // Mic button interactions: toggle on click, or hold in push-to-talk mode; right-click opens settings
   micBtn.addEventListener('click', (e) => {
     if (voiceSettings().mode === 'ptt') {
-      // Keyboard activation (Enter/Space on focused button) still works as toggle fallback
       if (e.detail === 0) toggle();
       return;
     }
@@ -614,9 +1029,7 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     if (e.button !== 0 || voiceSettings().mode !== 'ptt') return;
     e.preventDefault();
     pointerHolding = true;
-    try {
-      micBtn.setPointerCapture(e.pointerId);
-    } catch { /* fine */ }
+    try { micBtn.setPointerCapture(e.pointerId); } catch { /* fine */ }
     start();
   });
   const endPointerHold = (e) => {
@@ -654,6 +1067,7 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
       if (state !== 'idle') drawStatus();
     }
   });
+  const unwatchSetup = watchLocalSetup(handleSetupUpdate);
 
   const ctrl = {
     micBtn,
@@ -668,7 +1082,9 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
     contains: (node) => !!node && composerEl.contains(node),
     destroy: () => {
       if (state !== 'idle') cancel();
+      stopSetupPoll();
       unwatch();
+      unwatchSetup();
       mounted.delete(ctrl);
       if (lastFocused === ctrl) lastFocused = null;
       ta.removeEventListener('input', onManualInput);
@@ -733,4 +1149,3 @@ export function attachComposerVoice(composerEl, { onSend } = {}) {
   attached.set(composerEl, ctrl);
   return ctrl;
 }
-

@@ -123,6 +123,62 @@
 }
 .cmp-voice-err.soft > .ico { color: var(--accent); }
 
+.cmp-voice-bar.transcribing {
+  background: var(--bg);
+  border-color: var(--line2);
+  border-left-color: var(--accent);
+}
+.cmp-voice-bar.transcribing .cmp-voice-lbl { color: var(--accent); }
+
+.cmp-voice-meter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+  flex: none;
+}
+.cmp-voice-meter i {
+  display: block;
+  width: 3px;
+  min-height: 3px;
+  background: var(--hot);
+  transition: height .12s var(--ease);
+}
+
+.cmp-voice-dl {
+  display: grid;
+  gap: 6px;
+  padding: 7px 10px;
+  background: var(--bg);
+  border: 1px solid var(--line2);
+  border-left: 3px solid var(--accent);
+}
+.cmp-voice-dl-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.cmp-voice-dl-t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.cmp-voice-prog {
+  height: 4px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.cmp-voice-prog i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width .2s var(--ease);
+}
+
 .cmp-voice-cfg { margin-left: 0; }
 .cmp-hint .cmp-voice-cfg + .cmp-steps { margin-left: 0; }
 .cmp-hint .cmp-voice-cfg { margin-left: auto; }

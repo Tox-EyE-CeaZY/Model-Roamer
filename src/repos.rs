@@ -43,6 +43,16 @@ fn row(core: &Core, pid: &str, rid: &str) -> Result<Value> {
     core.db.one("SELECT * FROM repos WHERE id = ?1 AND project_id = ?2", &[&rid, &pid])?.ok_or_else(|| anyhow!("No repository {rid} in this project."))
 }
 
+/// Why the last clone of an added repository failed (until one works), so the list can say so and offer a retry.
+fn clone_errors() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static E: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+    E.get_or_init(Default::default)
+}
+
+fn clone_error(rid: &str) -> Option<String> {
+    clone_errors().lock().ok()?.get(rid).cloned()
+}
+
 fn clone_dir(core: &Core, pid: &str, rid: &str) -> PathBuf {
     core.data.join("projects").join(pid).join("repos").join(rid)
 }
@@ -132,7 +142,7 @@ pub fn list(core: &Core, p: &Value) -> Result<Vec<Value>> {
         out.push(json!({
             "id": rid, "primary": false, "name": r["name"], "kind": r["kind"], "url": r["url"], "folder": f, "base_branch": r["base_branch"], "home": home,
             // a GitHub repository with no folder yet is still being cloned (or the clone failed: see `cloning`)
-            "present": on_disk(f), "cloning": f.is_empty() && !r["url"].as_str().unwrap_or("").is_empty(), "git": is_git(&home), "threads": open(rid),
+            "present": on_disk(f), "cloning": f.is_empty() && !r["url"].as_str().unwrap_or("").is_empty() && clone_error(rid).is_none(), "clone_error": clone_error(rid), "git": is_git(&home), "threads": open(rid),
             "created_at": r["created_at"],
         }));
     }
@@ -271,15 +281,32 @@ pub fn insert(core: &CoreRef, pid: &str, r: &Value) -> Result<Value> {
     )?;
     changed(core, pid);
     if s(r, "folder").is_empty() {
-        let (c, pid, rid) = (core.clone(), pid.to_string(), id.clone());
-        tokio::spawn(async move {
-            if let Err(e) = ensure_folder(&c, &pid, &rid).await {
-                c.bus.emit("toast", Some(&pid), None, json!({ "err": true, "text": format!("Couldn't clone the repository: {e:#}") }));
-                changed(&c, &pid);
-            }
-        });
+        clone_in_background(core, pid, &id);
     }
     Ok(row(core, pid, &id)?)
+}
+
+/// Repositories being cloned right now.
+fn cloning() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static C: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn clone_in_background(core: &CoreRef, pid: &str, rid: &str) {
+    if !cloning().lock().map(|mut c| c.insert(rid.to_string())).unwrap_or(false) {
+        return; // already on it
+    }
+    let (c, pid, rid) = (core.clone(), pid.to_string(), rid.to_string());
+    tokio::spawn(async move {
+        let r = ensure_folder(&c, &pid, &rid).await;
+        if let Ok(mut s) = cloning().lock() {
+            s.remove(&rid);
+        }
+        if let Err(e) = r {
+            c.bus.emit("toast", Some(&pid), None, json!({ "err": true, "text": format!("Couldn't clone the repository: {e:#}") }));
+            changed(&c, &pid);
+        }
+    });
 }
 
 fn changed(core: &Core, pid: &str) {
@@ -304,7 +331,16 @@ pub async fn ensure_folder(core: &Core, pid: &str, rid: &str) -> Result<()> {
         }
         core.bus.emit("progress", Some(pid), None, json!({ "text": format!("Cloning {url}…") }));
         let tok = github::token(core).await;
-        git::clone(&url, &into, tok.as_deref()).await?;
+        if let Err(e) = git::clone(&url, &into, tok.as_deref()).await {
+            let _ = std::fs::remove_dir_all(&into);
+            if let Ok(mut m) = clone_errors().lock() {
+                m.insert(rid.to_string(), format!("{e:#}"));
+            }
+            return Err(e);
+        }
+    }
+    if let Ok(mut m) = clone_errors().lock() {
+        m.remove(rid);
     }
     let base = git::default_branch(&into).await;
     let f = into.display().to_string();
@@ -320,7 +356,12 @@ type Q = Query<HashMap<String, String>>;
 
 pub async fn list_api(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let p = core.project(&id)?;
-    Ok(Json(json!(list(&core, &p)?)))
+    let l = list(&core, &p)?;
+    // a clone that a restart cut short (or never began) starts again when someone looks
+    for r in l.iter().filter(|r| r["cloning"] == true) {
+        clone_in_background(&core, &id, r["id"].as_str().unwrap_or(""));
+    }
+    Ok(Json(json!(l)))
 }
 
 pub async fn add_api(State(core): State<CoreRef>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
@@ -344,6 +385,13 @@ pub async fn patch_api(State(core): State<CoreRef>, Path((id, rid)): Path<(Strin
     }
     if let Some(v) = b["base_branch"].as_str() {
         core.db.exec("UPDATE repos SET base_branch = ?1, updated_at = ?2 WHERE id = ?3", &[&v.trim(), &now, &rid])?;
+    }
+    // try a failed clone again
+    if b["retry_clone"] == true {
+        if let Ok(mut m) = clone_errors().lock() {
+            m.remove(&rid);
+        }
+        clone_in_background(&core, &id, &rid);
     }
     changed(&core, &id);
     Ok(Json(row(&core, &id, &rid)?))

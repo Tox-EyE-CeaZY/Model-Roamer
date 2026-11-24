@@ -931,6 +931,8 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
 .np-extra { display: flex; align-items: flex-start; gap: 8px; }
 .np-extra .np-x-ic { color: var(--dim); padding-top: 9px; }
 .np-extra .grow { min-width: 0; }
-.repo-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-.repo-bar .sel, .fl-bar .sel { width: auto; max-width: 30ch; height: 28px; }
+.p-body > .repo-bar { margin: var(--gut) var(--gut) 0; display: flex; align-items: center; gap: 10px; }
+.p-body > .repo-bar + .git-grid { margin-top: 12px; }
+.repo-bar .sel, .fl-bar .sel { width: auto; max-width: 30ch; padding-top: 5px; padding-bottom: 5px; flex: 0 0 auto; }
+.p-sub .chipbtn { white-space: nowrap; flex: 0 0 auto; }
 .tc-repo { display: inline-flex; align-items: center; gap: 3px; color: var(--accent); max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

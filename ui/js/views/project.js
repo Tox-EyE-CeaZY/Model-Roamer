@@ -35,8 +35,7 @@ export default async function projectView(el, r, ctx) {
         h('i', { class: 'p-sw' }),
         h('h1', {}, p.name),
         h('span', { class: 'p-sub mono', title: p.home }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', {}, where), p.base_branch ? [h('span', { class: 'faint' }, '·'), h('span', {}, p.base_branch)] : null,
-          p.repos?.length > 1 ? h('a', { class: 'chipbtn', href: '#/p/' + p.id + '/settings', title: p.repos.map(repoLabel).join('
-') }, `+${p.repos.length - 1} more`) : null),
+          p.repos?.length > 1 ? h('a', { class: 'chipbtn', href: '#/p/' + p.id + '/settings', title: p.repos.map(repoLabel).join(', ') }, `+${p.repos.length - 1} more`) : null),
         h('span', { class: 'grow' }),
         h('button', { class: 'btn primary sm', onclick: () => newThreadDialog(p.id) }, ic('plus', 13), 'New thread'),
         h('button', { class: 'ibtn', title: 'More', onclick: (e) => {
@@ -401,6 +400,7 @@ function reposPanel(p) {
   }
 
   function state(r) {
+    if (r.clone_error) return h('span', { class: 'tag hot', title: r.clone_error }, 'clone failed');
     if (r.cloning) return h('span', { class: 'tag' }, 'cloning…');
     if (!r.present) return h('span', { class: 'tag hot', title: r.folder }, 'folder missing');
     return h('span', { class: 'tag' }, r.git ? 'git' : 'plain folder');
@@ -412,9 +412,10 @@ function reposPanel(p) {
       h('div', { class: 'repo-main' },
         h('b', {}, r.name, r.primary ? h('span', { class: 'tag acc' }, 'primary') : null, state(r)),
         h('small', { class: 'mono faint', title: r.home }, r.kind === 'github' && r.url ? r.url : r.home || r.folder),
-        h('small', { class: 'faint' }, [r.base_branch ? 'base ' + r.base_branch : null, r.threads ? `${r.threads} open thread${r.threads === 1 ? '' : 's'}` : null].filter(Boolean).join(' · '))),
+        r.clone_error ? h('small', { class: 'f-err' }, r.clone_error) : h('small', { class: 'faint' }, [r.base_branch ? 'base ' + r.base_branch : null, r.threads ? `${r.threads} open thread${r.threads === 1 ? '' : 's'}` : null].filter(Boolean).join(' · '))),
       h('div', { class: 'row-btns' },
-        h('button', { class: 'btn xs', title: 'Open a thread on this repository', onclick: () => newThreadDialog(p.id, { repo: r.id }) }, ic('plus', 11), 'Thread'),
+        r.clone_error ? h('button', { class: 'btn xs', onclick: () => patch(`projects/${p.id}/repos/${r.id}`, { retry_clone: true }).then(load).catch((e) => toast(e.message, { err: true })) }, ic('refresh', 11), 'Retry clone')
+          : h('button', { class: 'btn xs', title: 'Open a thread on this repository', onclick: () => newThreadDialog(p.id, { repo: r.id }) }, ic('plus', 11), 'Thread'),
         r.primary ? null : h('button', { class: 'ibtn sm', title: 'Rename', onclick: () => rename(r), html: icon('edit', 14) }),
         r.primary ? null : h('button', { class: 'ibtn sm', title: r.threads ? 'Resolve its open threads first' : 'Remove from the project', onclick: () => remove(r), html: icon('trash', 14) })));
   }

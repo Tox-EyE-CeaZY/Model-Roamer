@@ -384,6 +384,7 @@ function shortcuts() {
       k('Ctrl ,', 'Settings'),
       k('Ctrl B', 'Collapse the side rail'),
       k('Ctrl Enter', 'Send a message'),
+      k('Ctrl Shift M', 'Voice input (toggle or hold to talk)'),
       k('Ctrl Shift O', 'Pop the thread out into its own window'),
       k('Ctrl .', 'Stop the agent in this thread'),
       k('Alt ←', 'Back'),
@@ -468,6 +469,7 @@ async function start() {
   side();
   // a phone can install the app to its home screen (needs https or localhost; harmless elsewhere)
   if (!isDesktop && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  import('./voice.js').then((m) => m.initVoice()).catch((e) => console.error(e));
   if (!isPop) import('./statusbar.js').then((m) => m.initStatusBar()).catch((e) => console.error(e));
   addEventListener('hashchange', render);
   render();

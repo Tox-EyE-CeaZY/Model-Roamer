@@ -86,7 +86,10 @@ pub async fn handle(core: &CoreRef, thread_id: &str, req: &Value) -> Option<Valu
             "instructions": "Model Roamer's tools: shared memory, threads, messages, artifacts, git and GitHub for this project. Your instructions explain when to use each."
         })),
         "ping" => ok(json!({})),
-        "tools/list" => ok(json!({ "tools": tools::list(tools::role_of(&thread)) })),
+        "tools/list" => {
+            let bridged = crate::collab_bridge::bind_row(core, &thread).ok().flatten().is_some();
+            ok(json!({ "tools": tools::list(tools::role_of(&thread), bridged) }))
+        }
         "tools/call" => {
             let name = req["params"]["name"].as_str().unwrap_or("");
             let args = req["params"]["arguments"].clone();

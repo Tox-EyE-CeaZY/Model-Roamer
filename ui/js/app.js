@@ -347,7 +347,7 @@ export async function palette(initial = '') {
           ...r.threads.map((t) => ({ label: t.title, sub: clean(t.snippet) || where(t), icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => open(t) })),
           ...r.messages.slice(0, 12).map((m) => ({ label: clean(m.snippet), sub: `${m.role === 'agent' ? 'agent' : m.author || 'you'} · ${where(m)}`, icon: 'hash', run: () => open(m, m.id) })),
           ...r.artifacts.map((a) => ({ label: a.title, sub: clean(a.description) || a.kind + (projectOf(a.project_id) ? ' · ' + projectOf(a.project_id).name : ''), icon: 'artifact', run: () => go('#/a/' + a.id) })),
-          ...r.memory.slice(0, 6).map((m) => ({ label: m.name, sub: m.description || 'memory', icon: 'memory', run: () => go('#/memory?open=' + m.id) })),
+          ...r.memory.slice(0, 6).map((m) => ({ label: m.name, sub: [m.scope === 'collaborator' ? 'private' : m.scope, m.description].filter(Boolean).join(' · '), icon: 'memory', run: () => go('#/memory?open=' + m.id) })),
         ];
       } catch { /* offline: actions still work */ }
     }

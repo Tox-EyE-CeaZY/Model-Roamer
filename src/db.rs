@@ -300,6 +300,20 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE threads ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
     "#,
+    // 12: private memory and explicit bindings from local agent threads to joined projects
+    r#"
+    ALTER TABLE memory ADD COLUMN user_id TEXT;
+    DROP INDEX memory_name;
+    CREATE UNIQUE INDEX memory_name ON memory(IFNULL(project_id, ''), IFNULL(user_id, ''), name);
+    ALTER TABLE collab_users ADD COLUMN identity_hash TEXT NOT NULL DEFAULT '';
+    CREATE UNIQUE INDEX collab_user_identity ON collab_users(instance_id, identity_hash)
+        WHERE identity_hash != '' AND revoked_at IS NULL;
+    CREATE TABLE collab_agent_threads (
+        thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+        link_id TEXT NOT NULL,
+        host_thread_id TEXT
+    );
+    "#,
 ];
 
 #[derive(Clone)]
@@ -418,5 +432,36 @@ mod tests {
         db.exec("INSERT INTO memory(id, project_id, name, body, updated_at) VALUES ('m1', NULL, 'design', 'chamfered corners and lime', ?1)", &[&now]).unwrap();
         let hits = db.all("SELECT m.name FROM memory_fts f JOIN memory m ON m.rowid = f.rowid WHERE memory_fts MATCH 'chamfered'", &[]).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn upgrades_v11_memory_and_keeps_private_names_independent() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..11] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 11;
+             INSERT INTO memory(id, project_id, name, body, updated_at) VALUES
+                 ('global', NULL, 'rules', 'globaltext', 1),
+                 ('shared', 'project', 'rules', 'sharedtext', 1);",
+        ).unwrap();
+        let db = Db { conn: Arc::new(Mutex::new(conn)) };
+        db.migrate().unwrap();
+        assert_eq!(db.scalar_i64("PRAGMA user_version", &[]).unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM memory WHERE user_id IS NULL", &[]).unwrap(), 2);
+        db.exec(
+            "INSERT INTO memory(id, project_id, user_id, name, body, updated_at) VALUES
+                 ('a', 'project', 'user-a', 'rules', 'privatealpha', 2),
+                 ('b', 'project', 'user-b', 'rules', 'privatebravo', 2)",
+            &[],
+        ).unwrap();
+        assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM memory WHERE name = 'rules'", &[]).unwrap(), 4);
+        assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'sharedtext'", &[]).unwrap(), 1);
+        assert!(db.exec(
+            "INSERT INTO memory(id, project_id, user_id, name, body, updated_at)
+             VALUES ('dup', 'project', 'user-a', 'rules', 'duplicate', 3)",
+            &[],
+        ).is_err());
     }
 }

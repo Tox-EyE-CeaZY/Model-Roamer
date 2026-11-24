@@ -61,6 +61,39 @@ fn origin_of(url: &str) -> String {
     format!("{}://{}", url.split("://").next().unwrap_or("http"), host)
 }
 
+/// Grant microphone capture inside Windows WebView2 so composer voice input (getUserMedia) isn't blocked.
+#[cfg(windows)]
+fn allow_microphone(webview: &WebView) {
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+            COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+        },
+        PermissionRequestedEventHandler,
+    };
+    use wry::WebViewExtWindows;
+
+    let wv = webview.webview();
+    let mut token = 0i64;
+    unsafe {
+        let res = wv.add_PermissionRequested(
+            &PermissionRequestedEventHandler::create(Box::new(|_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+                args.PermissionKind(&mut kind)?;
+                if kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE {
+                    args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
+                }
+                Ok(())
+            })),
+            &mut token,
+        );
+        if let Err(e) = res {
+            tracing::warn!("couldn't attach WebView2 microphone permission handler: {e}");
+        }
+    }
+}
+
 impl Shell {
     fn auth_url(&self, next: &str) -> String {
         let enc = percent_encoding::utf8_percent_encode(next, percent_encoding::NON_ALPHANUMERIC);
@@ -158,6 +191,8 @@ impl Shell {
         };
         match webview {
             Ok(webview) => {
+                #[cfg(windows)]
+                allow_microphone(&webview);
                 self.wins.insert(id, Win { window, webview, key: key.to_string(), main });
             }
             Err(e) => tracing::error!("couldn't create a web view: {e}"),

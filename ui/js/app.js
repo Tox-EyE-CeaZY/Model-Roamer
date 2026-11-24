@@ -384,6 +384,7 @@ function shortcuts() {
       k('Ctrl ,', 'Settings'),
       k('Ctrl B', 'Collapse the side rail'),
       k('Ctrl Enter', 'Send a message'),
+      k('Ctrl Shift M', 'Voice input (toggle or hold to talk)'),
       k('Ctrl Shift O', 'Pop the thread out into its own window'),
       k('Ctrl .', 'Stop the agent in this thread'),
       k('Alt ←', 'Back'),

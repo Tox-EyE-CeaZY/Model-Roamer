@@ -34,6 +34,7 @@ mod setup;
 mod tools;
 mod update;
 mod util;
+mod voice;
 
 use serde_json::json;
 use std::{sync::atomic::Ordering, time::Duration};

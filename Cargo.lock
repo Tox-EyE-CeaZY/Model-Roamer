@@ -1909,6 +1909,7 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "uuid",
+ "webview2-com",
  "which",
  "winreg 0.52.0",
  "winresource",

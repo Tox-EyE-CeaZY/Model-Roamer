@@ -101,6 +101,10 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/fs/check", get(crate::repos::check_api))
         .route("/api/fs/reveal", post(fs_reveal))
         .route("/api/upload", post(upload))
+        // voice (free local offline fallback)
+        .route("/api/voice/status", get(crate::voice::api_status))
+        .route("/api/voice/setup", post(crate::voice::api_setup))
+        .route("/api/voice/transcribe", post(crate::voice::api_transcribe))
         // remote access
         .route("/api/network", get(network))
         .route("/api/network/tailscale-serve", post(tailscale_serve))

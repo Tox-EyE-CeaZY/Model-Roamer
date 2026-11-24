@@ -1,0 +1,200 @@
+/* ============================================================================
+   Composer voice mode — matches the Roamer angular / chamfered token language.
+   Kept in its own sheet to stay cleanly separated from other layout changes.
+   ========================================================================== */
+
+.composer.listening { --bd: var(--hot); }
+
+.cmp-mic { flex: none; }
+.cmp-mic.unsupported { opacity: .48; }
+.cmp-mic.listening {
+  background: var(--hot);
+  color: #000;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}
+@media (hover: hover) {
+  .cmp-mic.listening:hover { background: var(--hot); color: #000; filter: brightness(1.08); }
+}
+.cmp-mic.listening::after {
+  content: '';
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 6px;
+  height: 6px;
+  background: #000;
+  animation: cmp-mic-blink 1.1s var(--ease) infinite;
+}
+.cmp-mic.starting { opacity: .82; }
+
+.cmp-voice:not([hidden]) { padding: 0 2px 6px; }
+
+.cmp-voice-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  background: color-mix(in oklch, var(--hot) 10%, var(--bg));
+  border: 1px solid color-mix(in oklch, var(--hot) 55%, transparent);
+  border-left: 3px solid var(--hot);
+}
+
+.cmp-voice-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  background: var(--hot);
+  animation: cmp-mic-blink 1s var(--ease) infinite;
+}
+
+.cmp-voice-lbl {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--hot);
+  white-space: nowrap;
+}
+
+.cmp-voice-live {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--faint);
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cmp-voice-live.has {
+  color: var(--ink);
+  font-style: normal;
+}
+
+.cmp-voice-acts {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+}
+
+.cmp-voice-btn {
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line2);
+  background: var(--bg2);
+  color: var(--dim);
+  font: 600 9.5px var(--f-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: border-color .15s, color .15s, background .15s;
+}
+@media (hover: hover) {
+  .cmp-voice-btn:hover { border-color: var(--ink); color: var(--ink); }
+}
+.cmp-voice-btn.done {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+@media (hover: hover) {
+  .cmp-voice-btn.done:hover { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+}
+
+.cmp-voice-err {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  background: color-mix(in oklch, var(--hot) 8%, var(--bg));
+  border: 1px solid color-mix(in oklch, var(--hot) 45%, transparent);
+  border-left: 3px solid var(--hot);
+  font-size: 12px;
+  color: var(--ink);
+}
+.cmp-voice-err > .ico { color: var(--hot); flex: none; }
+.cmp-voice-err > span { flex: 1; min-width: 0; line-height: 1.35; }
+.cmp-voice-err.soft {
+  background: var(--bg);
+  border-color: var(--line2);
+  border-left-color: var(--accent);
+}
+.cmp-voice-err.soft > .ico { color: var(--accent); }
+
+.cmp-voice-bar.transcribing {
+  background: var(--bg);
+  border-color: var(--line2);
+  border-left-color: var(--accent);
+}
+.cmp-voice-bar.transcribing .cmp-voice-lbl { color: var(--accent); }
+
+.cmp-voice-meter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+  flex: none;
+}
+.cmp-voice-meter i {
+  display: block;
+  width: 3px;
+  min-height: 3px;
+  background: var(--hot);
+  transition: height .12s var(--ease);
+}
+
+.cmp-voice-dl {
+  display: grid;
+  gap: 6px;
+  padding: 7px 10px;
+  background: var(--bg);
+  border: 1px solid var(--line2);
+  border-left: 3px solid var(--accent);
+}
+.cmp-voice-dl-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+}
+.cmp-voice-dl-t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.cmp-voice-prog {
+  height: 4px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.cmp-voice-prog i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width .2s var(--ease);
+}
+
+.cmp-voice-cfg { margin-left: 0; }
+.cmp-hint .cmp-voice-cfg + .cmp-steps { margin-left: 0; }
+.cmp-hint .cmp-voice-cfg { margin-left: auto; }
+
+@keyframes cmp-mic-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .28; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cmp-mic.listening::after,
+  .cmp-voice-dot { animation: none; }
+}
+.no-motion .cmp-mic.listening::after,
+.no-motion .cmp-voice-dot { animation: none; }
+
+@media (max-width: 700px) {
+  .cmp-voice-live { display: none; }
+}

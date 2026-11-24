@@ -101,6 +101,8 @@ const P = {
   warn: '<path d="M12 3 2 20h20zM12 10v4M12 17h.01"/>',
   dot: '<circle cx="12" cy="12" r="4" fill="currentColor"/>',
   hash: '<path d="M10 3 8 21M16 3l-2 18M4 8h17M3 16h17"/>',
+  mic: '<rect x="9" y="3" width="6" height="11"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v3M8 22h8"/>',
+  micOff: '<path d="M9 9v5h6v-1M9 5V3h6v8M5 11v1a7 7 0 0 0 11.4 5.4M19 11v1a7 7 0 0 1-.5 2.6M12 19v3M8 22h8M3 3l18 18"/>',
 };
 
 export function icon(name, size = 18, cls = '') {

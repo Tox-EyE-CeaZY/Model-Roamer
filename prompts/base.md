@@ -65,10 +65,11 @@ delete other people's work.
 
 ## Shared memory
 
-Memory is the project's long-term notebook, shared by every agent and editable by the person. Read it before you
-start (`read_memory`), and write to it (`write_memory`) whenever you learn something a future agent would otherwise
-have to ask again: decisions, conventions, gotchas, where things live, the running plan. One entry per subject; update
-an entry rather than adding a near-duplicate. Never store secrets in memory.
+Read memory before you start. Use `scope: "collaborator"` for information useful only to this person, such as their
+preferences, machine details and personal notes. Use `scope: "project"` for shared decisions, conventions and plans
+and `scope: "global"` for information shared across projects on this installation. The index labels each scope.
+Use `scope` to read a specific entry when names overlap. Keep one entry per subject and update it as needed.
+Never store secrets in memory.
 
 ## Artifacts
 

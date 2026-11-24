@@ -114,6 +114,7 @@ pub struct Ctx<'a> {
 pub fn system(core: &Core, c: &Ctx) -> String {
     let t = c.thread;
     let role = tools::role_of(t);
+    let bridged = crate::collab_bridge::bind_row(core, t).ok().flatten().is_some();
     let agent = t["agent"].as_str().unwrap_or("");
     let pname = c.project.and_then(|p| p["name"].as_str()).unwrap_or("");
     let role_line = match role {
@@ -149,7 +150,7 @@ pub fn system(core: &Core, c: &Ctx) -> String {
     s.push_str("\n\n");
     s.push_str(&harness(agent));
     s.push_str("\n\n## Model Roamer tools\n\n");
-    s.push_str(&tools::describe(role));
+    s.push_str(&tools::describe(role, bridged));
     if !c.mcp || agent == "antigravity" {
         s.push('\n');
         s.push_str(tools::TEXT_PROTOCOL);
@@ -178,10 +179,13 @@ pub fn system(core: &Core, c: &Ctx) -> String {
             s.push_str(&format!("\n### The person's instructions for this project (follow them)\n\n{instr}\n"));
         }
     }
-    let pid = c.project.and_then(|p| p["id"].as_str());
+    let pid = if bridged { None } else { c.project.and_then(|p| p["id"].as_str()) };
     s.push_str(&format!("\n### Memory index\n\n{}\n", memory::index(core, pid)));
+    if bridged {
+        s.push_str("\nThis thread is linked to a hosted project. Call `read_memory` to include the host's shared project memory, and use `list_threads` and `read_thread` for its threads. Publish shared artifacts with inline `content`. Collaborator and global memory belong to this installation.\n");
+    }
     // The design note is long, so only agents doing UI work get it in full; everyone else is pointed to it.
-    if let Ok(Some(d)) = memory::get_by_name(core, pid, "design-language") {
+    if let Ok(Some(d)) = memory::View::local(pid).get(core, "design-language") {
         let ui_work = agent == "antigravity" || matches!(t["task_kind"].as_str().unwrap_or(""), "design" | "frontend" | "creative");
         if ui_work {
             s.push_str(&format!("\n### Design language (from memory)\n\n{}\n", d["body"].as_str().unwrap_or("")));

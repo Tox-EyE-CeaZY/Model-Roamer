@@ -1,6 +1,6 @@
 # Collaboration: design (Stage 1a foundation)
 
-Status: Stage 1a design, 2026-11-24. Code lives in `src/collab.rs`, migration 11 in `src/db.rs`, the auth hook in
+Status: Stage 1b, 2026-11-24. Code lives in `src/collab.rs` and `src/collab_bridge.rs`, migrations 11–12 in `src/db.rs`, the auth hook in
 `src/server.rs`, and the UI in `ui/js/views/collab.js` (Settings › Collaborators and Settings › Join a project).
 
 ## 1. Topology: the owner hosts
@@ -65,7 +65,9 @@ role, perms, **token**, status, last error, last sync).
 2. The owner sends it to that one person (chat, email). Single use, default expiry 7 days, revocable until used.
 3. Guest: Settings › **Join a project** › paste the link, confirm their display name. Their app probes
    `GET /api/hello` on the host (must be Model Roamer, must not be itself), then `POST /api/collab/join`
-   `{invite, name, instance_id}`.
+   `{invite, name, instance_id, identity_proof}`. The proof is private to this pair of installations. An existing
+   identity is reused only when the proof matches. A pre-1b identity is retained by its current membership;
+   its first rejoin creates a new identity because the old installation provided no proof.
 4. Host checks the invite (exists, not used/expired/revoked; 12 failures per 10 minutes per host, like pairing),
    makes or reuses the `collab_users` row (same `instance_id` = same person), creates the membership with a fresh
    token, marks the invite used, tells the owner's UI, and posts a short note to the project lead
@@ -82,8 +84,8 @@ Host API for members (`/api/collab/host/*`, Bearer member token, every call perm
 | `GET project` | | project summary (no local paths), repos (URLs only), visible threads, a `cursor` |
 | `GET changes?since=&wait=` | | **incremental sync**: threads, messages, memory and artifacts changed after `since`, capped, plus the next cursor. Long-polls up to `wait` seconds (max 25) on the host's event bus, so idle guests cost one parked request, not a polling loop |
 | `GET threads/{id}/messages?before=&limit=` | view | one page of a thread's history |
-| `GET memory`, `GET memory/{name}` | | project memory (+ global with `read_global_memory`) |
-| `POST memory` | `edit_memory` | write a project memory entry, attributed to the person |
+| `GET memory`, `GET memory/{name}` | | project memory, global with `read_global_memory`, or the caller's private host notes with `scope=collaborator` |
+| `POST memory` | `edit_memory` for project scope | write shared project memory or private host notes with `scope: "collaborator"` |
 | `GET artifacts` | | project artifacts with signed host URLs |
 | `POST artifacts` | `publish_artifacts` | publish text/markdown/html into the project |
 | `POST threads` | `create_threads` | open a thread that **runs on the guest's machine** (`threads.user_id` = them) |
@@ -91,7 +93,8 @@ Host API for members (`/api/collab/host/*`, Bearer member token, every call perm
 | `POST threads/{id}/merge` | `merge` | merge a thread's branch into the base branch |
 | `POST request-role` | | ask the owner once to become an operator |
 | `POST leave` | | revoke own membership |
-| `POST presence`, `POST mcp`, `POST threads/{id}/transfer` | | named extension points (501 until their stage) |
+| `POST mcp` | per tool | invoke one of the bridge tools listed below |
+| `POST presence`, `POST threads/{id}/transfer` | | named extension points |
 
 Guest side: `/api/collab/links` (list/join/leave) and `/api/collab/links/{id}/host/{path}`, a narrow proxy that
 adds the token. Proxy rules: connect timeout 6 s, request timeout 20 s (long polls: `wait` + 10 s), two retries with
@@ -101,15 +104,26 @@ backoff for idempotent GETs on connection errors only, never for POSTs. A 401 fr
 **Live events and offline:** the guest view runs one long-poll loop (`changes?since=cursor&wait=20`). On success it
 applies the delta and loops at once; on failure it backs off 2 s → 4 s → … → 30 s and shows "offline, retrying".
 Nothing is lost while offline: the cursor is a host timestamp and the next call returns everything after it (with a
-1 ms overlap; the client de-duplicates by id). Stage 1b moves this loop into the guest's server so its agents get
-the same feed.
+1 ms overlap; the client de-duplicates by id). Agents fetch shared data on demand through their tools.
 
-**The guest's runner and the host (Stage 1b, extension point `collab::bridge`):** a guest thread runs locally like
-any thread, but its MCP tools that touch shared state (memory, artifacts, other threads, messages to the lead) are
-forwarded by the guest's app to `POST host/mcp` with the member token, and the host answers them with the same
-`tools.rs` code, scoped to that member's permissions and project. Local-only tools (git in the guest's worktree)
-stay local. Same timeouts and retries as `mcp.rs` (3 tries, backoff), plus an "host unreachable, retrying" tool
-error after 20 s so the agent can carry on with local work.
+**The guest's runner and the host.** Bind an existing local agent thread with
+`POST /api/collab/links/{link_id}/agent-threads/{local_thread_id}`. Pass `{"host_thread_id":"th_…"}` to associate
+one of the member's own threads on the host. An empty object enables project-level calls without a host thread.
+`DELETE` at the same URL removes the binding. The guest starts the agent with the usual local thread controls.
+
+The guest server sends `{tool, thread_id, arguments}` to `POST host/mcp` with the member token. The host determines
+the project from that token and checks visibility or ownership for thread operations. The supported calls are
+`read_memory`, `write_memory`, `list_threads`, `read_thread`, `check_status`, `list_artifacts`, `publish_artifact`,
+and `set_status`. Publishing accepts inline content and folder paths inside the shared project. Reporting status
+requires a bound host thread owned by the caller and the corresponding permission. The endpoint never starts an
+agent on the host. File claims stay on the guest and are published to the host by the Stage 1d presence preflight
+and heartbeat.
+
+The guest agent's default memory index and search combine local collaborator and global memory with shared host
+project memory. Reads by name prefer collaborator, then project, then global. Explicit collaborator and global
+tool calls stay on the guest installation. The host's private notes and permitted host global memory remain
+available through explicit scoped host API calls. Read-only bridge calls can retry twice within 20 seconds.
+Writes have a 20-second request timeout and are sent once. If the host is unavailable, local memory remains usable.
 
 ## 5. Keeping the host responsive and cheap
 
@@ -137,6 +151,7 @@ error after 20 s so the agent can carry on with local work.
 | `edit_memory` | yes | yes | no | write project memory |
 | `read_global_memory` | no | no | no | read the owner's global memory (it spans all the owner's projects) |
 | `publish_artifacts` | yes | yes | no | publish artifacts into the project |
+| `update_thread_status` | yes | yes | no | report status on the member's own threads |
 | `merge` | no | no | no | merge threads into the base branch |
 | `transfer_threads` | no | yes | no | take threads over from the owner or others without asking each time (Stage 2) |
 
@@ -148,9 +163,9 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
 
 | scope | lives on | who sees it |
 |---|---|---|
-| global memory | owner's host (`memory.project_id IS NULL`) | owner; members only with `read_global_memory`. A guest's own global memory stays on the guest's machine |
+| global memory | owner's host (`memory.project_id` and `memory.user_id` are NULL) | owner; members only with `read_global_memory`. A guest's own global memory stays on the guest's machine |
 | project memory | host | every member; written with `edit_memory` |
-| collaborator memory | host, `memory.user_id` (Stage 1b) | only that person (and their agents); the owner can see it exists, not read it, unless shared |
+| collaborator memory | agent's installation, or the host if written via the scoped host API | only the caller and their agents. Sharing a note is an explicit write to project memory |
 | per-person project chat | host, a `chat` thread with `user_id` (Stage 1c) | that person; others with `view_others_chats` |
 | shared threads | host `threads` (`user_id` says whose agents run it) | members with `view_threads` |
 | artifacts | host files + signed URLs | members; publish with `publish_artifacts` |
@@ -163,8 +178,9 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
   local folder paths (`projects.folder`, `repos.folder`, `threads.workspace`), session ids, terminals, logs,
   devices or other projects. Message `meta` is reduced to safe keys. Guest tokens are stored only in the guest's DB
   and never returned by its API.
-- **Artifact links** are signed per artifact (`/a/{id}/{sig}`), so a member sees only the project's artifacts. A
-  revoked member who kept a link can still open that one artifact; Stage 1b can add per-member artifact grants.
+- **Artifact links** for members are signed per artifact and membership. Every request, including asset files,
+  checks that the membership and project are active. A re-invite issues a fresh membership and the old links
+  stay invalid. Stage 1b retires the old owner/member URL format, so pre-upgrade bookmarks need fresh links.
 - **Transport:** plain `http://` is fine over Tailscale or WireGuard (already encrypted) and on a trusted LAN.
   Anywhere else use HTTPS: Tailscale `serve` (one button in Remote access), a TLS cert/key, or a reverse proxy at
   the owner's domain. The join screen warns when an invite uses plain http to a public address.
@@ -174,8 +190,6 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
 
 ## 9. Later stages plug in here
 
-- **1b collaborator memory:** `memory.user_id` column + unique index on `(project, user, name)`; `collab::memory_scope`
-  picks the scope for a member; the `write_memory` tool gains `scope: "me"`. Bridge `host/mcp` goes live.
 - **1c per-person project chats:** `collab::personal_chat` makes or finds the `chat` thread with `user_id` for a
   member; `view_others_chats` gates the others.
 - **1d presence:** `POST host/presence {thread, doing, files}` keeps an in-memory map with a 90 s TTL (`collab::Presence`);

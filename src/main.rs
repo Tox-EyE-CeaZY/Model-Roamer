@@ -12,6 +12,7 @@ mod api;
 mod artifacts;
 mod bus;
 mod collab;
+mod collab_bridge;
 mod config;
 mod core;
 mod db;
@@ -150,8 +151,8 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
         core.patch_settings(&json!({ "server": { "name": n } }))?;
     }
     // the suite's design language, shared by every agent, the first time round
-    if memory::get_by_name(&core, None, "design-language")?.is_none() {
-        let _ = memory::write(&core, None, "design-language", "The Roamer suite's look and feel: follow it for any UI", prompts::DESIGN_NOTE, "Model Roamer");
+    if memory::View::local(None).only(Some(memory::Scope::Global)).get(&core, "design-language")?.is_none() {
+        let _ = memory::write(&core, None, None, "design-language", "The Roamer suite's look and feel: follow it for any UI", prompts::DESIGN_NOTE, "Model Roamer");
     }
     let port = server::serve_loopback(core.clone(), if headless { 0 } else { o.port.filter(|_| o.browser).unwrap_or(LOCAL_PORT) }).await?;
     core.port.store(port, Ordering::Relaxed);

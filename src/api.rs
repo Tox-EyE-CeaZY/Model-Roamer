@@ -877,7 +877,7 @@ async fn search(State(core): State<CoreRef>, q: Q) -> R {
         &[&like, &text.trim()],
     )?;
     let artifacts = core.db.all("SELECT id, title, kind, project_id, description FROM artifacts WHERE deleted_at IS NULL AND (title LIKE ?1 OR description LIKE ?1) ORDER BY updated_at DESC LIMIT 10", &[&like])?;
-    let mem = memory::search(&core, q.get("project").map(String::as_str), &text).unwrap_or_default();
+    let mem = memory::View::local(q.get("project").map(String::as_str)).search(&core, &text).unwrap_or_default();
     Ok(Json(json!({ "threads": threads, "messages": messages, "memory": mem, "projects": projects, "artifacts": artifacts })))
 }
 
@@ -885,44 +885,50 @@ async fn search(State(core): State<CoreRef>, q: Q) -> R {
 
 async fn list_memory(State(core): State<CoreRef>, q: Q) -> R {
     let project = q.get("project").filter(|p| !p.is_empty()).map(String::as_str);
+    let view = memory::View::local(project).only(memory::Scope::parse(q.get("scope").map_or("", String::as_str)).map_err(|e| bad(e.to_string()))?);
     if q.get("deleted").is_some() {
-        return Ok(Json(json!(core.db.all("SELECT id, project_id, name, description, deleted_at FROM memory WHERE deleted_at IS NOT NULL AND (project_id IS NULL OR project_id = ?1) ORDER BY deleted_at DESC LIMIT 50", &[&project.unwrap_or("")])?)));
+        return Ok(Json(json!(view.list(&core, true)?)));
     }
     let rows = match q.get("q").filter(|x| !x.trim().is_empty()) {
-        Some(text) => memory::search(&core, project, text)?,
-        None => memory::list(&core, project)?,
+        Some(text) => view.search(&core, text)?,
+        None => view.list(&core, false)?,
     };
     Ok(Json(json!(rows)))
 }
 
 async fn get_memory(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
-    Ok(Json(core.db.one("SELECT * FROM memory WHERE id = ?1", &[&id])?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such memory".into()))?))
+    Ok(Json(memory::local_entry(&core, &id)?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such memory".into()))?))
 }
 
 async fn save_memory(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
     let project = b["project_id"].as_str().filter(|p| !p.is_empty());
-    // renaming: the old entry goes away
-    if let Some(old) = b["id"].as_str() {
-        if let Some(prev) = core.db.one("SELECT name, project_id FROM memory WHERE id = ?1", &[&old])? {
-            let newname = util::slug(&s(&b, "name"), 64);
-            if prev["name"].as_str() != Some(newname.as_str()) || prev["project_id"].as_str() != project {
-                let now = util::now_ms();
-                core.db.exec("UPDATE memory SET deleted_at = ?1 WHERE id = ?2", &[&now, &old])?;
-            }
-        }
+    let scope = memory::Scope::parse(&s(&b, "scope")).map_err(|e| bad(e.to_string()))?;
+    let (project, user) = match scope {
+        Some(memory::Scope::Collaborator) => (None, Some(memory::LOCAL_USER)),
+        Some(memory::Scope::Global) => (None, None),
+        Some(memory::Scope::Project) if project.is_none() => return Err(bad("Choose a project for project memory.")),
+        _ => (project, None),
+    };
+    let previous = match b["id"].as_str() {
+        Some(id) => Some(memory::local_entry(&core, id)?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such memory".into()))?),
+        None => None,
+    };
+    let saved = memory::write(&core, project, user, &s(&b, "name"), &s(&b, "description"), b["body"].as_str().unwrap_or(""), "You")?;
+    if let Some(prev) = previous.filter(|m| m["id"] != saved["id"]) {
+        memory::delete_by_name(&core, prev["project_id"].as_str(), prev["user_id"].as_str(), prev["name"].as_str().unwrap_or_default())?;
     }
-    Ok(Json(memory::write(&core, project, &s(&b, "name"), &s(&b, "description"), b["body"].as_str().unwrap_or(""), "You")?))
+    Ok(Json(saved))
 }
 
 async fn delete_memory(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let now = util::now_ms();
-    core.db.exec("UPDATE memory SET deleted_at = ?1 WHERE id = ?2", &[&now, &id])?;
+    core.db.exec("UPDATE memory SET deleted_at = ?1 WHERE id = ?2 AND (user_id IS NULL OR user_id = ?3)", &[&now, &id, &memory::LOCAL_USER])?;
     core.bus.emit("memory", None, None, json!({ "deleted": id }));
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn restore_memory(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
-    core.db.exec("UPDATE memory SET deleted_at = NULL WHERE id = ?1", &[&id])?;
+    core.db.exec("UPDATE memory SET deleted_at = NULL WHERE id = ?1 AND (user_id IS NULL OR user_id = ?2)", &[&id, &memory::LOCAL_USER])?;
     core.bus.emit("memory", None, None, json!({ "restored": id }));
     Ok(Json(json!({ "ok": true })))
 }
@@ -930,7 +936,8 @@ async fn restore_memory(State(core): State<CoreRef>, Path(id): Path<String>) -> 
 // ------------------------------------------------------------------------------------------------ artifacts
 
 pub fn artifact_sig(core: &CoreRef, id: &str) -> String {
-    util::sha256(&format!("{}:{id}", core.local_token))[..24].to_string()
+    // Retire the v1 format: it was also issued to members and cannot be revoked by membership.
+    util::sha256(&format!("{}:owner-artifact:{id}", core.local_token))[..24].to_string()
 }
 
 fn with_urls(core: &CoreRef, mut a: Value) -> Value {
@@ -1088,7 +1095,7 @@ async fn forward_url(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
 async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String, String>>, q: Q) -> Response {
     let id = p.get("id").cloned().unwrap_or_default();
     let sig = p.get("sig").cloned().unwrap_or_default();
-    if !util::same(&sig, &artifact_sig(&core, &id)) {
+    if !util::same(&sig, &artifact_sig(&core, &id)) && !crate::collab_bridge::valid_artifact_grant(&core, &id, &sig) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let rest = p.get("rest").cloned().unwrap_or_default();
@@ -1102,7 +1109,7 @@ async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String
     } else {
         bytes
     };
-    let mut r = Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, "no-cache");
+    let mut r = Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, "private, no-store");
     if q.get("download").is_some() {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "artifact".into());
         r = r.header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", name.replace('"', "")));

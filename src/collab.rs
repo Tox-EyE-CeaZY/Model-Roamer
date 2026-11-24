@@ -61,12 +61,13 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/collab/host/memory/{name}", get(h_memory_entry))
         .route("/api/collab/host/artifacts", get(h_artifacts).post(h_publish))
         .route("/api/collab/host/presence", post(h_presence))
-        .route("/api/collab/host/mcp", post(h_mcp))
+        .route("/api/collab/host/mcp", post(crate::collab_bridge::host))
         .route("/api/collab/host/leave", post(h_leave))
         .route("/api/collab/host/request-role", post(h_request_role))
         // this machine as a guest
         .route("/api/collab/links", get(list_links).post(add_link))
         .route("/api/collab/links/{id}", delete(remove_link))
+        .route("/api/collab/links/{id}/agent-threads/{thread}", post(crate::collab_bridge::bind_api).delete(crate::collab_bridge::unbind))
         .route("/api/collab/links/{id}/host/{*path}", any(proxy))
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(core.clone(), server::auth))
@@ -95,6 +96,7 @@ pub const PERMS: &[(&str, &str, [bool; 3])] = &[
     ("edit_memory", "write project memory", [true, true, false]),
     ("read_global_memory", "read your global memory (it spans all your projects)", [false, false, false]),
     ("publish_artifacts", "publish artifacts into the project", [true, true, false]),
+    ("update_thread_status", "update the status of their own threads", [true, true, false]),
     ("merge", "merge threads into the base branch", [false, false, false]),
     // Stage 2: an operator takes a thread over without asking each time; everyone else asks per transfer
     ("transfer_threads", "take threads over from you or others without asking each time", [false, true, false]),
@@ -163,7 +165,7 @@ impl Member {
         self.perms[perm] == true
     }
 
-    fn need(&self, perm: &str) -> Result<(), ApiErr> {
+    pub(crate) fn need(&self, perm: &str) -> Result<(), ApiErr> {
         if self.can(perm) {
             return Ok(());
         }
@@ -171,7 +173,7 @@ impl Member {
         Err(forbid(format!("The project's owner hasn't allowed you to {what} (permission '{perm}').")))
     }
 
-    fn author(&self) -> String {
+    pub(crate) fn author(&self) -> String {
         format!("{} (collaborator)", self.name)
     }
 }
@@ -209,11 +211,8 @@ pub fn runs_here(thread: &Value) -> bool {
     thread["user_id"].as_str().unwrap_or("").is_empty()
 }
 
-/// Stage 1b, collaborator memory: the memory scope a member's agents write to with `scope: "me"` (a `user_id`
-/// column on `memory`, private to that person). Until then members write project memory only.
-#[allow(dead_code)]
-pub fn memory_scope(m: &Member) -> (Option<String>, Option<String>) {
-    (Some(m.project_id.clone()), None)
+pub fn memory_scope(m: &Member) -> memory::View<'_> {
+    memory::View { project: Some(&m.project_id), shared: true, global: m.can("read_global_memory"), user: Some(&m.user_id), personal_project: Some(&m.project_id) }
 }
 
 /// Stage 1c, per-person project chats: find or make the member's own `chat` thread in the project (`user_id` set).
@@ -239,11 +238,6 @@ fn not_yet(stage: &str, what: &str) -> ApiErr {
 /// Stage 1d, presence: who is working on what, kept in memory with a short time to live.
 async fn h_presence(Extension(_m): Extension<Member>) -> Result<Json<Value>, ApiErr> {
     Err(not_yet("Stage 1d", "Presence"))
-}
-
-/// Stage 1b, the agent tool bridge: a member's local agents call the host's tools through here, scoped to them.
-async fn h_mcp(Extension(_m): Extension<Member>) -> Result<Json<Value>, ApiErr> {
-    Err(not_yet("Stage 1b", "The agent tool bridge"))
 }
 
 /// Stage 2, thread transfer through the shared git repository. Members with `transfer_threads` (operators) take a
@@ -445,20 +439,20 @@ async fn join(State(core): State<CoreRef>, ConnectInfo(addr): ConnectInfo<Socket
         return Err(bad("That invite is for this same Model Roamer. Open it on the other person's app."));
     }
     let name = if s(&b, "name").is_empty() { s(&inv, "name") } else { util::clip(&s(&b, "name"), 60) };
-    // the same app joining again is the same person
-    let existing = if instance.is_empty() { None } else { core.db.one("SELECT id FROM collab_users WHERE instance_id = ?1 AND revoked_at IS NULL", &[&instance])? };
-    let user_id = match existing {
-        Some(u) => {
-            let uid = s(&u, "id");
-            core.db.exec("UPDATE collab_users SET name = ?1 WHERE id = ?2", &[&name, &uid])?;
-            uid
-        }
-        None => {
-            let uid = util::id("usr");
-            core.db.exec("INSERT INTO collab_users(id, name, instance_id, created_at) VALUES (?1, ?2, ?3, ?4)", &[&uid, &name, &instance, &now])?;
-            uid
-        }
+    // Instance IDs are public. Reuse an identity only with proof from the same guest installation.
+    let proof = s(&b, "identity_proof");
+    let identity_hash = if !instance.is_empty() && proof.len() == 64 && proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+        util::sha256(&proof)
+    } else {
+        String::new()
     };
+    let identity = core.db.one(
+        "INSERT INTO collab_users(id, name, instance_id, identity_hash, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(instance_id, identity_hash) WHERE identity_hash != '' AND revoked_at IS NULL
+         DO UPDATE SET name = excluded.name RETURNING id",
+        &[&util::id("usr"), &name, &instance, &identity_hash, &now],
+    )?.ok_or_else(|| bad("Couldn't create a collaborator identity."))?;
+    let user_id = s(&identity, "id");
     // one live membership per person and project: joining again replaces the old token
     core.db.exec("UPDATE collab_members SET revoked_at = ?1 WHERE user_id = ?2 AND project_id = ?3 AND revoked_at IS NULL", &[&now, &user_id, &pid])?;
     let token = util::secret();
@@ -512,7 +506,7 @@ fn clean_message(m: &Value) -> Value {
 
 /// May this member see this thread? Their own always; the owner's shared ones with view_threads; other people's own
 /// chats only with view_others_chats.
-fn can_see(m: &Member, t: &Value) -> bool {
+pub(crate) fn can_see(m: &Member, t: &Value) -> bool {
     if t["project_id"].as_str() != Some(m.project_id.as_str()) {
         return false;
     }
@@ -526,7 +520,7 @@ fn can_see(m: &Member, t: &Value) -> bool {
     m.can("view_threads")
 }
 
-fn visible_thread(core: &CoreRef, m: &Member, id: &str) -> Result<Value, ApiErr> {
+pub(crate) fn visible_thread(core: &CoreRef, m: &Member, id: &str) -> Result<Value, ApiErr> {
     let t = core.thread(id).map_err(|_| ApiErr(StatusCode::NOT_FOUND, "No such thread".into()))?;
     if !can_see(m, &t) {
         // the same answer as a missing thread: members can't probe for ids
@@ -577,7 +571,7 @@ async fn h_me(State(core): State<CoreRef>, Extension(m): Extension<Member>) -> R
     Ok(Json(me_json(&core, &m)))
 }
 
-fn threads_of(core: &CoreRef, m: &Member, since: i64) -> Result<Vec<Value>, ApiErr> {
+pub(crate) fn threads_of(core: &CoreRef, m: &Member, since: i64) -> Result<Vec<Value>, ApiErr> {
     let rows = core.db.all(
         "SELECT t.*, (SELECT body FROM messages x WHERE x.thread_id = t.id AND x.role IN ('agent','user') ORDER BY created_at DESC LIMIT 1) AS last_body,
                 (SELECT COUNT(*) FROM messages x WHERE x.thread_id = t.id) AS message_count
@@ -629,17 +623,14 @@ fn changes_since(core: &CoreRef, m: &Member, since: i64) -> Result<Value, ApiErr
         c["body"] = json!(util::clip(c["body"].as_str().unwrap_or(""), 20_000));
         c
     }).collect();
-    let global = m.can("read_global_memory");
-    let mem = core.db.all(
-        "SELECT id, project_id, name, description, length(body) AS size, updated_by, updated_at, deleted_at FROM memory
-         WHERE (project_id = ?1 OR (?3 = 1 AND project_id IS NULL)) AND (updated_at > ?2 OR deleted_at > ?2)",
-        &[&m.project_id, &since, &(global as i64)],
-    )?;
+    let mut memory = memory_scope(m);
+    memory.user = None;
+    let mem = memory.changes(core, since)?;
     let arts = core.db.all(
         "SELECT id, project_id, thread_id, title, kind, description, version, created_at, updated_at, deleted_at FROM artifacts WHERE project_id = ?1 AND (updated_at > ?2 OR deleted_at > ?2)",
         &[&m.project_id, &since],
     )?;
-    let arts: Vec<Value> = arts.into_iter().map(|a| with_url(core, a)).collect();
+    let arts: Vec<Value> = arts.into_iter().map(|a| with_url(core, m, a)).collect();
     let mut newest = since;
     for t in threads.iter().chain(&messages).chain(&mem).chain(&arts) {
         for k in ["updated_at", "created_at", "deleted_at"] {
@@ -718,11 +709,15 @@ async fn h_changes(State(core): State<CoreRef>, Extension(m): Extension<Member>,
 }
 
 async fn h_messages(State(core): State<CoreRef>, Extension(m): Extension<Member>, Path(id): Path<String>, q: Q) -> R {
-    let t = visible_thread(&core, &m, &id)?;
     let before: i64 = q.get("before").and_then(|b| b.parse().ok()).unwrap_or(i64::MAX);
     let limit: i64 = q.get("limit").and_then(|b| b.parse().ok()).unwrap_or(80).clamp(1, 300);
+    Ok(Json(thread_history(&core, &m, &id, before, limit)?))
+}
+
+pub(crate) fn thread_history(core: &CoreRef, m: &Member, id: &str, before: i64, limit: i64) -> Result<Value, ApiErr> {
+    let t = visible_thread(core, m, id)?;
     let rows = core.db.all("SELECT * FROM (SELECT * FROM messages WHERE thread_id = ?1 AND created_at < ?2 ORDER BY created_at DESC LIMIT ?3) ORDER BY created_at", &[&id, &before, &limit])?;
-    Ok(Json(json!({ "thread": pick(&t, THREAD_FIELDS), "messages": rows.iter().map(clean_message).collect::<Vec<_>>() })))
+    Ok(json!({ "thread": pick(&t, THREAD_FIELDS), "messages": rows.iter().map(clean_message).collect::<Vec<_>>() }))
 }
 
 async fn h_post_message(State(core): State<CoreRef>, Extension(m): Extension<Member>, Path(id): Path<String>, Json(b): Json<Value>) -> R {
@@ -784,49 +779,70 @@ async fn h_merge(State(core): State<CoreRef>, Extension(m): Extension<Member>, P
     Ok(Json(json!({ "sha": sha })))
 }
 
-async fn h_memory(State(core): State<CoreRef>, Extension(m): Extension<Member>) -> R {
-    let rows = memory::list(&core, Some(m.project_id.as_str()))?;
-    let global = m.can("read_global_memory");
-    Ok(Json(json!(rows.into_iter().filter(|r| global || !r["project_id"].is_null()).collect::<Vec<_>>())))
+async fn h_memory(State(core): State<CoreRef>, Extension(m): Extension<Member>, q: Q) -> R {
+    let scope = crate::collab_bridge::scope(q.get("scope").map_or("", String::as_str))?;
+    Ok(Json(json!(member_http_memory(&core, &m, scope, "", q.get("q").map_or("", String::as_str))?)))
 }
 
-async fn h_memory_entry(State(core): State<CoreRef>, Extension(m): Extension<Member>, Path(name): Path<String>) -> R {
-    let e = memory::get_by_name(&core, Some(m.project_id.as_str()), &name)?.filter(|e| !e["project_id"].is_null() || m.can("read_global_memory"));
-    let e = e.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("No memory named '{name}'")))?;
-    Ok(Json(pick(&e, &["id", "project_id", "name", "description", "body", "updated_by", "updated_at"])))
+async fn h_memory_entry(State(core): State<CoreRef>, Extension(m): Extension<Member>, Path(name): Path<String>, q: Q) -> R {
+    let scope = crate::collab_bridge::scope(q.get("scope").map_or("", String::as_str))?;
+    let rows = member_http_memory(&core, &m, scope, &name, "")?;
+    Ok(Json(rows.into_iter().next().ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, format!("No memory named '{name}'")))?))
+}
+
+fn member_http_memory(core: &CoreRef, m: &Member, scope: Option<memory::Scope>, name: &str, query: &str) -> Result<Vec<Value>, ApiErr> {
+    if scope.is_some() {
+        return crate::collab_bridge::member_memory(core, m, scope, name, query);
+    }
+    // The shared project viewer requests entries by name. Private entries require an explicit scope in this API.
+    let mut view = memory_scope(m);
+    view.user = None;
+    Ok(view.rows(core, name, query)?)
 }
 
 async fn h_save_memory(State(core): State<CoreRef>, Extension(m): Extension<Member>, Json(b): Json<Value>) -> R {
-    m.need("edit_memory")?;
-    // members write project memory only; global memory is the owner's (collaborator memory: memory_scope, Stage 1b)
-    let e = memory::write(&core, Some(m.project_id.as_str()), &s(&b, "name"), &s(&b, "description"), b["body"].as_str().unwrap_or(""), &m.author())?;
-    Ok(Json(pick(&e, &["id", "project_id", "name", "description", "updated_by", "updated_at"])))
+    Ok(Json(crate::collab_bridge::save_member_memory(&core, &m, &b)?))
 }
 
-fn with_url(core: &CoreRef, mut a: Value) -> Value {
+fn with_url(core: &CoreRef, m: &Member, mut a: Value) -> Value {
     let id = s(&a, "id");
-    a["url"] = json!(format!("/a/{id}/{}/", crate::api::artifact_sig(core, &id)));
+    a["url"] = json!(crate::collab_bridge::artifact_link(core, m, &id));
     a
 }
 
 async fn h_artifacts(State(core): State<CoreRef>, Extension(m): Extension<Member>) -> R {
+    Ok(Json(json!(member_artifacts(&core, &m)?)))
+}
+
+pub(crate) fn member_artifacts(core: &CoreRef, m: &Member) -> Result<Vec<Value>, ApiErr> {
     let rows = core.db.all(
         "SELECT id, project_id, thread_id, title, kind, description, version, created_at, updated_at FROM artifacts WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 300",
         &[&m.project_id],
     )?;
-    Ok(Json(json!(rows.into_iter().map(|a| with_url(&core, a)).collect::<Vec<_>>())))
+    Ok(rows.into_iter().map(|a| with_url(core, m, a)).collect())
 }
 
 async fn h_publish(State(core): State<CoreRef>, Extension(m): Extension<Member>, Json(b): Json<Value>) -> R {
+    Ok(Json(publish_member_artifact(&core, &m, None, &b)?))
+}
+
+pub(crate) fn publish_member_artifact(core: &CoreRef, m: &Member, thread: Option<&str>, b: &Value) -> Result<Value, ApiErr> {
     m.need("publish_artifacts")?;
-    let kind = if s(&b, "kind").is_empty() { "markdown".to_string() } else { s(&b, "kind") };
+    let kind = if s(b, "kind").is_empty() { "markdown".to_string() } else { s(b, "kind") };
     if !matches!(kind.as_str(), "markdown" | "html" | "text" | "svg") {
         return Err(bad("Members publish markdown, html, text or svg content."));
     }
     let content = b["content"].as_str().ok_or_else(|| bad("content is required"))?;
     // content only, never a path: a path would read the owner's disk
-    let a = artifacts::publish(&core, Some(m.project_id.as_str()), None, &s(&b, "title"), &s(&b, "description"), &kind, None, Some(content), None, None)?;
-    Ok(Json(with_url(&core, a)))
+    if b.get("path").is_some() {
+        return Err(bad("Publish shared artifacts with inline content."));
+    }
+    let folder = b["folder"].as_str().filter(|path| !path.trim().is_empty());
+    if folder.is_some_and(|path| !crate::collab_bridge::relative_path(path.trim())) {
+        return Err(bad("Use a folder inside the shared project."));
+    }
+    let a = artifacts::publish(core, Some(m.project_id.as_str()), thread, &s(b, "title"), &s(b, "description"), &kind, None, Some(content), None, folder)?;
+    Ok(with_url(core, m, pick(&a, &["id", "project_id", "thread_id", "title", "kind", "description", "version", "created_at", "updated_at"])))
 }
 
 /// A member asks the owner for a role (today: operator). One open request at a time; the owner answers it once in
@@ -863,7 +879,7 @@ async fn h_leave(State(core): State<CoreRef>, Extension(m): Extension<Member>) -
 
 fn client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(6)).build().unwrap_or_default())
+    C.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(6)).redirect(reqwest::redirect::Policy::none()).build().expect("collaboration HTTP client"))
 }
 
 /// `https://host:4630/#/join?invite=inv_x.SECRET` → ("https://host:4630", "inv_x.SECRET"). A bare host gets
@@ -931,7 +947,10 @@ async fn add_link(State(core): State<CoreRef>, Extension(_who): Extension<Who>, 
     let r = client()
         .post(format!("{url}/api/collab/join"))
         .timeout(Duration::from_secs(20))
-        .json(&json!({ "invite": invite, "name": name, "instance_id": core.instance_id, "version": env!("CARGO_PKG_VERSION") }))
+        .json(&json!({
+            "invite": invite, "name": name, "instance_id": core.instance_id, "version": env!("CARGO_PKG_VERSION"),
+            "identity_proof": util::sha256(&format!("{}:collaborator-identity:{}", core.local_token, s(&hello, "id"))),
+        }))
         .send()
         .await
         .map_err(|e| bad(format!("Couldn't reach {url}: {e}")))?;
@@ -947,11 +966,16 @@ async fn add_link(State(core): State<CoreRef>, Extension(_who): Extension<Who>, 
     let id = util::id("lnk");
     let now = util::now_ms();
     let pid = v["project"]["id"].as_str().unwrap_or("").to_string();
-    // joining the same host project again replaces the old link
-    core.db.exec("DELETE FROM collab_links WHERE host_id = ?1 AND project_id = ?2", &[&v["host"]["id"].as_str().unwrap_or(""), &pid])?;
+    // Keep local thread bindings across a fresh invitation to the same project.
+    let id = core.db.one("SELECT id FROM collab_links WHERE host_id = ?1 AND project_id = ?2", &[&s(&v["host"], "id"), &pid])?
+        .map(|r| s(&r, "id")).unwrap_or(id);
     core.db.exec(
         "INSERT INTO collab_links(id, host_url, host_id, host_name, project_id, project_name, member_id, user_id, name, role, perms, token, created_at, last_sync)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+         ON CONFLICT(id) DO UPDATE SET host_url = excluded.host_url, host_name = excluded.host_name,
+         project_name = excluded.project_name, member_id = excluded.member_id, user_id = excluded.user_id,
+         name = excluded.name, role = excluded.role, perms = excluded.perms, token = excluded.token,
+         status = 'ok', error = '', last_sync = excluded.last_sync",
         &[
             &id, &url, &v["host"]["id"].as_str().unwrap_or(""), &v["host"]["name"].as_str().unwrap_or(""), &pid, &v["project"]["name"].as_str().unwrap_or(""),
             &s(&v, "member_id"), &s(&v, "user_id"), &s(&v, "name"), &s(&v, "role"), &v["perms"].to_string(), &token, &now,
@@ -977,9 +1001,9 @@ fn set_link_status(core: &CoreRef, l: &Value, status: &str, error: &str) {
     let changed = l["status"].as_str() != Some(status) || l["error"].as_str() != Some(error);
     let now = util::now_ms();
     if status == "ok" {
-        let _ = core.db.exec("UPDATE collab_links SET status = ?1, error = ?2, last_sync = ?3 WHERE id = ?4", &[&status, &error, &now, &id]);
+        let _ = core.db.exec("UPDATE collab_links SET status = ?1, error = ?2, last_sync = ?3 WHERE id = ?4 AND member_id = ?5 AND status != 'revoked'", &[&status, &error, &now, &id, &s(l, "member_id")]);
     } else {
-        let _ = core.db.exec("UPDATE collab_links SET status = ?1, error = ?2 WHERE id = ?3", &[&status, &error, &id]);
+        let _ = core.db.exec("UPDATE collab_links SET status = ?1, error = ?2 WHERE id = ?3 AND member_id = ?4 AND status != 'revoked'", &[&status, &error, &id, &s(l, "member_id")]);
     }
     if changed {
         core.bus.emit("collab-links", None, None, json!({ "id": id, "status": status }));
@@ -989,6 +1013,11 @@ fn set_link_status(core: &CoreRef, l: &Value, status: &str, error: &str) {
 /// The guest's windows reach the host only through here: the member token is added on this machine and never sent
 /// to a browser. GETs are retried twice on connection errors; nothing that changes state is retried.
 async fn proxy(State(core): State<CoreRef>, Extension(_who): Extension<Who>, method: Method, Path((id, path)): Path<(String, String)>, q: Q, body: Bytes) -> Response {
+    let retry = method == Method::GET;
+    proxy_host(&core, &id, &path, method, &q.0, body, retry).await
+}
+
+pub(crate) async fn proxy_host(core: &CoreRef, id: &str, path: &str, method: Method, q: &HashMap<String, String>, body: Bytes, retry: bool) -> Response {
     let Some(l) = core.db.one("SELECT * FROM collab_links WHERE id = ?1", &[&id]).ok().flatten() else {
         return ApiErr(StatusCode::NOT_FOUND, "No such project link".into()).into_response();
     };
@@ -1003,38 +1032,43 @@ async fn proxy(State(core): State<CoreRef>, Extension(_who): Extension<Who>, met
     }
     let wait = q.get("wait").and_then(|w| w.parse::<u64>().ok()).unwrap_or(0).min(25);
     let url = format!("{}/api/collab/host/{path}", s(&l, "host_url"));
-    let timeout = Duration::from_secs(20 + wait);
-    let tries = if method == Method::GET { 3 } else { 1 };
+    // The tool call has one bounded response window, including retries. Only retry known read-only operations.
+    let timeout = Duration::from_secs(if path == "mcp" && retry { 6 } else { 20 + wait });
+    let tries = if retry { 3 } else { 1 };
     let mut last = String::new();
     for attempt in 0..tries {
-        let mut rq = client().request(method.clone(), &url).bearer_auth(s(&l, "token")).query(&q.0).timeout(timeout);
+        let mut rq = client().request(method.clone(), &url).bearer_auth(s(&l, "token")).query(q).timeout(timeout);
         if method == Method::POST {
             rq = rq.header(header::CONTENT_TYPE, "application/json").body(body.clone());
         }
-        match rq.send().await {
-            Ok(r) => {
-                let st = r.status();
-                let bytes = r.bytes().await.unwrap_or_default();
+        match async {
+            let response = rq.send().await?;
+            let status = response.status();
+            let bytes = response.bytes().await?;
+            Ok::<_, reqwest::Error>((status, bytes))
+        }.await {
+            Ok((st, bytes)) => {
                 if st == StatusCode::UNAUTHORIZED {
                     // not this window's own sign-in: a 401 here would send the guest's UI to the pairing page
                     let msg = "The owner removed you from this project (or you left it). Ask them for a new invite.";
-                    set_link_status(&core, &l, "revoked", msg);
+                    set_link_status(core, &l, "revoked", msg);
                     return ApiErr(StatusCode::FORBIDDEN, msg.into()).into_response();
                 }
-                set_link_status(&core, &l, "ok", "");
+                set_link_status(core, &l, "ok", "");
                 return Response::builder().status(st).header(header::CONTENT_TYPE, "application/json").body(Body::from(bytes)).unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
             }
             Err(e) => {
-                last = if e.is_timeout() { "the host took too long to answer".into() } else { e.to_string() };
-                if !(e.is_connect() || e.is_timeout()) || attempt + 1 == tries {
+                let transient = e.is_connect() || e.is_timeout() || e.is_body();
+                last = if e.is_timeout() { "the host took too long to answer".into() } else { e.without_url().to_string() };
+                if !transient || attempt + 1 == tries {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(500 * 3u64.pow(attempt))).await;
             }
         }
     }
-    let msg = format!("Can't reach {} right now ({last}). It will retry.", s(&l, "host_name"));
-    set_link_status(&core, &l, "offline", &msg);
+    let msg = format!("Can't reach {} right now ({last}). Try again when the host is reachable.", s(&l, "host_name"));
+    set_link_status(core, &l, "offline", &msg);
     ApiErr(StatusCode::BAD_GATEWAY, msg).into_response()
 }
 

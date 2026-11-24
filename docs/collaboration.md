@@ -114,9 +114,10 @@ one of the member's own threads on the host. An empty object enables project-lev
 The guest server sends `{tool, thread_id, arguments}` to `POST host/mcp` with the member token. The host determines
 the project from that token and checks visibility or ownership for thread operations. The supported calls are
 `read_memory`, `write_memory`, `list_threads`, `read_thread`, `check_status`, `list_artifacts`, `publish_artifact`,
-`list_claims`, `claim_paths`, `release_paths` and `set_status`. Publishing accepts inline content and folder paths
-inside the shared project. Claim and status changes require a bound host thread owned by the caller and the
-corresponding permission. The endpoint never starts an agent on the host.
+and `set_status`. Publishing accepts inline content and folder paths inside the shared project. Reporting status
+requires a bound host thread owned by the caller and the corresponding permission. The endpoint never starts an
+agent on the host. File claims stay on the guest and are published to the host by the Stage 1d presence preflight
+and heartbeat.
 
 The guest agent's default memory index and search combine local collaborator and global memory with shared host
 project memory. Reads by name prefer collaborator, then project, then global. Explicit collaborator and global
@@ -150,7 +151,6 @@ Writes have a 20-second request timeout and are sent once. If the host is unavai
 | `edit_memory` | yes | yes | no | write project memory |
 | `read_global_memory` | no | no | no | read the owner's global memory (it spans all the owner's projects) |
 | `publish_artifacts` | yes | yes | no | publish artifacts into the project |
-| `manage_claims` | yes | yes | no | claim paths and release claims for the member's own threads |
 | `update_thread_status` | yes | yes | no | report status on the member's own threads |
 | `merge` | no | no | no | merge threads into the base branch |
 | `transfer_threads` | no | yes | no | take threads over from the owner or others without asking each time (Stage 2) |

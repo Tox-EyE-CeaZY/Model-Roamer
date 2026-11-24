@@ -133,7 +133,6 @@ fn readonly(tool: &str) -> bool {
             | "list_threads"
             | "read_thread"
             | "list_artifacts"
-            | "list_claims"
             | "check_status"
     )
 }
@@ -145,9 +144,6 @@ pub(crate) fn shared_tool(tool: &str) -> bool {
             | "read_thread"
             | "list_artifacts"
             | "publish_artifact"
-            | "claim_paths"
-            | "release_paths"
-            | "list_claims"
             | "set_status"
             | "check_status"
     )
@@ -355,54 +351,11 @@ pub(crate) async fn host(
             }
             collab::publish_member_artifact(&core, &m, Some(tid).filter(|id| !id.is_empty()), args)?
         }
-        "list_claims" => {
-            let rows = tools::claim_rows(&core, &m.project_id)?;
-            json!(tools::format_claims(rows.iter().filter(
-                |r| collab::can_see(&m, r) && relative_path(field(r, "path"))
-            )))
-        }
-        "claim_paths" | "release_paths" => {
-            m.need("manage_claims")?;
-            owned_thread(&core, &m, tid)?;
-            if !args["paths"].is_null()
-                && !args["paths"]
-                    .as_array()
-                    .is_some_and(|paths| paths.iter().all(Value::is_string))
-            {
-                return Err(bad("Paths must be a list of strings."));
-            }
-            let paths = tools::claim_paths(args);
-            if paths.iter().any(|path| !relative_path(path))
-                || (tool == "claim_paths" && paths.is_empty())
-            {
-                return Err(bad("Give paths relative to the shared repository."));
-            }
-            if tool == "release_paths" {
-                tools::release_claims(&core, tid, &paths)?;
-                json!("Released.")
-            } else {
-                let others = tools::claim_rows(&core, &m.project_id)?;
-                let visible = others
-                    .iter()
-                    .filter(|r| collab::can_see(&m, r) && relative_path(field(r, "path")));
-                json!(tools::record_claims(
-                    &core,
-                    &m.project_id,
-                    tid,
-                    &paths,
-                    field(args, "note"),
-                    visible
-                )?)
-            }
-        }
         "set_status" => {
             m.need("update_thread_status")?;
             owned_thread(&core, &m, tid)?;
             let status = field(args, "status");
             tools::validate_status(status).map_err(|e| bad(e.to_string()))?;
-            if status == "done" {
-                tools::release_claims(&core, tid, &[])?;
-            }
             core.set_status(tid, status, &util::clip(field(args, "note"), 200))?;
             json!(format!("Host thread status is '{status}'."))
         }

@@ -96,7 +96,6 @@ pub const PERMS: &[(&str, &str, [bool; 3])] = &[
     ("edit_memory", "write project memory", [true, true, false]),
     ("read_global_memory", "read your global memory (it spans all your projects)", [false, false, false]),
     ("publish_artifacts", "publish artifacts into the project", [true, true, false]),
-    ("manage_claims", "claim and release paths for their own threads", [true, true, false]),
     ("update_thread_status", "update the status of their own threads", [true, true, false]),
     ("merge", "merge threads into the base branch", [false, false, false]),
     // Stage 2: an operator takes a thread over without asking each time; everyone else asks per transfer

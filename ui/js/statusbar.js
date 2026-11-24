@@ -27,7 +27,9 @@ function collect() {
   }
   for (const n of data.conflictNotes || []) {
     out.push({ key: 'note-' + n.id, tone: 'hot', icon: 'flag', label: 'Needs you', text: 'Review conflict note', sub: n.title,
-      go: () => import('./app.js').then((m) => m.go(n.link_id ? '#/settings/join?link=' + encodeURIComponent(n.link_id) : '#/p/' + n.project_id)) });
+      go: () => import('./app.js').then((m) => m.go(n.link_id
+        ? '#/settings/join?link=' + encodeURIComponent(n.link_id) + '&inbox=1'
+        : '#/p/' + n.project_id + '?inbox=1')) });
   }
   // threads that need the person: the same rule (and the same "seen" marks) as Home and the board
   const need = attention(data.threads).need;

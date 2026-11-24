@@ -44,7 +44,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   const liveEl = h('div', { class: 'th-live', hidden: true });
   const scroller = h('div', { class: 'th-scroll' }, h('div', { class: 'th-inner' }, log, liveEl));
   const composerStops = [];
-  if (t.project_id && !t.user_id) composerStops.push(mountCoordination(coordination, t.project_id, t.id, t.kind));
+  if (t.project_id && !t.user_id) composerStops.push(mountCoordination(coordination, t.project_id, t.id, t.kind, !compact));
   const composer = makeComposer();
   const sidebar = full ? h('aside', { class: 'th-side' }) : null;
   el.classList.add('thread', compact ? 'compact' : 'full');

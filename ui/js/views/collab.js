@@ -13,7 +13,7 @@ import { openExternal } from '../native.js';
 import { dialog, toast } from '../ui.js';
 import { md } from '../md.js';
 import { ic, field, input, textarea, select, seg, toggle, loading, errorBox, empty, kicker, copyable, statusChip } from '../common.js';
-import { checkWork, drawPresence, notesInbox, presenceDot } from '../collab-presence.js';
+import { checkWork, clearControl, drawInbox, drawPresence, presenceDot, requestedInbox } from '../collab-presence.js';
 
 const ROLE_LABEL = { collaborator: 'Collaborator', operator: 'Operator', viewer: 'Viewer', owner: 'Owner' };
 
@@ -274,6 +274,7 @@ async function joined(el, linkId) {
   const head = h('section', { class: 'panel cut collab-head' });
   const presenceHost = h('div', { class: 'collab-presence-host' });
   const inboxHost = h('div', { class: 'collab-note-host' });
+  const collabStrip = h('div', { class: 'collab-toolbar' }, presenceHost, inboxHost);
   const body = h('section', { class: 'panel cut' });
   el.replaceChildren(head, body);
   body.replaceChildren(loading('Reaching ' + link.host_name));
@@ -296,7 +297,7 @@ async function joined(el, linkId) {
   const me = st.member;
   let presence = st.presence;
   let notes = st.notes || [];
-  let notesKey;
+  let openInbox = requestedInbox();
 
   async function refreshNotes() {
     try {
@@ -308,11 +309,9 @@ async function joined(el, linkId) {
   }
 
   function drawCoordination() {
-    drawPresence(presenceHost, presence, live === 'ok');
-    const key = JSON.stringify([live, notes]);
-    if (notesKey === key) return;
-    notesKey = key;
-    inboxHost.replaceChildren(live === 'ok' ? notesInbox(base, notes, refreshNotes) : null);
+    drawPresence(presenceHost, presence, live === 'ok', linkId);
+    drawInbox(inboxHost, base, live === 'ok' ? notes : [], refreshNotes, openInbox);
+    if (live === 'ok' && notes.length) openInbox = false;
   }
 
   const liveTag = h('span');
@@ -322,7 +321,7 @@ async function joined(el, linkId) {
       h('a', { class: 'linkbtn', href: '#/settings/join' }, ic('left', 13), 'All joined projects'),
       h('div', { class: 'collab-title' }, h('h2', {}, st.project?.name || link.project_name), liveTag),
       h('div', { class: 'collab-title' }, h('p', { class: 'faint small' }, `Hosted by ${st.host?.name || link.host_name} · you are ${ROLE_LABEL[me.role] || me.role} as ${me.name}`), askOperator()),
-      presenceHost, inboxHost,
+      collabStrip,
       seg([['threads', 'Threads'], ['memory', 'Memory'], ['artifacts', 'Artifacts'], ['people', 'People']], tab, (v) => {
         tab = v;
         openThread = null;
@@ -567,5 +566,5 @@ async function joined(el, linkId) {
   drawHead();
   drawBody();
   pump();
-  return () => (alive = false);
+  return () => { alive = false; clearControl(inboxHost); clearControl(presenceHost); };
 }

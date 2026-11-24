@@ -12,7 +12,7 @@ import { mountThread, decisionCard } from './thread.js';
 import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, folderInput, askLine, repoSelect, repoLabel, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 import { needsYou, isFinished } from '../attention.js';
 import { scrollStrip } from '../scrollstrip.js';
-import { mountPresence, ownerOverlap } from '../collab-presence.js';
+import { mountPresence, mountProjectInbox, ownerOverlap } from '../collab-presence.js';
 
 const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
 const PANE_KEY = (id) => 'mr-proj-pane-' + id;
@@ -43,7 +43,10 @@ export default async function projectView(el, r, ctx) {
   const tab = r.tab || '';
   const headEl = h('div', { class: 'p-head', style: { '--ph': p.color } });
   const presenceHost = h('div', { class: 'collab-presence-host' });
+  const inboxHost = h('div', { class: 'collab-note-host' });
+  const collabStrip = h('div', { class: 'collab-toolbar' }, presenceHost, inboxHost);
   const stopPresence = mountPresence(presenceHost, p.id);
+  const inbox = mountProjectInbox(inboxHost, p.id);
   const body = h('div', { class: 'p-body' });
   el.append(headEl, body);
   el.style.setProperty('--ph', p.color);
@@ -138,7 +141,7 @@ export default async function projectView(el, r, ctx) {
               { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
             ], b.right, b.bottom + 4, { anchor: e.currentTarget });
           }, html: icon('more', 16) }))),
-      presenceHost, tabStrip.el);
+      collabStrip, tabStrip.el);
     renderThreadBadge();
   }
   drawHead();
@@ -155,7 +158,10 @@ export default async function projectView(el, r, ctx) {
   });
   let inner = null;
   if (tab === '') {
-    inner = await board(body, p, r, ctx, {
+    inner = await board(body, p, r, { ...ctx, onRoute: (update) => ctx?.onRoute?.((next) => {
+      if (next.q.inbox) inbox.open();
+      return update(next);
+    }) }, {
       getPane: () => mobilePane,
       onPane: (fn) => (onPaneChange = fn),
       onBadge: (info) => {
@@ -169,7 +175,7 @@ export default async function projectView(el, r, ctx) {
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'settings') inner = await settingsTab(body, p, (np) => ((p = { ...p, ...np }), drawHead()));
-  return () => (unlisten(), unwatch(), stopPresence(), tabStrip?.destroy(), inner?.());
+  return () => (unlisten(), unwatch(), inbox.destroy(), stopPresence(), tabStrip?.destroy(), inner?.());
 }
 
 // ------------------------------------------------------------ board

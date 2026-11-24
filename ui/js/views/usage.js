@@ -60,7 +60,7 @@ export default async function usage(el, r) {
             : detail));
       const quotas = a.quotas || [];
       plans.replaceChildren(kicker('Plan limits'),
-        quotas.length ? quotas.flatMap((q) => {
+        ...(quotas.length ? quotas.flatMap((q) => {
           const checked = q.at ? ` · checked ${dur(Date.now() - q.at)} ago` : '';
           const detail = `${q.turns_5h || 0} turns in 5 hours, ${q.turns_7d || 0} this week${checked}`;
           const availability = q.probe_failed ? ' · Usage refresh unavailable' : '';
@@ -69,7 +69,7 @@ export default async function usage(el, r) {
             row(q, q.name + shared, q, detail + availability),
             ...Object.entries(q.tiers || {}).map(([name, tier]) => row(q, `${q.name} · ${name}`, tier)),
           ];
-        }) : h('p', { class: 'faint small' }, 'No agents are enabled.'));
+        }) : [h('p', { class: 'faint small' }, 'No agents are enabled.')]));
     } catch (e) {
       plans.replaceChildren(kicker('Plan limits'), errorBox(e, loadPlans));
     }

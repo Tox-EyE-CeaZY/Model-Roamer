@@ -33,25 +33,46 @@ export default async function usage(el, r) {
   // each plan's 5-hour and weekly use: the same figures as the status bar, which a phone doesn't have
   const plans = h('section', { class: 'panel cut plans' });
   body.before(plans);
+  plans.append(loading());
   async function loadPlans() {
     try {
       const a = await get('activity', { quiet: true, timeout: 15000 });
       const pct = (w) => (w && typeof w.used === 'number' ? Math.round(w.used * 100) : null);
-      const reset = (w) => (w?.resets_at ? 'resets ' + new Date(w.resets_at).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }) : '');
-      const bar = (label, w, lim) => {
-        const v = lim ? 100 : pct(w);
+      const reset = (at) => at ? 'resets ' + new Date(at).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }) : '';
+      const bar = (label, w, limit) => {
+        const out = limit?.active || w?.restricted;
+        const v = out ? 100 : pct(w);
         return h('div', { class: 'plan-w' + (v >= 90 ? ' hot' : '') },
           h('span', { class: 'plan-l' }, label),
           h('span', { class: 'sb-m-bar wide' }, h('i', { style: { width: (v ?? 0) + '%' } })),
-          h('b', {}, v == null ? 'unknown' : lim ? 'OUT' : v + '%'),
-          h('small', { class: 'faint' }, reset(w)));
+          h('b', {}, v == null ? 'Unknown' : out || w?.used >= 1 ? 'OUT' : v + '%'),
+          h('small', { class: 'faint' }, reset(out && limit?.active ? limit.until : w?.resets_at)));
       };
-      plans.replaceChildren(kicker('Plan limits', h('small', { class: 'faint' }, 'how much of each plan is used right now')),
-        ...(a.quotas || []).map((q) => h('div', { class: 'plan-row', style: { '--ah': q.hue ?? 200, '--m': `oklch(.72 .16 ${q.hue ?? 200})` } },
-          h('b', { class: 'plan-n' }, q.name),
-          bar('5-hour', q.five_hour, q.limit?.active), bar('Weekly', q.weekly, false),
-          h('small', { class: 'faint plan-f' }, `${q.turns_5h || 0} turns in 5 hours, ${q.turns_7d || 0} this week` + (q.at ? ` · checked ${dur(Date.now() - q.at)} ago` : '')))));
-    } catch { /* the figures just stay as they were */ }
+      const row = (agent, label, usage, detail) => h('div', {
+        class: 'plan-row', style: { '--ah': agent.hue ?? 200, '--m': `oklch(.72 .16 ${agent.hue ?? 200})` },
+      },
+        h('b', { class: 'plan-n' }, label),
+        bar('5-hour', usage.five_hour, usage.limit?.window === 'five_hour' ? usage.limit : null),
+        bar('Weekly', usage.weekly, usage.limit?.window === 'weekly' ? usage.limit : null),
+        h('small', { class: 'faint plan-f' },
+          usage.limit?.active && !usage.limit.window
+            ? [usage.limit.note || 'Usage limit reached', reset(usage.limit.until)].filter(Boolean).join(' · ')
+            : detail));
+      const quotas = a.quotas || [];
+      plans.replaceChildren(kicker('Plan limits'),
+        quotas.length ? quotas.flatMap((q) => {
+          const checked = q.at ? ` · checked ${dur(Date.now() - q.at)} ago` : '';
+          const detail = `${q.turns_5h || 0} turns in 5 hours, ${q.turns_7d || 0} this week${checked}`;
+          const availability = q.probe_failed ? ' · Usage refresh unavailable' : '';
+          const shared = q.id === 'claude' ? ' · All models' : q.id === 'antigravity' ? ' · Highest group usage' : '';
+          return [
+            row(q, q.name + shared, q, detail + availability),
+            ...Object.entries(q.tiers || {}).map(([name, tier]) => row(q, `${q.name} · ${name}`, tier)),
+          ];
+        }) : h('p', { class: 'faint small' }, 'No agents are enabled.'));
+    } catch (e) {
+      plans.replaceChildren(kicker('Plan limits'), errorBox(e, loadPlans));
+    }
   }
   loadPlans();
   const planTimer = setInterval(loadPlans, 30000);

@@ -40,7 +40,7 @@ const DEFS: &[Def] = &[
         "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"},
         "allow_limited": {"type": "boolean", "description": "Open the thread even though that agent is out of usage right now (it waits for the reset). Default false: you're told who has room instead."}
     }), &["title", "instructions"]) },
-    Def { name: "agent_status", roles: LEAD, desc: "Each agent's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
+    Def { name: "agent_status", roles: LEAD, desc: "Each agent and model tier's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
     Def { name: "send_message", roles: LEAD, desc: "Send a message to a thread (answers, review notes, new instructions). If the thread is mid-turn it is interrupted so it reads the message at once, then carries on with its session (pass interrupt=false to let it finish its turn first).", schema: || obj(json!({
         "thread_id": {"type": "string"}, "text": {"type": "string"}, "interrupt": {"type": "boolean", "description": "Default true. false queues the message until the thread's current turn ends."}
     }), &["thread_id", "text"]) },
@@ -51,8 +51,9 @@ const DEFS: &[Def] = &[
         "thread_id": {"type": "string"}, "limit": {"type": "integer", "description": "Messages to return (default 12)"}
     }), &["thread_id"]) },
     Def { name: "check_status", roles: LEAD, desc: "Overview: every open thread's state, what each agent is doing, which agents are signed in or out of usage, and pending decisions.", schema: || obj(json!({}), &[]) },
-    Def { name: "route_task", roles: LEAD, desc: "Which agent should take a kind of task right now, by the person's routing rules and each agent's headroom.", schema: || obj(json!({
-        "task_kind": {"type": "string"}
+    Def { name: "route_task", roles: LEAD, desc: "Which agent and model should take a task, based on routing rules and available usage.", schema: || obj(json!({
+        "task_kind": {"type": "string"},
+        "model": {"type": "string", "description": "Optional model to check for this task"}
     }), &["task_kind"]) },
     Def { name: "reassign_thread", roles: LEAD, desc: "Move a thread to a different agent (e.g. when one hits its usage limit). The new agent gets the thread's history.", schema: || obj(json!({
         "thread_id": {"type": "string"}, "agent": {"type": "string"}, "model": {"type": "string"}, "note": {"type": "string", "description": "Optional message for the new agent"}
@@ -195,10 +196,6 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
-            let want = a("agent").to_lowercase();
-            if !want.is_empty() && want != "auto" && core.is_limited(&want) && args["allow_limited"] != true {
-                bail!("{want} is out of usage right now, so nothing was opened. Pick another agent or use agent \"auto\", or pass allow_limited to queue it for the reset.\n\n{}", runner::fleet_now(core));
-            }
             let deps: Vec<String> = args["depends_on"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
             let t = runner::create_worker(
                 core,
@@ -210,6 +207,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
                     agent: a("agent"),
                     task_kind: a("task_kind"),
                     model: a("model"),
+                    allow_limited: args["allow_limited"] == true,
                     effort: a("effort"),
                     workspace: a("workspace"),
                     depends_on: deps,
@@ -219,10 +217,11 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             )
             .await?;
             Ok(format!(
-                "Opened thread {} \"{}\" with {}{}. You'll get a wake when it replies.",
+                "Opened thread {} \"{}\" with {} ({}){}. You'll get a wake when it replies.",
                 t["id"].as_str().unwrap_or(""),
                 t["title"].as_str().unwrap_or(""),
                 t["agent"].as_str().unwrap_or(""),
+                runner::model_label(t["model"].as_str().unwrap_or("")),
                 if t["status"] == "waiting" { " (waiting for its dependencies)" } else { "" }
             ))
         }
@@ -273,7 +272,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             let p = need_project()?;
             Ok(runner::overview(core, &p))
         }
-        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind")).map(|(agent, why)| format!("{agent}: {why}\n\n{}", runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
+        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind"), &a("model")).map(|(agent, model, why)| format!("{agent} ({}): {why}\n\n{}", runner::model_label(&model), runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
         "reassign_thread" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;

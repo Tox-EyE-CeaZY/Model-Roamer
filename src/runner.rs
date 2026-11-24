@@ -108,6 +108,7 @@ pub fn wake_tag(reason: &str, t: &Value, body: &str) -> String {
 
 // ------------------------------------------------------------------------------------------------ threads
 
+#[derive(Default)]
 pub struct NewWorker {
     pub title: String,
     pub instructions: String,
@@ -115,6 +116,7 @@ pub struct NewWorker {
     pub agent: String,
     pub task_kind: String,
     pub model: String,
+    pub allow_limited: bool,
     /// Thinking strength for this thread ("" = the agent's setting)
     pub effort: String,
     pub workspace: String,
@@ -131,16 +133,26 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     let kind = if w.task_kind.is_empty() { "general".to_string() } else { w.task_kind.to_lowercase() };
     let (buddy_agent, buddy_model, buddy) = if w.agent.starts_with("buddy:") { core.pick_agent(&w.agent, &w.model)? } else { (String::new(), String::new(), None) };
     let w = if buddy.is_some() { NewWorker { agent: buddy_agent, model: buddy_model, ..w } } else { w };
-    let agent = if w.agent.is_empty() || w.agent == "auto" {
-        route(core, Some(project), &kind).map(|(a, _)| a).ok_or_else(|| anyhow!("No agent is installed, signed in and within its limits. Open Agents to set one up."))?
+    let (agent, model) = if w.agent.is_empty() || w.agent == "auto" {
+        route(core, Some(project), &kind, &w.model)
+            .map(|(agent, model, _)| (agent, model))
+            .ok_or_else(|| anyhow!("No eligible agent and model have usage available.\n\n{}", fleet_now(core)))?
     } else {
-        let a = w.agent.to_lowercase();
-        if core.adapter(&a).is_none() {
-            bail!("There's no agent called '{a}'. Use claude, codex, antigravity or a custom agent's id.");
+        let agent = w.agent.to_lowercase();
+        if core.adapter(&agent).is_none() {
+            bail!("There's no agent called '{agent}'. Use claude, codex, antigravity or a custom agent's id.");
         }
-        a
+        let preferred = effective_model(core, &agent, &w.model);
+        let model = if w.allow_limited {
+            preferred
+        } else {
+            choose_model(core, &agent, &w.model).ok_or_else(|| anyhow!(
+                "{agent} ({}) is out of usage or restricted right now. Choose another model or use allow_limited to wait.\n\n{}",
+                model_label(&preferred), fleet_now(core)
+            ))?
+        };
+        (agent, model)
     };
-    let model = if w.model.is_empty() { core.agent_cfg(&agent)["model"].as_str().unwrap_or("").to_string() } else { w.model.clone() };
     let mode = match w.workspace.as_str() {
         "shared" | "scratch" | "worktree" => w.workspace.clone(),
         m if m.starts_with("path:") => m.to_string(),
@@ -243,24 +255,68 @@ fn release_dependents(core: &CoreRef, project: &str) {
 
 /// Which agent should take a kind of task now: the person's routing rule if that agent is usable, else the first
 /// usable one in the fallback order.
-pub fn route(core: &CoreRef, project: Option<&str>, kind: &str) -> Option<(String, String)> {
+pub fn route(core: &CoreRef, project: Option<&str>, kind: &str, requested: &str) -> Option<(String, String, String)> {
     let s = core.settings();
     let mut routing = s["routing"].clone();
     if let Some(p) = project.and_then(|p| core.project(p).ok()) {
         crate::config::merge(&mut routing, &p["routing"]);
     }
     let want = routing[kind].as_str().or(routing["general"].as_str()).unwrap_or("claude").to_string();
-    if usable(core, &want) {
-        return Some((want, format!("routing rule for {kind}")));
-    }
     let mut order: Vec<String> = s["lead_fallback"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     order.extend(core.adapters().iter().map(|a| a.id()));
-    for a in order {
-        if a != want && usable(core, &a) {
-            return Some((a.clone(), format!("{want} isn't available right now ({}), so {a}", why_not(core, &want))));
+    for agent in std::iter::once(want.clone()).chain(order) {
+        if !agent_ready(core, &agent) {
+            continue;
+        }
+        if !requested.is_empty()
+            && !core.adapter(&agent).is_some_and(|adapter| core.models_of(adapter.as_ref()).iter().any(|m| {
+                m.id.eq_ignore_ascii_case(requested) || m.label.eq_ignore_ascii_case(requested)
+            }))
+        {
+            continue;
+        }
+        if let Some(model) = choose_model(core, &agent, requested) {
+            let why = if agent == want {
+                if model == effective_model(core, &agent, requested) {
+                    format!("routing rule for {kind}")
+                } else {
+                    format!("routing rule for {kind}; configured model is out of usage")
+                }
+            } else {
+                format!("{want} isn't available right now ({})", why_not(core, &want))
+            };
+            return Some((agent, model, why));
         }
     }
     None
+}
+
+fn effective_model(core: &CoreRef, agent: &str, model: &str) -> String {
+    if model.is_empty() {
+        core.agent_cfg(agent)["model"].as_str().unwrap_or("").to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+pub(crate) fn model_label(model: &str) -> &str {
+    if model.is_empty() { "CLI default" } else { model }
+}
+
+fn choose_model(core: &CoreRef, agent: &str, requested: &str) -> Option<String> {
+    let preferred = effective_model(core, agent, requested);
+    if core.model_limit(agent, &preferred)["active"] != true {
+        return Some(preferred);
+    }
+    if !requested.is_empty() || core.is_limited(agent) {
+        return None;
+    }
+    let adapter = core.adapter(agent)?;
+    core.models_of(adapter.as_ref()).into_iter()
+        .filter(|m| !m.id.is_empty() && m.id != preferred)
+        .filter(|m| crate::quota::model_tier(agent, &m.id) != Some("Fable"))
+        .find(|m| core.model_limit(agent, &m.id)["active"] != true)
+        .map(|m| m.id)
 }
 
 /// The thinking strength the routing rules give a kind of task (stored as `effort:<kind>` next to the agent rule,
@@ -281,7 +337,21 @@ pub fn route_effort(core: &CoreRef, project: Option<&str>, kind: &str, agent: &s
 /// Every agent's state right now, for the lead: ready, out of usage (and until when), signed out, how much of its
 /// 5-hour and weekly allowance is used, and how busy it is.
 pub fn fleet_now(core: &CoreRef) -> String {
-    let pct = |w: &Value| w["used"].as_f64().map(|u| format!("{}%", (u * 100.0).round()));
+    let usage = |row: &Value| {
+        let window = |key: &str, label: &str| {
+            let w = &row[key];
+            let limit = &row["limit"];
+            let (amount, until) = if limit["active"] == true && limit["window"] == key {
+                ("out of usage".to_string(), limit["until"].as_i64())
+            } else if w["restricted"] == true {
+                ("restricted".to_string(), w["resets_at"].as_i64())
+            } else {
+                (w["used"].as_f64().map(|u| format!("{}% used", (u * 100.0).round())).unwrap_or_else(|| "unknown".into()), w["resets_at"].as_i64())
+            };
+            format!("{label} {amount}{}", reset_label(until).map(|x| format!(" (resets {x})")).unwrap_or_default())
+        };
+        format!("{}, {}", window("five_hour", "5-hour"), window("weekly", "weekly"))
+    };
     let quotas = core.quotas();
     let mut out = vec![];
     for st in core.cached_status() {
@@ -296,18 +366,27 @@ pub fn fleet_now(core: &CoreRef) -> String {
         } else if core.is_limited(id) {
             let lim = core.limit_of(id);
             format!("OUT OF USAGE ({}){}", window_name(lim["window"].as_str().unwrap_or("")).trim_start_matches("its "), reset_label(lim["until"].as_i64()).map(|w| format!(", resets around {w}")).unwrap_or_default())
+        } else if let Some(model) = choose_model(core, id, "") {
+            format!("ready ({})", model_label(&model))
         } else {
-            "ready".to_string()
+            "no model available within its limits".to_string()
         };
         let q = quotas.iter().find(|q| q["id"] == id);
-        let used = q.map(|q| match (pct(&q["five_hour"]), pct(&q["weekly"])) {
-            (Some(a), Some(b)) => format!(" · 5-hour {a} used, weekly {b} used"),
-            (Some(a), None) => format!(" · 5-hour {a} used"),
-            _ => String::new(),
-        });
+        let used = q.map(&usage).unwrap_or_default();
         let busy = core.db.scalar_i64("SELECT COUNT(*) FROM threads WHERE agent = ?1 AND status IN ('working','queued')", &[&id]).unwrap_or(0);
         let max = core.agent_cfg(id)["max_parallel"].as_i64().unwrap_or(2);
-        out.push(format!("- {id}: {state}{} · {busy} of {max} running", used.unwrap_or_default()));
+        out.push(format!("- {id}: {state} · {used} · {busy} of {max} running"));
+        if let Some(tiers) = q.and_then(|q| q["tiers"].as_object()) {
+            for (tier, row) in tiers {
+                let restriction = if row["limit"]["active"] == true {
+                    format!(" · {}{}", row["limit"]["note"].as_str().unwrap_or("usage limit"),
+                        reset_label(row["limit"]["until"].as_i64()).map(|x| format!(" (retry {x})")).unwrap_or_default())
+                } else {
+                    String::new()
+                };
+                out.push(format!("  - {tier}: {}{restriction}", usage(row)));
+            }
+        }
     }
     if out.is_empty() { "No agents are set up.".into() } else { out.join("\n") }
 }
@@ -331,19 +410,21 @@ fn reset_label(until: Option<i64>) -> Option<String> {
 /// for the reset (it then picks up on its own). Never moves without that permission.
 fn on_limit(core: &CoreRef, t: &Value, agent: &str, pid: Option<&str>) -> Result<Option<String>> {
     let thread = t["id"].as_str().unwrap_or("");
-    let lim = core.limit_of(agent);
+    let model = effective_model(core, agent, t["model"].as_str().unwrap_or(""));
+    let lim = core.model_limit(agent, &model);
     let name = core.adapter(agent).map(|a| a.info().name).unwrap_or_else(|| agent.to_string());
     let when = reset_label(lim["until"].as_i64());
     let head = format!(
-        "{name} hit {}{}.",
+        "{name} ({}) hit {}{}.",
+        model_label(&model),
         window_name(lim["window"].as_str().unwrap_or("")),
         when.as_deref().map(|w| format!(" (resets around {w})")).unwrap_or_default()
     );
     let kind = t["task_kind"].as_str().filter(|s| !s.is_empty()).unwrap_or("general");
     if core.settings()["auto_fallback"] == true {
-        if let Some((a, _)) = route(core, pid, kind).filter(|r| r.0 != agent) {
-            note(core, thread, &format!("{head} You turned on automatic moves, so this thread moved to {a}."));
-            core.set_thread(thread, &json!({ "agent": a, "model": core.agent_cfg(&a)["model"], "session_id": "", "session_agent": "", "status": "idle", "status_note": "" }))?;
+        if let Some((a, next_model, _)) = route(core, pid, kind, "").filter(|r| r.0 != agent || r.1 != model) {
+            note(core, thread, &format!("{head} You turned on automatic moves, so this thread moved to {a} ({}).", model_label(&next_model)));
+            core.set_thread(thread, &json!({ "agent": a, "model": next_model, "session_id": "", "session_agent": "", "status": "idle", "status_note": "" }))?;
             return Ok(Some(a));
         }
     }
@@ -353,11 +434,11 @@ fn on_limit(core: &CoreRef, t: &Value, agent: &str, pid: Option<&str>) -> Result
         return Ok(None);
     }
     // the agents that could take it, best first: routing's pick, then the rest with room
-    let mut order: Vec<String> = route(core, pid, kind).map(|r| vec![r.0]).unwrap_or_default();
+    let mut order: Vec<String> = route(core, pid, kind, "").map(|r| vec![r.0]).unwrap_or_default();
     order.extend(core.adapters().iter().map(|a| a.id()));
     let mut alts: Vec<String> = vec![];
     for a in order {
-        if a != agent && !alts.contains(&a) && usable(core, &a) {
+        if !alts.contains(&a) && usable(core, &a) && choose_model(core, &a, "").is_some_and(|candidate| a != agent || candidate != model) {
             alts.push(a);
         }
     }
@@ -369,12 +450,17 @@ fn on_limit(core: &CoreRef, t: &Value, agent: &str, pid: Option<&str>) -> Result
         let busy = core.db.scalar_i64("SELECT COUNT(*) FROM threads WHERE agent = ?1 AND status IN ('working','queued')", &[a]).unwrap_or(0);
         let max = core.agent_cfg(a)["max_parallel"].as_i64().unwrap_or(2);
         let recent = core.db.scalar_i64("SELECT COUNT(*) FROM turns WHERE agent = ?1 AND started_at > ?2", &[a, &(util::now_ms() - 5 * 3_600_000)]).unwrap_or(0);
-        let label = format!("Move to {}", info.as_ref().map(|i| i.name.clone()).unwrap_or_else(|| a.clone()));
+        let Some(next_model) = choose_model(core, a, "") else { continue };
+        let label = if a == agent {
+            format!("Switch to {}", model_label(&next_model))
+        } else {
+            format!("Move to {}", info.as_ref().map(|i| i.name.clone()).unwrap_or_else(|| a.clone()))
+        };
         options.push(json!({
             "label": clip(&label, 40),
             "consequence": format!("Has room: {busy} of {max} running, {recent} turn(s) in the last 5 hours. It starts a fresh session with this thread's history."),
         }));
-        choices.push(json!({ "agent": a, "model": core.agent_cfg(a)["model"] }));
+        choices.push(json!({ "agent": a, "model": next_model }));
     }
     options.push(json!({
         "label": "Wait for the reset",
@@ -416,7 +502,9 @@ fn act_on_decision(core: &CoreRef, d: &Value, choice: usize) -> Result<bool> {
         schedule(core, thread);
     } else {
         let agent = action["agent"].as_str().unwrap_or("");
-        let when = reset_label(core.limit_of(agent)["until"].as_i64());
+        let model = core.thread(thread)?["model"].as_str().unwrap_or("").to_string();
+        let model = effective_model(core, agent, &model);
+        let when = reset_label(core.model_limit(agent, &model)["until"].as_i64());
         note(core, thread, &match when {
             Some(w) => format!("Waiting for the reset. This thread picks up on its own around {w}."),
             None => "Waiting for the reset. This thread tries again every half hour until it works.".into(),
@@ -426,6 +514,10 @@ fn act_on_decision(core: &CoreRef, d: &Value, choice: usize) -> Result<bool> {
 }
 
 pub fn usable(core: &CoreRef, agent: &str) -> bool {
+    agent_ready(core, agent) && choose_model(core, agent, "").is_some()
+}
+
+fn agent_ready(core: &CoreRef, agent: &str) -> bool {
     if core.adapter(agent).is_none() || core.agent_cfg(agent)["enabled"] == false || core.is_limited(agent) {
         return false;
     }
@@ -443,7 +535,7 @@ fn why_not(core: &CoreRef, agent: &str) -> String {
     if core.agent_cfg(agent)["enabled"] == false {
         return "turned off".into();
     }
-    if core.is_limited(agent) {
+    if choose_model(core, agent, "").is_none() {
         return "out of usage".into();
     }
     let st = core.status_cache.lock().ok().and_then(|c| c.get(agent).cloned()).unwrap_or_default();
@@ -713,6 +805,11 @@ enum Outcome {
     RetryLater(u64),
 }
 
+fn thread_limited(core: &CoreRef, thread: &Value, agent: &str) -> bool {
+    let model = effective_model(core, agent, thread["model"].as_str().unwrap_or(""));
+    core.model_limit(agent, &model)["active"] == true
+}
+
 async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<bool>) -> Result<()> {
     let mut t = core.thread(thread)?;
     let project = match t["project_id"].as_str() {
@@ -723,7 +820,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     let mut agent = t["agent"].as_str().unwrap_or("claude").to_string();
 
     // out of usage: move to another agent, or wait for the reset
-    if core.is_limited(&agent) {
+    if thread_limited(core, &t, &agent) {
         match on_limit(core, &t, &agent, pid.as_deref())? {
             Some(a) => {
                 agent = a;
@@ -752,6 +849,12 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             }
         }
     };
+
+    if thread_limited(core, &t, &agent) {
+        drop(permit);
+        on_limit(core, &t, &agent, pid.as_deref())?;
+        return Ok(());
+    }
 
     // the messages this turn answers
     let inputs = core.db.all("SELECT * FROM messages WHERE thread_id = ?1 AND pending = 1 ORDER BY created_at", &[&thread])?;
@@ -929,14 +1032,21 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                             usage.3 += cost;
                         }
                         AgentEvent::Final(x) => final_text = Some(x),
-                        AgentEvent::Limit { until, message } => limit = Some((until, message)),
+                        AgentEvent::Limit { until, message } => {
+                            let scoped = |m: &str| crate::quota::limit_scope(&agent, &model, m).is_some();
+                            if limit.as_ref().is_none_or(|(previous_reset, previous_message): &(Option<i64>, String)| {
+                                (scoped(&message), until.is_some()) >= (scoped(previous_message), previous_reset.is_some())
+                            }) {
+                                limit = Some((until, message));
+                            }
+                        }
                         AgentEvent::Error(e) => {
                             flush_text(core, &t, &turn_id, &mut cur, &mut segments);
                             add_activity(core, &t, &turn_id, "error", "Error", &e);
                             errs.push(e);
                         }
                         AgentEvent::Raw(r) => raw.push(r),
-                        AgentEvent::Quota(q) => core.set_quota(&agent, &q),
+                        AgentEvent::Quota(q) => core.update_quota(&agent, &q),
                         AgentEvent::Context { used, window } => {
                             let w = if window > 0 { window } else { ctx_seen.map(|c| c.1).unwrap_or(0) };
                             ctx_seen = Some((if used > 0 { used } else { ctx_seen.map(|c| c.0).unwrap_or(0) }, w));
@@ -959,11 +1069,19 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         if after.iter().any(|s| !s.trim().is_empty()) { after.join("\n\n") } else { segments.join("\n\n") }
     });
     if reply.trim().is_empty() && adapter.raw_is_text() {
+        if limit.is_none() && exit.is_some_and(|code| code != 0) {
+            limit = raw.iter()
+                .find(|line| line.len() < 800 && crate::quota::model_restriction(&agent, &model, line))
+                .map(|line| (crate::agents::reset_time(line), line.clone()));
+        }
         reply = raw.join("\n").trim().to_string();
     }
     if limit.is_none() && reply.trim().is_empty() {
         for e in errs.iter().chain(stderr_tail.iter()) {
-            if let Some(until) = crate::agents::limit_in(e).filter(|_| e.len() < 800) {
+            if let Some(until) = crate::agents::limit_in(e)
+                .or_else(|| crate::quota::model_restriction(&agent, &model, e).then_some(None))
+                .filter(|_| e.len() < 800)
+            {
                 limit = Some((until, e.trim().to_string()));
                 break;
             }
@@ -991,11 +1109,16 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     } else if let Some((until, msg)) = &limit {
         let now = util::now_ms();
         let window = crate::agents::limit_window(msg);
-        let _ = core.db.exec(
+        let key = crate::quota::limit_scope(&agent, &model, msg)
+            .map(|tier| crate::quota::tier_key(&agent, tier)).unwrap_or_else(|| agent.clone());
+        if let Err(error) = core.db.exec(
             "INSERT INTO limits(agent, limited_until, note, hit_at, window) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(agent) DO UPDATE SET limited_until = excluded.limited_until, note = excluded.note, hit_at = excluded.hit_at, window = excluded.window",
-            &[&agent, until, &clip(msg, 300), &now, &window],
-        );
-        core.bus.emit("limits", None, None, json!({ "agent": agent, "limit": core.limit_of(&agent) }));
+            &[&key, until, &clip(msg, 300), &now, &window],
+        ) {
+            tracing::warn!(agent, model, %error, "could not save usage limit");
+        }
+        core.bus.emit("limits", None, None, json!({ "agent": agent, "model": model, "limit": core.limit_of(&key) }));
+        core.bus.emit("quota", None, None, json!({ "agent": agent }));
         Outcome::Limited
     } else if transient && (earlier_tries as usize) < TRANSIENT_RETRIES.len() {
         Outcome::RetryLater(TRANSIENT_RETRIES[earlier_tries as usize])
@@ -1074,7 +1197,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
                         Some(a) => format!("It was moved to {a} automatically."),
                         None => "The person was asked whether to move it to another agent or wait for the reset; it is paused until they answer or the limit resets. Reassign it yourself only if they ask.".into(),
                     };
-                    wake_lead(core, p, &wake_tag("agent-limit", &t2, &format!("{} is out of usage. {what} Plan around it: don't route new work to {} until it resets.\n\nAgents right now:\n{}", adapter.info().name, adapter.info().name, fleet_now(core))), json!({ "thread": thread }));
+                    wake_lead(core, p, &wake_tag("agent-limit", &t2, &format!("{} ({}) hit a usage limit. {what}\n\nAgents right now:\n{}", adapter.info().name, model_label(&model), fleet_now(core))), json!({ "thread": thread }));
                 }
             }
             if moved.is_some() {
@@ -1424,6 +1547,7 @@ pub async fn request_review(core: &CoreRef, target: &Value, agent: &str, focus: 
             agent: reviewer,
             task_kind: "review".into(),
             model: String::new(),
+            allow_limited: false,
             effort: String::new(),
             workspace: ws,
             depends_on: vec![],
@@ -1545,10 +1669,11 @@ pub async fn watch_limits(core: CoreRef) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
         close_idle_parked(&core).await;
-        let limited = core.db.all("SELECT id, agent, project_id FROM threads WHERE status = 'limited' AND deleted_at IS NULL", &[]).unwrap_or_default();
+        let limited = core.db.all("SELECT id, agent, model, project_id FROM threads WHERE status = 'limited' AND deleted_at IS NULL", &[]).unwrap_or_default();
         for t in limited {
             let agent = t["agent"].as_str().unwrap_or("");
-            if !core.is_limited(agent) {
+            let model = effective_model(&core, agent, t["model"].as_str().unwrap_or(""));
+            if core.model_limit(agent, &model)["active"] != true {
                 let id = t["id"].as_str().unwrap_or("");
                 // the reset answers the open "move or wait?" question
                 for d in core.db.all("SELECT id, options FROM decisions WHERE thread_id = ?1 AND answer IS NULL AND action LIKE '%\"limit\"%'", &[&id]).unwrap_or_default() {
@@ -1573,6 +1698,48 @@ pub async fn watch_limits(core: CoreRef) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn routing_keeps_claude_when_only_fable_is_limited() {
+        use super::*;
+        let data = std::env::temp_dir().join(util::id("roamer-routing-test"));
+        let core = crate::core::Core::open(data.clone(), true).unwrap();
+        core.patch_settings(&json!({"agents": {"claude": {"model": "fable"}}, "routing": {"general": "claude"}})).unwrap();
+        core.set_quota("claude", &json!({"five_hour": {"used": 0.2}}));
+        core.update_quota("claude", &json!({"tiers": {"Fable": {"weekly": {
+            "used": 1.0, "resets_at": util::now_ms() + 3_600_000
+        }}}}));
+        let (agent, model, _) = route(&core, None, "general", "").unwrap();
+        assert_eq!((agent.as_str(), model.as_str()), ("claude", "opus"));
+        assert!(choose_model(&core, "claude", "fable").is_none());
+        assert!(route(&core, None, "general", "fable").is_none());
+        assert_eq!(core.quotas().iter().find(|q| q["id"] == "claude").unwrap()["five_hour"]["used"], 0.2);
+
+        core.db.exec("INSERT INTO projects(id, name, created_at, updated_at) VALUES ('project', 'Test', 0, 0)", &[]).unwrap();
+        core.db.exec("INSERT INTO threads(id, kind, title, agent, status, created_at, updated_at) VALUES ('dependency', 'worker', 'Test', 'claude', 'waiting', 0, 0)", &[]).unwrap();
+        let worker = create_worker(&core, "project", NewWorker {
+            title: "Use an available Claude model".into(),
+            instructions: "Test worker routing".into(),
+            agent: "auto".into(),
+            depends_on: vec!["dependency".into()],
+            kind: "worker".into(),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(worker["status"], "waiting");
+        assert_eq!(worker["model"], "opus");
+
+        core.set_quota("claude", &json!({}));
+        let scope = crate::quota::limit_scope("claude", "fable", "Claude seven day fable limit reached").unwrap();
+        let key = crate::quota::tier_key("claude", scope);
+        core.db.exec("INSERT INTO limits(agent, hit_at, note) VALUES (?1, ?2, ?3)",
+            &[&key, &util::now_ms(), &"Fable restricted"]).unwrap();
+        assert!(choose_model(&core, "claude", "fable").is_none());
+        assert_eq!(choose_model(&core, "claude", "").as_deref(), Some("opus"));
+        assert!(!core.is_limited("claude"));
+        assert_eq!(crate::quota::limit_scope("claude", "fable", "Account usage limit reached"), None);
+        drop(core);
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
     #[test]
     fn names_limit_windows() {
         assert_eq!(crate::agents::limit_window("You've hit your weekly limit · resets Mon 9am"), "weekly");

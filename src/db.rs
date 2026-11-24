@@ -233,6 +233,73 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX repos_project ON repos(project_id);
     ALTER TABLE threads ADD COLUMN repo_id TEXT NOT NULL DEFAULT '';
     "#,
+    // collaboration (see collab.rs and docs/collaboration.md). Host side: the people invited to this machine's
+    // projects, their per-project memberships (each with its own token), invites and each project's rules. Guest
+    // side: the host projects this machine has joined. The owner stays implicit (the local token and paired
+    // devices), so projects nobody joined work exactly as before. threads.user_id says whose agents run a thread:
+    // '' is the owner, as every existing thread.
+    r#"
+    CREATE TABLE collab_users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        instance_id TEXT NOT NULL DEFAULT '', -- the guest app's instance id: the same app joining again is the same person
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+    );
+    CREATE TABLE collab_members (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'collaborator', -- collaborator | operator | viewer
+        perms TEXT NOT NULL DEFAULT '{}',          -- this person's overrides of the project's rules
+        token_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen INTEGER,
+        last_ip TEXT NOT NULL DEFAULT '',
+        requested_role TEXT NOT NULL DEFAULT '',   -- a role they asked the owner for (operator), until answered
+        requested_at INTEGER,
+        revoked_at INTEGER
+    );
+    CREATE INDEX collab_members_token ON collab_members(token_hash);
+    CREATE INDEX collab_members_project ON collab_members(project_id);
+    CREATE TABLE collab_invites (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'collaborator',
+        perms TEXT NOT NULL DEFAULT '{}',
+        secret_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER,
+        used_by TEXT,
+        revoked_at INTEGER
+    );
+    CREATE TABLE collab_rules (
+        project_id TEXT PRIMARY KEY,
+        rules TEXT NOT NULL DEFAULT '{}',          -- {collaborator: {perm: bool}, viewer: {...}}
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE collab_links (
+        id TEXT PRIMARY KEY,
+        host_url TEXT NOT NULL,
+        host_id TEXT NOT NULL DEFAULT '',
+        host_name TEXT NOT NULL DEFAULT '',
+        project_id TEXT NOT NULL,
+        project_name TEXT NOT NULL DEFAULT '',
+        member_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT '',
+        perms TEXT NOT NULL DEFAULT '{}',
+        token TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ok',         -- ok | offline | revoked
+        error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        last_sync INTEGER
+    );
+    ALTER TABLE threads ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+    "#,
 ];
 
 #[derive(Clone)]
@@ -299,7 +366,7 @@ impl Db {
                     ValueRef::Text(t) => {
                         let s = String::from_utf8_lossy(t).into_owned();
                         // JSON columns come back parsed
-                        if (n == "meta" || n == "options" || n == "routing" || n == "context" || n == "buddy") && (s.starts_with('{') || s.starts_with('[')) {
+                        if matches!(n.as_str(), "meta" | "options" | "routing" | "context" | "buddy" | "perms" | "rules") && (s.starts_with('{') || s.starts_with('[')) {
                             serde_json::from_str(&s).unwrap_or(Value::String(s))
                         } else {
                             Value::String(s)

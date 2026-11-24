@@ -229,7 +229,7 @@ loops). The host upserts only the member's own threads (new ones need `create_th
 **Context, host → guest** (`collab_chat::before_turn`): before each turn in a joined project the guest's app fetches
 `GET host/context` (8 s timeout; the last snapshot is used when the host can't be reached): people and roles, up to
 60 open and 8 recently finished threads (title, owner, agent, status, a 140-character note), the memory index,
-20 recent artifacts and the files claimed. No message bodies. The lead's instructions get it as the "A collaborative
+20 recent artifacts. No message bodies (claims and presence come from 1d's filtered digest). The lead's instructions get it as the "A collaborative
 project you joined" section; each lead turn starts with a `<project-update>` listing only what changed since its
 last turn (threads that changed status, memory added or updated, artifacts, people who joined).
 
@@ -253,7 +253,9 @@ get two lines and the thread list. On the host, lead tools that act on a thread 
 | `GET/PATCH /api/collab/projects/{pid}/chats` | owner | each person's chat and who may read it; `{owner: bool}` |
 | `POST /api/collab/links/{id}/chat` | guest | make sure the joined project's local side exists; works offline once made |
 
-Hooks for later stages: `collab_chat::deliver_local(thread, author, text, meta)` posts a visible message into a
-guest's local thread (1d's approved notes); 1d can add claims to the sync body and presence lines to `digest()`.
+Hooks: approved notes reach a guest's local thread through 1d's `notes::deliver` (visible, never wakes a turn);
+claims and presence reach prompts through 1d's digest. Each local thread of a joined project is bound to 1b's tool
+bridge (`collab_chat::bind_bridge` → `collab_bridge::bind`, table `collab_agent_threads`) when the host makes the chat
+and whenever a sync is accepted.
 Not in 1c: thread transfer (Stage 2), presence and conflict notices (1d), the agent tool bridge (1b, so a guest's
 `read_memory` reads the host's project memory).

@@ -15,7 +15,7 @@
 //! `POST host/sync` after local changes (debounced, backed off while offline). The host inserts them as they are
 //! (by id, never twice) and never wakes an agent for them: another person's activity must not run the owner's plan.
 //! **Context, host → guest** (`before_turn`): before each turn of a guest's lead, a compact snapshot of the host
-//! project (`GET host/context`: people, threads and who owns them, memory index, artifacts, claims) is fetched and
+//! project (`GET host/context`: people, threads and who owns them, memory index, artifacts) is fetched and
 //! cached; the prompt gets the snapshot and a short "what changed since your last turn" digest, never whole histories.
 //!
 //! **Private by default.** A person's chat messages leave their machine only while someone else may read them: the
@@ -25,7 +25,6 @@
 use crate::{
     collab::{self, Member},
     core::{Core, CoreRef},
-    runner,
     server::{bad, ApiErr, Who, R},
     util,
 };
@@ -276,7 +275,7 @@ const CONTEXT_OPEN: usize = 60;
 const CONTEXT_DONE: usize = 8;
 
 /// The project as a member's lead needs it, compactly: people, threads (whose, doing what), the memory index,
-/// recent artifacts and the files claimed right now. Bodies never: those are read on demand.
+/// and recent artifacts (claims and presence come from 1d's filtered digest). Bodies never: those are read on demand.
 async fn h_context(State(core): State<CoreRef>, Extension(m): Extension<Member>) -> R {
     let now = util::now_ms();
     let people = collab::people(&core, &m.project_id);
@@ -316,17 +315,6 @@ async fn h_context(State(core): State<CoreRef>, Extension(m): Extension<Member>)
         })
         .collect();
     let artifacts = core.db.all("SELECT id, title, kind, updated_at FROM artifacts WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 20", &[&m.project_id])?;
-    let claims: Vec<Value> = core
-        .db
-        .all(
-            "SELECT c.path, c.thread_id, t.title, t.user_id, t.kind, t.project_id FROM claims c JOIN threads t ON t.id = c.thread_id
-             WHERE c.project_id = ?1 AND t.resolved = 0 AND t.deleted_at IS NULL AND t.status NOT IN ('done','cancelled','failed') ORDER BY c.created_at LIMIT 40",
-            &[&m.project_id],
-        )?
-        .into_iter()
-        .filter(|c| collab::can_see(&m, c))
-        .map(|c| json!({ "path": c["path"], "thread_id": c["thread_id"], "title": c["title"], "owner_name": name_of(c["user_id"].as_str().unwrap_or("")) }))
-        .collect();
     let readers = chat_readers(&core, &m.project_id, &m.user_id);
     Ok(Json(json!({
         "at": now,
@@ -339,7 +327,6 @@ async fn h_context(State(core): State<CoreRef>, Extension(m): Extension<Member>)
         "finished": done,
         "memory": memory,
         "artifacts": artifacts,
-        "claims": claims,
         "share_chat": !readers.is_empty(),
         "readers": readers,
     })))
@@ -488,6 +475,9 @@ pub async fn ensure_local(core: &CoreRef, link_id: &str) -> Result<Value> {
     core.db.set_setting(&state_key(link_id), &sync)?;
     core.bus.emit("project", Some(link_id), None, p);
     let t = core.thread(&chat)?;
+    if let Err(e) = bind_bridge(core, &chat, link_id) {
+        tracing::warn!("collab: couldn't bind {chat} to the tool bridge: {e}");
+    }
     core.bus.emit("thread", Some(link_id), Some(&chat), t.clone());
     mark_dirty(link_id);
     Ok(json!({ "thread": t, "project_id": link_id, "share_chat": r["share_chat"], "readers": r["readers"], "host": r["host"], "member": r["member"] }))
@@ -510,6 +500,16 @@ async fn open_chat(State(core): State<CoreRef>, Extension(_who): Extension<Who>,
     }
 }
 
+/// A local thread of a joined project is the host thread with the same id. Register that with 1b's agent tool bridge
+/// (`collab_bridge::bind`, table collab_agent_threads), so the thread's agents reach the host's tools with no extra
+/// step. Called for the person's chat once the host made it, and for every thread the host accepted on sync (so
+/// ownership is verified). MERGE NOTE: 1b's `collab_bridge` isn't on this branch; when both are merged this body is
+/// `crate::collab_bridge::bind(core, thread_id, link_id, Some(thread_id))`.
+fn bind_bridge(core: &Core, thread_id: &str, link_id: &str) -> Result<()> {
+    let _ = (core, thread_id, link_id);
+    Ok(())
+}
+
 /// Before a thread opens in a joined project: may this person open threads there?
 pub fn may_create(core: &CoreRef, project_id: &str) -> Result<()> {
     let Some(l) = link_of(core, project_id) else { return Ok(()) };
@@ -520,17 +520,6 @@ pub fn may_create(core: &CoreRef, project_id: &str) -> Result<()> {
         bail!("The project's owner hasn't allowed you to open threads in it (permission 'create_threads'). Ask them, or do this outside the project.");
     }
     Ok(())
-}
-
-/// Deliver a message into a local thread of a joined project as a visible message the thread's agent reads on its
-/// next turn (for 1d's approved notes and anything else the host sends this person). The one entry point for that.
-#[allow(dead_code)]
-pub fn deliver_local(core: &CoreRef, thread_id: &str, author: &str, text: &str, meta: Value) -> Result<Value> {
-    let t = core.thread(thread_id)?;
-    if link_of(core, t["project_id"].as_str().unwrap_or("")).is_none() {
-        bail!("That thread isn't in a joined project.");
-    }
-    runner::post(core, thread_id, "user", author, text, meta, true)
 }
 
 // ------------------------------------------------------------------------------------------------ push loop
@@ -605,8 +594,15 @@ pub async fn push(core: &CoreRef, link_id: &str) -> Result<bool> {
     }
     let more = messages.len() >= PUSH_MAX_MESSAGES;
     let r = host(core, &link, "POST", "sync", Some(&json!({ "threads": threads, "messages": messages })), Duration::from_secs(30)).await?;
-    for e in r["errors"].as_array().into_iter().flatten() {
+    let refused: HashSet<String> = r["errors"].as_array().into_iter().flatten().map(|e| {
         tracing::warn!("collab: host refused thread {}: {}", e["id"], e["error"]);
+        s(e, "id")
+    }).collect();
+    // the host took these as this person's: their agents may use the host's tools for them
+    for t in threads.iter().filter(|t| t["deleted"] != true && !refused.contains(&s(t, "id"))) {
+        if let Err(e) = bind_bridge(core, &s(t, "id"), link_id) {
+            tracing::warn!("collab: couldn't bind {} to the tool bridge: {e}", s(t, "id"));
+        }
     }
     st["pushed_at"] = json!(started - 1);
     st["upto"] = r["upto"].clone();
@@ -906,15 +902,13 @@ fn guest_section(core: &Core, t: &Value, link: &Value) -> String {
     let perms_text = if allowed.is_empty() { "read only".to_string() } else { allowed.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ") };
     let memory: Vec<String> = ctx["memory"].as_array().into_iter().flatten().take(80).map(|m| format!("`{}`{}", s(m, "name"), if m["global"] == true { " (owner's global)" } else { "" })).collect();
     let arts: Vec<String> = ctx["artifacts"].as_array().into_iter().flatten().take(12).map(|a| format!("\"{}\" ({})", s(a, "title"), s(a, "kind"))).collect();
-    let claims: Vec<String> = ctx["claims"].as_array().into_iter().flatten().map(|c| format!("- `{}`: \"{}\" ({})", s(c, "path"), s(c, "title"), s(c, "owner_name"))).collect();
     let readers: Vec<String> = sync["readers"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(|x| if x == "owner" { format!("{owner} (the owner)") } else { x.to_string() }).collect();
     let shared = if readers.is_empty() { ", and nobody else can read it".to_string() } else { format!("; the owner's rules let {} read it too", readers.join(" and ")) };
     let stale = if ctx.is_object() { String::new() } else { format!("\n\n(The project picture hasn't been fetched from {host_name} yet; it arrives with the next turn.)") };
     let lead = t["kind"] == "lead";
     if !lead {
         return format!(
-            "\n\n## A collaborative project\n\nThis project belongs to {owner} and is shared; you work for {me}, on {me}'s machine and accounts. Other people's threads are theirs: don't redo their work or edit files they claimed.\n\n{threads}{}\n",
-            if claims.is_empty() { String::new() } else { format!("\n\nFiles claimed in the shared project:\n\n{}", claims.join("\n")) }
+            "\n\n## A collaborative project\n\nThis project belongs to {owner} and is shared; you work for {me}, on {me}'s machine and accounts. Other people's threads are theirs: don't redo their work or edit files they claimed.\n\n{threads}\n"
         );
     }
     let text = prompt_part("guest")
@@ -928,7 +922,6 @@ fn guest_section(core: &Core, t: &Value, link: &Value) -> String {
         .replace("{{SHARED}}", &shared)
         .replace("{{MEMORY}}", &if memory.is_empty() { "empty.".to_string() } else { memory.join(", ") })
         .replace("{{ARTIFACTS}}", &if arts.is_empty() { String::new() } else { format!("**Recent artifacts:** {}.\n\n", arts.join(", ")) })
-        .replace("{{CLAIMS}}", &if claims.is_empty() { String::new() } else { format!("**Files claimed in the shared project right now** (don't let your threads edit them):\n\n{}\n\n", claims.join("\n")) })
         .replace("{{AT}}", &when(ctx["at"].as_i64().unwrap_or(0)));
     format!("\n\n{text}{stale}\n")
 }

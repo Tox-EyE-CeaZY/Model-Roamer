@@ -54,5 +54,5 @@ waiting for it, or talking to its owner. You can't message, steer or merge other
 
 **Project memory index (on the host):** {{MEMORY}}
 
-{{ARTIFACTS}}{{CLAIMS}}The project picture above is from {{AT}}; each turn starts with a `<project-update>` listing what
+{{ARTIFACTS}}The project picture above is from {{AT}}; each turn starts with a `<project-update>` listing what
 changed since your last turn, when anything did.

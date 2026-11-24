@@ -10,16 +10,18 @@ import { openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { runStep } from '../term.js';
 import { ic, stamp, field, input, textarea, select, seg, toggle, modelOptions, agentOptions, agentModelPicker, effortOptions, routeEffort, loading, errorBox, empty, kicker, timeAgo } from '../common.js';
+import { scrollStrip } from '../scrollstrip.js';
 
 const TABS = [['agents', 'Agents', 'agents'], ['tools', 'Tools', 'terminal'], ['routing', 'Routing', 'route']];
 
 export default async function agents(el, r) {
   const tab = r.q.tab || 'agents';
   const body = h('div');
+  const strip = scrollStrip(h('nav', { class: 'p-tabs' }, TABS.map(([k, label, ico]) => h('a', { class: 'p-tab' + (k === tab ? ' on' : ''), href: '#/agents?tab=' + k }, ic(ico, 14), label))));
   el.append(
     h('div', { class: 'page-h' }, h('div', {}, h('h1', {}, 'Agents'), h('p', { class: 'lede' }, 'The harnesses Model Roamer drives. Install, sign in and test each one here; no terminal needed.')),
       h('button', { class: 'btn', onclick: () => refresh(true) }, ic('refresh', 14), 'Check again')),
-    h('nav', { class: 'p-tabs' }, TABS.map(([k, label, ico]) => h('a', { class: 'p-tab' + (k === tab ? ' on' : ''), href: '#/agents?tab=' + k }, ic(ico, 14), label))),
+    strip.el,
     body);
   let un = () => {};
   async function refresh(force) {
@@ -35,7 +37,7 @@ export default async function agents(el, r) {
   if (tab === 'agents') un = await agentCards(body, r.q.open);
   else if (tab === 'tools') un = await tools(body);
   else un = await routing(body);
-  return un;
+  return () => (strip.destroy(), un?.());
 }
 
 // ------------------------------------------------------------ agent cards

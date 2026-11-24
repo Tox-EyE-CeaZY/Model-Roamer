@@ -54,6 +54,9 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/projects/{id}/prs", get(project_prs))
         .route("/api/projects/{id}/prs/{number}/merge", post(project_pr_merge))
         .route("/api/projects/{id}/workers", post(new_worker))
+        .route("/api/projects/{id}/repos", get(crate::repos::list_api).post(crate::repos::add_api))
+        .route("/api/projects/{id}/repos/{rid}", axum::routing::patch(crate::repos::patch_api).delete(crate::repos::delete_api))
+        .route("/api/projects/{id}/repos/{rid}/restore", post(crate::repos::restore_api))
         // threads
         .route("/api/threads", get(list_threads).post(create_chat))
         .route("/api/threads/{id}", get(get_thread).patch(patch_thread).delete(delete_thread))
@@ -95,8 +98,13 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/github/repos", get(github_repos))
         .route("/api/fs", get(fs_list))
         .route("/api/fs/mkdir", post(fs_mkdir))
+        .route("/api/fs/check", get(crate::repos::check_api))
         .route("/api/fs/reveal", post(fs_reveal))
         .route("/api/upload", post(upload))
+        // voice (free local offline fallback)
+        .route("/api/voice/status", get(crate::voice::api_status))
+        .route("/api/voice/setup", post(crate::voice::api_setup))
+        .route("/api/voice/transcribe", post(crate::voice::api_transcribe))
         // remote access
         .route("/api/network", get(network))
         .route("/api/network/tailscale-serve", post(tailscale_serve))
@@ -284,13 +292,12 @@ async fn state(State(core): State<CoreRef>, Extension(who): Extension<Who>) -> R
 /// terminals, agent checks, questions waiting on the person, recent failures and agents that need attention.
 async fn activity(State(core): State<CoreRef>) -> R {
     let running: std::collections::HashMap<String, i64> = core.running.lock().map(|r| r.iter().map(|(k, v)| (k.clone(), v.started)).collect()).unwrap_or_default();
-    let recent = util::now_ms() - 30 * 60 * 1000;
     let mut threads = core.db.all(
-        "SELECT t.id, t.kind, t.title, t.agent, t.model, t.status, t.status_note, t.project_id, p.name AS project, t.updated_at
+        "SELECT t.id, t.kind, t.title, t.agent, t.model, t.status, t.status_note, t.project_id, p.name AS project, t.updated_at, t.unread
          FROM threads t LEFT JOIN projects p ON p.id = t.project_id
-         WHERE t.deleted_at IS NULL AND t.resolved = 0 AND (t.status IN ('working','queued','blocked','limited') OR (t.status = 'failed' AND t.updated_at > ?1))
+         WHERE t.deleted_at IS NULL AND t.resolved = 0 AND (t.status IN ('working','queued','blocked','limited','failed') OR (t.kind = 'lead' AND t.unread = 1))
          ORDER BY t.updated_at DESC LIMIT 40",
-        &[&recent],
+        &[],
     )?;
     for t in threads.iter_mut() {
         if let Some(st) = t["id"].as_str().and_then(|id| running.get(id)) {
@@ -379,12 +386,21 @@ async fn create_project(State(core): State<CoreRef>, Json(b): Json<Value>) -> R 
         repo = git::remote_url(&PathBuf::from(&folder)).await;
     }
     let hue = b["color"].as_i64().unwrap_or_else(|| [128, 38, 175, 262, 318, 205, 85][(now as usize / 7) % 7]);
+    // more repositories beside the primary, checked before anything is made so a bad one makes nothing
+    let mut more: Vec<Value> = vec![json!({ "name": "the first one", "folder": folder, "url": repo })];
+    for r in b["repos"].as_array().cloned().unwrap_or_default() {
+        let c = crate::repos::check_new(&core, &r, &more).await.map_err(|e| bad(format!("{e:#}")))?;
+        more.push(c);
+    }
     core.db.exec(
         "INSERT INTO projects(id, name, instructions, lead_agent, lead_model, folder, repo_url, base_branch, color, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
         &[&id, &name, &s(&b, "instructions"), &lead, &lead_model, &folder, &repo, &base, &hue, &now],
     )?;
     let p = core.project(&id)?;
     core.lead_thread(&id)?;
+    for r in more.iter().skip(1) {
+        crate::repos::insert(&core, &id, r)?;
+    }
     core.bus.emit("project", Some(&id), None, p.clone());
     // a repository without a folder gets cloned now, in the background
     if folder.is_empty() && !repo.is_empty() {
@@ -403,6 +419,7 @@ async fn get_project(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let mut p = core.project(&id)?;
     p["lead"] = core.lead_thread(&id)?;
     p["home"] = json!(core.project_home(&p).display().to_string());
+    p["repos"] = json!(crate::repos::list(&core, &p)?);
     p["decisions"] = json!(core.db.all("SELECT * FROM decisions WHERE project_id = ?1 AND answer IS NULL ORDER BY created_at", &[&id])?);
     p["claims"] = json!(core.db.all("SELECT c.*, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1", &[&id])?);
     Ok(Json(p))
@@ -479,8 +496,8 @@ async fn project_threads(State(core): State<CoreRef>, Path(id): Path<String>) ->
     Ok(Json(json!(rows)))
 }
 
-async fn project_git(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
-    let p = core.project(&id)?;
+async fn project_git(State(core): State<CoreRef>, Path(id): Path<String>, q: Q) -> R {
+    let p = crate::repos::view(&core, &core.project(&id)?, q.get("repo").map(String::as_str).unwrap_or(""))?;
     let home = core.project_home(&p);
     if !git::is_repo(&home).await {
         return Ok(Json(json!({ "repo": false, "folder": home.display().to_string(), "git": git::git().is_some() })));
@@ -496,8 +513,8 @@ async fn project_git(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
 }
 
 /// The GitHub owner and repository a project pushes to: its repo URL, else its folder's remote.
-async fn project_github(core: &CoreRef, id: &str) -> Result<Option<(String, String)>, ApiErr> {
-    let p = core.project(id)?;
+async fn project_github(core: &CoreRef, id: &str, repo: &str) -> Result<Option<(String, String)>, ApiErr> {
+    let p = crate::repos::view(core, &core.project(id)?, repo)?;
     let mut url = s(&p, "repo_url");
     if url.is_empty() {
         url = git::remote_url(&core.project_home(&p)).await;
@@ -505,8 +522,8 @@ async fn project_github(core: &CoreRef, id: &str) -> Result<Option<(String, Stri
     Ok(git::github_repo(&url))
 }
 
-async fn project_prs(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
-    let Some((o, r)) = project_github(&core, &id).await? else { return Ok(Json(json!({ "github": false }))) };
+async fn project_prs(State(core): State<CoreRef>, Path(id): Path<String>, q: Q) -> R {
+    let Some((o, r)) = project_github(&core, &id, q.get("repo").map(String::as_str).unwrap_or("")).await? else { return Ok(Json(json!({ "github": false }))) };
     match github::list_prs(&core, &o, &r, "all").await {
         Ok(list) => Ok(Json(json!({ "github": true, "repo": format!("{o}/{r}"), "prs": list }))),
         Err(e) => Ok(Json(json!({ "github": true, "repo": format!("{o}/{r}"), "error": e.to_string() }))),
@@ -514,7 +531,7 @@ async fn project_prs(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
 }
 
 async fn project_pr_merge(State(core): State<CoreRef>, Path((id, number)): Path<(String, i64)>, Json(b): Json<Value>) -> R {
-    let Some((o, r)) = project_github(&core, &id).await? else { return Err(bad("This project's remote isn't on GitHub.")) };
+    let Some((o, r)) = project_github(&core, &id, &s(&b, "repo")).await? else { return Err(bad("This repository's remote isn't on GitHub.")) };
     let method = match s(&b, "method").as_str() {
         m @ ("merge" | "squash" | "rebase") => m.to_string(),
         _ => "merge".to_string(),
@@ -535,8 +552,10 @@ async fn new_worker(State(core): State<CoreRef>, Path(id): Path<String>, Json(b)
             agent: s(&b, "agent"),
             task_kind: s(&b, "task_kind"),
             model: s(&b, "model"),
+            allow_limited: true,
             effort: s(&b, "effort"),
             workspace: s(&b, "workspace"),
+            repo: s(&b, "repo"),
             depends_on: vec![],
             parent: lead["id"].as_str().map(str::to_string),
             kind: "worker".into(),
@@ -580,6 +599,7 @@ async fn get_thread(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let mut t = core.thread(&id)?;
     if let Some(p) = t["project_id"].as_str() {
         t["project"] = core.project(p).unwrap_or(Value::Null);
+        t["repo"] = crate::repos::for_thread(&core, &t).map(|v| json!({ "id": v["repo_id"], "name": v["repo_name"] })).unwrap_or(Value::Null);
     }
     t["running"] = json!(core.running.lock().map(|r| r.get(&id).map(|x| json!({ "turn": x.turn_id, "started": x.started }))).ok().flatten());
     t["workspace_path"] = json!(runner::workspace_of(&core, &t).map(|p| p.display().to_string()));
@@ -929,7 +949,12 @@ async fn list_artifacts(State(core): State<CoreRef>, q: Q) -> R {
 
 async fn get_artifact(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let a = core.db.one("SELECT a.*, t.title AS thread_title, t.agent FROM artifacts a LEFT JOIN threads t ON t.id = a.thread_id WHERE a.id = ?1", &[&id])?.ok_or_else(|| ApiErr(StatusCode::NOT_FOUND, "No such artifact".into()))?;
-    Ok(Json(with_urls(&core, a)))
+    let mut a = with_urls(&core, a);
+    // where a comment on it can go: its project's lead (the thread that made it is thread_id)
+    if let Some(l) = a["project_id"].as_str().and_then(|p| core.lead_thread(p).ok()) {
+        a["lead_id"] = l["id"].clone();
+    }
+    Ok(Json(a))
 }
 
 async fn create_artifact(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
@@ -1070,6 +1095,13 @@ async fn artifact_file(State(core): State<CoreRef>, Path(p): Path<HashMap<String
     let Some(path) = artifacts::file(&core, &id, &rest) else { return StatusCode::NOT_FOUND.into_response() };
     let Ok(bytes) = tokio::fs::read(&path).await else { return StatusCode::NOT_FOUND.into_response() };
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let bytes = if mime.essence_str() == "text/html" && q.get("download").is_none() {
+        let mut b = bytes;
+        b.extend_from_slice(artifacts::COMMENT_SNIPPET.as_bytes());
+        b
+    } else {
+        bytes
+    };
     let mut r = Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, "no-cache");
     if q.get("download").is_some() {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "artifact".into());
@@ -1349,7 +1381,7 @@ async fn usage(State(core): State<CoreRef>, q: Q) -> R {
                 MAX(started_at) AS last FROM turns WHERE started_at >= ?1 GROUP BY agent",
         &[&since],
     )?;
-    let limits = core.db.all("SELECT * FROM limits ORDER BY hit_at DESC", &[])?;
+    let limits = core.db.all("SELECT * FROM limits WHERE instr(agent, ':') = 0 ORDER BY hit_at DESC", &[])?;
     let recent = core.db.all(
         "SELECT tu.id, tu.agent, tu.model, tu.status, tu.error, tu.input_tokens, tu.output_tokens, tu.cost_usd, tu.started_at, tu.ended_at, t.title, t.id AS thread_id, t.project_id
          FROM turns tu LEFT JOIN threads t ON t.id = tu.thread_id ORDER BY tu.started_at DESC LIMIT 40",
@@ -1376,7 +1408,10 @@ async fn github_repos(State(core): State<CoreRef>) -> R {
 // ------------------------------------------------------------------------------------------------ files
 
 async fn fs_list(State(_core): State<CoreRef>, q: Q) -> R {
-    let path = q.get("path").filter(|p| !p.trim().is_empty()).map(PathBuf::from);
+    let path = q.get("path").filter(|p| !p.trim().is_empty()).map(|p| PathBuf::from(p.trim()));
+    if path.as_ref().is_some_and(|p| !p.is_absolute()) {
+        return Err(bad("Give the full path to a folder (starting with / or a drive letter)."));
+    }
     let Some(dir) = path else {
         // the starting points
         let home = crate::os::home();

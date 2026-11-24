@@ -1,20 +1,26 @@
 package app.modelroamer
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -46,6 +52,9 @@ class MainActivity : Activity() {
     private var web: WebView? = null
     private var server: String = ""
     private var picker: ValueCallback<Array<Uri>>? = null
+    private var pendingPermReq: PermissionRequest? = null
+    private var pendingVoiceLang: String? = null
+    private var speech: SpeechRecognizer? = null
 
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
@@ -102,6 +111,29 @@ class MainActivity : Activity() {
                     false
                 }
             }
+
+            override fun onPermissionRequest(request: PermissionRequest) {
+                runOnUiThread {
+                    val wantsAudio = request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+                    if (!wantsAudio) {
+                        request.deny()
+                        return@runOnUiThread
+                    }
+                    if (hasAudioPermission()) {
+                        request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+                    } else {
+                        pendingPermReq?.deny()
+                        pendingPermReq = request
+                        requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), PERM_AUDIO)
+                    }
+                }
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                runOnUiThread {
+                    if (pendingPermReq == request) pendingPermReq = null
+                }
+            }
         }
         setContentView(w)
         w.loadUrl(server)
@@ -118,11 +150,129 @@ class MainActivity : Activity() {
         } catch (e: Exception) { /* nothing can open it */ }
     }
 
+    private fun hasAudioPermission(): Boolean =
+        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun emitVoice(ev: JSONObject) {
+        val payload = JSONObject.quote(ev.toString())
+        runOnUiThread {
+            web?.evaluateJavascript("window.__roamerVoiceEvent && window.__roamerVoiceEvent($payload)", null)
+        }
+    }
+
+    private fun beginNativeVoice(lang: String) {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            emitVoice(JSONObject().put("type", "error").put("code", "unsupported").put("message", "No speech recognition service is available on this device."))
+            return
+        }
+        cancelNativeVoice()
+        val sr = SpeechRecognizer.createSpeechRecognizer(this)
+        speech = sr
+        sr.setRecognitionListener(object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) {
+                emitVoice(JSONObject().put("type", "ready"))
+            }
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onError(err: Int) {
+                val code = when (err) {
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "not-allowed"
+                    SpeechRecognizer.ERROR_AUDIO -> "audio-capture"
+                    SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network"
+                    SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no-speech"
+                    SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED, SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "language-not-supported"
+                    else -> "unknown"
+                }
+                speech?.destroy()
+                speech = null
+                emitVoice(JSONObject().put("type", "error").put("code", code))
+            }
+            override fun onResults(results: Bundle?) {
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
+                speech?.destroy()
+                speech = null
+                emitVoice(JSONObject().put("type", "final").put("text", text))
+            }
+            override fun onPartialResults(partialResults: Bundle?) {
+                val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: ""
+                if (text.isNotEmpty()) emitVoice(JSONObject().put("type", "partial").put("text", text))
+            }
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            if (lang.isNotBlank()) putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+        }
+        try {
+            sr.startListening(intent)
+        } catch (e: Exception) {
+            cancelNativeVoice()
+            emitVoice(JSONObject().put("type", "error").put("code", "unknown").put("message", e.message ?: "Failed to start speech recognizer"))
+        }
+    }
+
+    private fun stopNativeVoice() {
+        val sr = speech
+        if (sr == null) {
+            pendingVoiceLang = null
+            emitVoice(JSONObject().put("type", "end"))
+            return
+        }
+        try {
+            sr.stopListening()
+        } catch (e: Exception) {
+            cancelNativeVoice()
+            emitVoice(JSONObject().put("type", "end"))
+        }
+    }
+
+    private fun cancelNativeVoice() {
+        pendingVoiceLang = null
+        try {
+            speech?.cancel()
+            speech?.destroy()
+        } catch (e: Exception) { /* ignore */ }
+        speech = null
+    }
+
     /** What the web interface can ask the app to do. */
     inner class Bridge {
         @JavascriptInterface fun changeServer() = runOnUiThread { showSetup() }
         @JavascriptInterface fun openExternal(url: String) = runOnUiThread { openOutside(url) }
         @JavascriptInterface fun server(): String = server
+        @JavascriptInterface fun hasVoice(): Boolean = SpeechRecognizer.isRecognitionAvailable(this@MainActivity)
+        @JavascriptInterface fun startVoice(lang: String) = runOnUiThread {
+            if (hasAudioPermission()) {
+                beginNativeVoice(lang)
+            } else {
+                pendingVoiceLang = lang
+                requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), PERM_AUDIO)
+            }
+        }
+        @JavascriptInterface fun stopVoice() = runOnUiThread { stopNativeVoice() }
+        @JavascriptInterface fun cancelVoice() = runOnUiThread { cancelNativeVoice() }
+    }
+
+    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grantResults: IntArray) {
+        if (code == PERM_AUDIO) {
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            val req = pendingPermReq
+            pendingPermReq = null
+            if (req != null) {
+                if (granted) req.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) else req.deny()
+            }
+            val lang = pendingVoiceLang
+            pendingVoiceLang = null
+            if (lang != null) {
+                if (granted) beginNativeVoice(lang)
+                else emitVoice(JSONObject().put("type", "error").put("code", "not-allowed"))
+            }
+        } else {
+            super.onRequestPermissionsResult(code, permissions, grantResults)
+        }
     }
 
     @Deprecated("Deprecated in Java")
@@ -144,6 +294,13 @@ class MainActivity : Activity() {
         CookieManager.getInstance().flush()
     }
 
+    override fun onDestroy() {
+        cancelNativeVoice()
+        pendingPermReq?.deny()
+        pendingPermReq = null
+        super.onDestroy()
+    }
+
     // ---------------------------------------------------------------- not connected
 
     private fun showError(why: String) {
@@ -156,6 +313,9 @@ class MainActivity : Activity() {
     }
 
     private fun showSetup() {
+        cancelNativeVoice()
+        pendingPermReq?.deny()
+        pendingPermReq = null
         web?.destroy()
         web = null
         val box = column()
@@ -269,5 +429,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val PICK = 7001
+        private const val PERM_AUDIO = 7002
     }
 }

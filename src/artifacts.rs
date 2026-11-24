@@ -303,3 +303,32 @@ pub fn file(core: &Core, id: &str, rel: &str) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
     (canon.starts_with(&root) && canon.is_file()).then_some(canon)
 }
+
+/// Added to the end of every HTML artifact when it is served. The page runs sandboxed, so the app can't see what the
+/// person selects in it; this tells the app (via postMessage to the window that framed it) so the person can comment on
+/// that part. Alt+click does the same for a single element. It sends nothing anywhere else.
+pub const COMMENT_SNIPPET: &str = r#"<script data-roamer-comment>(function(){
+var mode='text',last=null;
+function d(e){var o=[];for(var i=0;e&&e.nodeType===1&&i<4&&e!==document.body;i++,e=e.parentElement){var s=e.tagName.toLowerCase();if(e.id)s+='#'+e.id;else if(e.className&&typeof e.className==='string')s+='.'+e.className.trim().split(/\s+/).slice(0,2).join('.');o.unshift(s)}return o.join(' > ')}
+function send(){if(mode!=='text')return;var s=getSelection(),t=s&&s.toString().trim();if(!t){parent.postMessage({mr:'sel',text:''},'*');return}
+var r=s.getRangeAt(0).getBoundingClientRect(),n=s.anchorNode,e=n&&(n.nodeType===1?n:n.parentElement);
+parent.postMessage({mr:'sel',text:t.slice(0,1500),x:r.left,y:r.bottom,el:d(e)},'*')}
+function mark(e){if(last){last.style.outline=last.__o||'';last=null}if(e&&e!==document.body&&e!==document.documentElement){last=e;e.__o=e.style.outline;e.style.outline='2px solid #8f0'}}
+function pin(e){var t=e.target,de=document.documentElement,w=Math.max(de.scrollWidth,1),h=Math.max(de.scrollHeight,1);
+parent.postMessage({mr:'pin',mode:mode,el:d(t),text:(t.innerText||t.alt||'').trim().slice(0,300),x:e.clientX,y:e.clientY,px:Math.round(e.pageX/w*100),py:Math.round(e.pageY/h*100)},'*')}
+var lz=null,box=null;
+function lasso(a,b){var x1=Math.min(a.clientX,b.clientX),x2=Math.max(a.clientX,b.clientX),y1=Math.min(a.clientY,b.clientY),y2=Math.max(a.clientY,b.clientY),out=[],all=document.body.querySelectorAll('*');
+for(var i=0;i<all.length&&out.length<25;i++){var e=all[i];if(e.tagName==='SCRIPT'||e.tagName==='STYLE'||e.children.length&&!/^(P|LI|H[1-6]|BUTTON|A|LABEL|TD|TH|SPAN)$/.test(e.tagName))continue;
+var r=e.getBoundingClientRect();if(r.width<2||r.height<2||r.right<x1||r.left>x2||r.bottom<y1||r.top>y2)continue;out.push({el:d(e),text:(e.innerText||e.alt||'').trim().slice(0,80)})}
+var de=document.documentElement,w=Math.max(de.scrollWidth,1),h=Math.max(de.scrollHeight,1),sx=pageXOffset,sy=pageYOffset;
+parent.postMessage({mr:'lasso',els:out,x:x2,y:y2,px1:Math.round((x1+sx)/w*100),py1:Math.round((y1+sy)/h*100),px2:Math.round((x2+sx)/w*100),py2:Math.round((y2+sy)/h*100)},'*')}
+document.addEventListener('mousedown',function(e){if(mode!=='lasso')return;e.preventDefault();lz=e;box=document.createElement('div');box.style.cssText='position:fixed;z-index:2147483647;border:2px dashed #8f0;background:rgba(136,255,0,.12);pointer-events:none;left:'+e.clientX+'px;top:'+e.clientY+'px;width:0;height:0';document.body.appendChild(box)},true);
+document.addEventListener('mousemove',function(e){if(!lz)return;box.style.left=Math.min(lz.clientX,e.clientX)+'px';box.style.top=Math.min(lz.clientY,e.clientY)+'px';box.style.width=Math.abs(e.clientX-lz.clientX)+'px';box.style.height=Math.abs(e.clientY-lz.clientY)+'px'},true);
+document.addEventListener('mouseup',function(e){if(!lz)return;var a=lz;lz=null;box.remove();box=null;if(Math.abs(e.clientX-a.clientX)>4||Math.abs(e.clientY-a.clientY)>4)lasso(a,e)},true);
+addEventListener('message',function(e){if(e.source!==parent||!e.data||!e.data.mr)return;if(e.data.mr==='mode'){mode=e.data.mode;mark(null);document.documentElement.style.cursor=mode==='text'?'':'crosshair'}});
+document.addEventListener('mouseover',function(e){if(mode==='element')mark(e.target)});
+document.addEventListener('mouseup',function(){setTimeout(send,0)});
+document.addEventListener('keyup',function(e){if(e.key==='Shift'||e.key.indexOf('Arrow')===0)setTimeout(send,0)});
+document.addEventListener('click',function(e){if(mode==='lasso'){e.preventDefault();e.stopPropagation();return}if(mode==='text'&&!e.altKey)return;e.preventDefault();e.stopPropagation();pin(e)},true);
+parent.postMessage({mr:'ready'},'*');
+})();</script>"#;

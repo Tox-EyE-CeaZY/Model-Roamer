@@ -38,9 +38,10 @@ const DEFS: &[Def] = &[
         "effort": {"type": "string", "description": "Optional thinking strength for this thread (low | medium | high | xhigh | max, as the model allows). Use lower for simple edits and higher for hard design or debugging; leave empty for the agent's default."},
         "workspace": {"type": "string", "enum": ["worktree", "shared", "scratch"], "description": "worktree (default when the project has a git repo): its own branch and folder; shared: the project folder itself (read-only work, research); scratch: an empty folder"},
         "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Thread ids that must finish (review/done) first"},
+        "repo": {"type": "string", "description": "Which of the project's repositories it works on (an id from your instructions, or its name). Default: the primary."},
         "allow_limited": {"type": "boolean", "description": "Open the thread even though that agent is out of usage right now (it waits for the reset). Default false: you're told who has room instead."}
     }), &["title", "instructions"]) },
-    Def { name: "agent_status", roles: LEAD, desc: "Each agent's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
+    Def { name: "agent_status", roles: LEAD, desc: "Each agent and model tier's state right now: ready, out of usage (and when it resets), signed out, how much of its 5-hour and weekly allowance is used, and how many threads it is running. Check it before routing work, and when you get an agent-limit wake.", schema: || obj(json!({}), &[]) },
     Def { name: "send_message", roles: LEAD, desc: "Send a message to a thread (answers, review notes, new instructions). If the thread is mid-turn it is interrupted so it reads the message at once, then carries on with its session (pass interrupt=false to let it finish its turn first).", schema: || obj(json!({
         "thread_id": {"type": "string"}, "text": {"type": "string"}, "interrupt": {"type": "boolean", "description": "Default true. false queues the message until the thread's current turn ends."}
     }), &["thread_id", "text"]) },
@@ -51,8 +52,9 @@ const DEFS: &[Def] = &[
         "thread_id": {"type": "string"}, "limit": {"type": "integer", "description": "Messages to return (default 12)"}
     }), &["thread_id"]) },
     Def { name: "check_status", roles: LEAD, desc: "Overview: every open thread's state, what each agent is doing, which agents are signed in or out of usage, and pending decisions.", schema: || obj(json!({}), &[]) },
-    Def { name: "route_task", roles: LEAD, desc: "Which agent should take a kind of task right now, by the person's routing rules and each agent's headroom.", schema: || obj(json!({
-        "task_kind": {"type": "string"}
+    Def { name: "route_task", roles: LEAD, desc: "Which agent and model should take a task, based on routing rules and available usage.", schema: || obj(json!({
+        "task_kind": {"type": "string"},
+        "model": {"type": "string", "description": "Optional model to check for this task"}
     }), &["task_kind"]) },
     Def { name: "reassign_thread", roles: LEAD, desc: "Move a thread to a different agent (e.g. when one hits its usage limit). The new agent gets the thread's history.", schema: || obj(json!({
         "thread_id": {"type": "string"}, "agent": {"type": "string"}, "model": {"type": "string"}, "note": {"type": "string", "description": "Optional message for the new agent"}
@@ -195,10 +197,6 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
-            let want = a("agent").to_lowercase();
-            if !want.is_empty() && want != "auto" && core.is_limited(&want) && args["allow_limited"] != true {
-                bail!("{want} is out of usage right now, so nothing was opened. Pick another agent or use agent \"auto\", or pass allow_limited to queue it for the reset.\n\n{}", runner::fleet_now(core));
-            }
             let deps: Vec<String> = args["depends_on"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
             let t = runner::create_worker(
                 core,
@@ -210,8 +208,10 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
                     agent: a("agent"),
                     task_kind: a("task_kind"),
                     model: a("model"),
+                    allow_limited: args["allow_limited"] == true,
                     effort: a("effort"),
                     workspace: a("workspace"),
+                    repo: a("repo"),
                     depends_on: deps,
                     parent: Some(tid.clone()),
                     kind: "worker".into(),
@@ -219,10 +219,11 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             )
             .await?;
             Ok(format!(
-                "Opened thread {} \"{}\" with {}{}. You'll get a wake when it replies.",
+                "Opened thread {} \"{}\" with {} ({}){}. You'll get a wake when it replies.",
                 t["id"].as_str().unwrap_or(""),
                 t["title"].as_str().unwrap_or(""),
                 t["agent"].as_str().unwrap_or(""),
+                runner::model_label(t["model"].as_str().unwrap_or("")),
                 if t["status"] == "waiting" { " (waiting for its dependencies)" } else { "" }
             ))
         }
@@ -240,7 +241,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "list_threads" => {
             let p = need_project()?;
             let filter = a("status");
-            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, resolved, parked_at, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, repo_id, resolved, parked_at, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
             let rows: Vec<Value> = rows
                 .into_iter()
                 .filter(|r| match filter.as_str() {
@@ -273,7 +274,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             let p = need_project()?;
             Ok(runner::overview(core, &p))
         }
-        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind")).map(|(agent, why)| format!("{agent}: {why}\n\n{}", runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
+        "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind"), &a("model")).map(|(agent, model, why)| format!("{agent} ({}): {why}\n\n{}", runner::model_label(&model), runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
         "reassign_thread" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
@@ -547,16 +548,16 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             Ok(format!("Pull request #{}: {}", r["number"], r["url"].as_str().unwrap_or("")))
         }
         "list_pull_requests" => {
-            let (o, r) = repo_of(core, project.as_deref()).await?;
+            let (o, r) = repo_of(core, &caller).await?;
             let st = if a("state").is_empty() { "open".to_string() } else { a("state") };
             Ok(github::list_prs(core, &o, &r, &st).await?.to_string())
         }
         "pull_request_checks" => {
-            let (o, r) = repo_of(core, project.as_deref()).await?;
+            let (o, r) = repo_of(core, &caller).await?;
             Ok(github::checks(core, &o, &r, args["number"].as_i64().unwrap_or(0)).await?.to_string())
         }
         "comment_on_pull_request" => {
-            let (o, r) = repo_of(core, project.as_deref()).await?;
+            let (o, r) = repo_of(core, &caller).await?;
             let body = format!("{}\n\n— {} via Model Roamer", a("body"), caller["agent"].as_str().unwrap_or("agent"));
             github::comment(core, &o, &r, args["number"].as_i64().unwrap_or(0), &body).await?;
             Ok("Commented.".into())
@@ -573,7 +574,8 @@ fn thread_line(t: &Value) -> String {
         t["agent"].as_str().unwrap_or(""),
         t["status"].as_str().unwrap_or(""),
         t["status_note"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" ({s})")).unwrap_or_default(),
-        t["branch"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" · branch {s}")).unwrap_or_default(),
+        t["branch"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" · branch {s}")).unwrap_or_default()
+            + &t["repo_id"].as_str().filter(|s| !s.is_empty()).map(|s| format!(" · repo {s}")).unwrap_or_default(),
         if t["merged"] == 1 { " · merged" } else if t["resolved"] == 1 { " · resolved" } else if t["parked_at"].as_i64().is_some() { " · parked (kept idle)" } else { "" },
         match (t["context"]["used"].as_i64(), t["context"]["window"].as_i64()) {
             (Some(u), Some(w)) if w > 0 => format!(" · context {}%{}", u * 100 / w, if u * 100 / w >= 80 { " (near compacting)" } else { "" }),
@@ -589,8 +591,10 @@ fn overlaps(a: &str, b: &str) -> bool {
     a.is_empty() || b.is_empty() || a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
 
-async fn repo_of(core: &CoreRef, project: Option<&str>) -> Result<(String, String)> {
-    let p = core.project(project.ok_or_else(|| anyhow!("This thread isn't part of a project."))?)?;
+/// The GitHub repository a thread works on (one of its project's).
+async fn repo_of(core: &CoreRef, caller: &Value) -> Result<(String, String)> {
+    caller["project_id"].as_str().ok_or_else(|| anyhow!("This thread isn't part of a project."))?;
+    let p = crate::repos::for_thread(core, caller)?;
     let mut url = p["repo_url"].as_str().unwrap_or("").to_string();
     if url.is_empty() {
         url = git::remote_url(&PathBuf::from(core.project_home(&p))).await;

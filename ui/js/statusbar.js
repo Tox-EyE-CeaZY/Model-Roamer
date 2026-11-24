@@ -5,6 +5,7 @@ import { get, listen, onSocket } from './api.js';
 import { S, watch, agentName } from './store.js';
 import { h, debounce, dur, plural } from './util.js';
 import { ic } from './common.js';
+import { attention, needsYou, setActivity, watchAttention } from './attention.js';
 
 const CYCLE_MS = 4500;
 
@@ -24,8 +25,13 @@ function collect() {
   for (const d of data.decisions) {
     out.push({ key: 'd' + d.id, tone: 'hot', icon: 'question', label: 'Needs you', text: d.question, sub: d.title, go: threadGo({ id: d.thread_id, kind: d.kind, project_id: d.project_id }) });
   }
-  for (const t of data.threads.filter((t) => t.status === 'blocked')) {
+  // threads that need the person: the same rule (and the same "seen" marks) as Home and the board
+  const need = attention(data.threads).need;
+  for (const t of need.filter((t) => t.status === 'blocked')) {
     out.push({ key: 'b' + t.id, tone: 'hot', icon: 'flag', label: 'Needs you', text: where(t) + t.title, sub: t.status_note, go: threadGo(t) });
+  }
+  for (const t of need.filter((t) => needsYou(t) === 'unread')) {
+    out.push({ key: 'r' + t.id, tone: 'hot', icon: 'chat', label: 'New reply', text: (t.project || 'The lead') + ': the lead replied', go: threadGo(t) });
   }
   for (const a of data.agents.filter((a) => a.state === 'signin')) {
     out.push({ key: 'a' + a.id, tone: 'hot', icon: 'login', label: 'Sign in', text: `${a.name || a.id} isn't signed in`, go: () => import('./app.js').then((m) => m.go('#/agents')) });
@@ -42,13 +48,13 @@ function collect() {
   for (const a of data.agents.filter((a) => a.state === 'checking')) {
     out.push({ key: 'c' + a.id, tone: 'dim', icon: 'refresh', label: 'Checking', text: `${a.name || a.id}: sign-in and models`, go: () => import('./app.js').then((m) => m.go('#/agents')) });
   }
-  for (const t of data.threads.filter((t) => t.status === 'limited')) {
+  for (const t of need.filter((t) => t.status === 'limited')) {
     out.push({ key: 'l' + t.id, tone: 'hot', icon: 'pause', label: 'Waiting on limit', text: where(t) + t.title, sub: t.status_note, go: threadGo(t) });
   }
   for (const a of data.agents.filter((a) => a.state === 'limit')) {
     out.push({ key: 'a' + a.id, tone: 'hot', icon: 'warn', label: 'Usage limit', text: `${a.name || a.id} is out of usage`, sub: a.note, go: () => import('./app.js').then((m) => m.go('#/usage')) });
   }
-  for (const t of data.threads.filter((t) => t.status === 'failed')) {
+  for (const t of need.filter((t) => t.status === 'failed')) {
     out.push({ key: 'f' + t.id, tone: 'hot', icon: 'warn', label: 'Failed', text: where(t) + t.title, sub: t.status_note, go: threadGo(t) });
   }
   if (data.update) {
@@ -79,7 +85,7 @@ function drawItem() {
 
 function drawRight() {
   const working = data.threads.filter((t) => t.status === 'working').length + data.terms.length;
-  const needs = data.decisions.length + data.threads.filter((t) => t.status === 'blocked').length;
+  const needs = attention(data.threads, data.decisions).count;
   const remote = !S.me.local;
   right.replaceChildren(
     h('div', { class: 'sb-meters' }, ...(data.quotas || []).map(meter)),
@@ -165,7 +171,7 @@ const refresh = debounce(async () => {
   try {
     data = await get('activity', { quiet: true, timeout: 15000 });
   } catch { /* the next event or tick tries again */ }
-  rebuild();
+  setActivity(data); // redraws through watchAttention, and the side rail's count with it
 }, 300);
 
 export function initStatusBar() {
@@ -218,5 +224,6 @@ export function initStatusBar() {
     if (ok) refresh();
   });
   watch((what) => (what === 'all' || what === 'projects') && drawRight());
+  watchAttention(rebuild); // marked seen elsewhere, or new activity (setActivity) arrived
   refresh();
 }

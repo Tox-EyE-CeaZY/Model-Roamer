@@ -16,6 +16,18 @@ export const S = {
   dataDir: '',
 };
 
+// Threads the person pointed at for a chat's next message ("Reference in the lead chat"): chat id → [thread info]
+const refsPending = {};
+const refSubs = new Set();
+export const watchRefs = (fn) => (refSubs.add(fn), () => refSubs.delete(fn));
+export function addRef(chatId, t) {
+  const info = { id: t.id, title: t.title, agent: t.agent, status: t.status, note: (t.status_note || t.last_body || '').replace(/[#*_`>]/g, '').slice(0, 400) };
+  (refsPending[chatId] ||= []).push(info);
+  refSubs.forEach((f) => f(chatId));
+}
+/** Take (and clear) what's waiting for this chat. */
+export const takeRefs = (chatId) => refsPending[chatId]?.splice(0) || [];
+
 const subs = new Set();
 /** fn(what) whenever the store changes ('projects' | 'agents' | 'settings' | 'running' | 'all'). */
 export const watch = (fn) => (subs.add(fn), () => subs.delete(fn));

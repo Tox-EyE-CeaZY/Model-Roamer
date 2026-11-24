@@ -433,9 +433,9 @@ pub fn codex_quota_at(v: &Value, base: i64) -> Option<Value> {
 /// Which plan window a limit message is about: "weekly", "five_hour", or "" when it doesn't say.
 pub fn limit_window(text: &str) -> &'static str {
     let t = text.to_lowercase();
-    if t.contains("weekly") || t.contains("week") || t.contains("7-day") || t.contains("7 day") {
+    if t.contains("weekly") || t.contains("week") || t.contains("7-day") || t.contains("7 day") || t.contains("seven day") {
         "weekly"
-    } else if t.contains("5-hour") || t.contains("5 hour") || t.contains("five-hour") || t.contains("5h") || t.contains("session limit") || t.contains("hourly") {
+    } else if t.contains("5-hour") || t.contains("5 hour") || t.contains("five hour") || t.contains("five-hour") || t.contains("5h") || t.contains("session limit") || t.contains("hourly") {
         "five_hour"
     } else {
         ""

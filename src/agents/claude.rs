@@ -175,23 +175,23 @@ impl AgentAdapter for Claude {
             "rate_limit_event" => {
                 let info = &v["rate_limit_info"];
                 let mut q = json!({});
-                for (k, name) in [("five_hour", "five_hour"), ("seven_day", "weekly")] {
-                    let w = &info["unifiedWindows"][k];
-                    if let Some(u) = w["utilization"].as_f64() {
-                        q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": w["resetsAt"].as_i64().map(epoch_ms) });
+                if let Some(windows) = info["unifiedWindows"].as_object() {
+                    for (key, w) in windows {
+                        if let (Some((name, tier)), Some(u)) = (crate::quota::claude_window(key), w["utilization"].as_f64()) {
+                            crate::quota::put_window(&mut q, name, tier, json!({ "used": u.clamp(0.0, 1.0), "resets_at": w["resetsAt"].as_i64().map(epoch_ms) }));
+                        }
                     }
                 }
-                // older CLIs: one window per event, {rateLimitType, utilization, resetsAt}
-                if q.as_object().is_some_and(|o| o.is_empty()) {
-                    if let Some(u) = info["utilization"].as_f64() {
-                        let name = match info["rateLimitType"].as_str().unwrap_or("") {
-                            "five_hour" => Some("five_hour"),
-                            t if t.starts_with("seven_day") => Some("weekly"),
-                            _ => None,
-                        };
-                        if let Some(name) = name {
-                            q[name] = json!({ "used": u.clamp(0.0, 1.0), "resets_at": info["resetsAt"].as_i64().map(epoch_ms) });
-                        }
+                // Older CLIs send one window per event. A rejection also carries its scope here.
+                let kind = info["rateLimitType"].as_str().unwrap_or("");
+                let rejected = info["status"] == "rejected";
+                if let Some((name, tier)) = crate::quota::claude_window(kind) {
+                    if let Some(u) = info["utilization"].as_f64().or(rejected.then_some(1.0)) {
+                        crate::quota::put_window(&mut q, name, tier, json!({
+                            "used": u.clamp(0.0, 1.0),
+                            "resets_at": info["resetsAt"].as_i64().map(epoch_ms),
+                            "restricted": rejected,
+                        }));
                     }
                 }
                 if q.as_object().is_some_and(|o| !o.is_empty()) {

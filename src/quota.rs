@@ -51,17 +51,158 @@ async fn claude() -> Option<Value> {
 /// percentage.
 pub fn claude_parse(v: &Value) -> Option<Value> {
     let mut q = json!({});
-    for (k, name) in [("five_hour", "five_hour"), ("seven_day", "weekly")] {
-        let w = &v[k];
-        let Some(u) = w["utilization"].as_f64() else { continue };
+    for (key, w) in v.as_object()? {
+        let Some((window, tier)) = claude_window(key) else { continue };
+        let restricted = tier.is_some() && matches!(w["status"].as_str(), Some("restricted" | "rejected"));
+        let used = w["utilization"].as_f64().map(|u| (u / 100.0).clamp(0.0, 1.0));
+        if used.is_none() && !restricted {
+            continue;
+        }
         let resets = match &w["resets_at"] {
             Value::String(s) => chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis()),
             Value::Number(n) => n.as_i64().map(epoch_ms),
             _ => None,
         };
-        q[name] = json!({ "used": (u / 100.0).clamp(0.0, 1.0), "resets_at": resets });
+        put_window(&mut q, window, tier, json!({ "used": used, "resets_at": resets, "restricted": restricted }));
     }
-    q.as_object().is_some_and(|o| !o.is_empty()).then_some(q)
+    (!q.as_object()?.is_empty()).then_some(q)
+}
+
+/// Only interpret model names the provider identifies explicitly. Opaque usage keys can be unrelated features.
+pub fn claude_window(key: &str) -> Option<(&'static str, Option<&'static str>)> {
+    Some(match key {
+        "five_hour" => ("five_hour", None),
+        "seven_day" => ("weekly", None),
+        "five_hour_fable" => ("five_hour", Some("Fable")),
+        "seven_day_fable" => ("weekly", Some("Fable")),
+        "five_hour_opus" => ("five_hour", Some("Opus")),
+        "seven_day_opus" => ("weekly", Some("Opus")),
+        "five_hour_sonnet" => ("five_hour", Some("Sonnet")),
+        "seven_day_sonnet" => ("weekly", Some("Sonnet")),
+        "five_hour_haiku" => ("five_hour", Some("Haiku")),
+        "seven_day_haiku" => ("weekly", Some("Haiku")),
+        _ => return None,
+    })
+}
+
+pub fn put_window(q: &mut Value, window: &str, tier: Option<&str>, value: Value) {
+    match tier {
+        Some(tier) => q["tiers"][tier][window] = value,
+        None => q[window] = value,
+    }
+}
+
+pub fn tier_key(agent: &str, tier: &str) -> String {
+    format!("{agent}:{tier}")
+}
+
+pub fn model_tier(agent: &str, model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    let words = || model.split(|c: char| !c.is_ascii_alphanumeric());
+    match agent {
+        "claude" => [("fable", "Fable"), ("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+            .into_iter().find_map(|(id, tier)| words().any(|w| w == id).then_some(tier)),
+        "antigravity" if words().any(|w| w == "argon") => Some("Argon"),
+        _ => None,
+    }
+}
+
+pub fn model_restriction(agent: &str, model: &str, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    model_tier(agent, model).is_some()
+        && model_tier(agent, model) == model_tier(agent, &message)
+        && ["not available", "unavailable", "not allowed", "restricted", "do not have access", "don't have access"]
+            .iter().any(|phrase| message.contains(phrase))
+}
+
+pub fn limit_scope(agent: &str, model: &str, message: &str) -> Option<&'static str> {
+    // An unscoped 429 can be account-wide even when the selected model is Fable or Argon.
+    let named = model_tier(agent, message);
+    if named.is_some() && named == model_tier(agent, model) {
+        return named;
+    }
+    if agent == "antigravity" {
+        let message = message.to_ascii_lowercase();
+        if message.contains("gemini models") {
+            return Some("Gemini Models");
+        }
+        if message.contains("claude and gpt models") {
+            return Some("Claude and GPT models");
+        }
+    }
+    None
+}
+
+pub fn antigravity_pool(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gemini") || model.starts_with("orchestrator") {
+        Some("Gemini Models")
+    } else if model.starts_with("claude") || model.starts_with("gpt") {
+        Some("Claude and GPT models")
+    } else {
+        None
+    }
+}
+
+/// Legacy Antigravity snapshots have individual group windows in an array.
+pub fn tiers(agent: &str, q: &Value) -> Value {
+    let mut tiers = q["tiers"].as_object().cloned().unwrap_or_default();
+    if agent == "antigravity" {
+        for row in q["groups"].as_array().into_iter().flatten() {
+            if let (Some(group), Some(window)) = (row["group"].as_str(), row["window"].as_str()) {
+                tiers.entry(group.to_string()).or_insert_with(|| json!({}))[window] = row.clone();
+            }
+        }
+    }
+    let expected: &[&str] = match agent {
+        "claude" => &["Fable"],
+        "antigravity" => &["Gemini Models", "Claude and GPT models", "Argon"],
+        _ => &[],
+    };
+    for tier in expected {
+        tiers.entry(tier.to_string()).or_insert_with(|| json!({}));
+    }
+    Value::Object(tiers)
+}
+
+fn window_limit(q: &Value, now: i64, fallback_reset: Option<i64>) -> Option<Value> {
+    ["five_hour", "weekly"].into_iter().find_map(|window| {
+        let w = &q[window];
+        let until = w["resets_at"].as_i64().or(fallback_reset)?;
+        (until > now && (w["used"].as_f64().is_some_and(|used| used >= 1.0) || w["restricted"] == true))
+            .then(|| json!({ "active": true, "until": until, "window": window }))
+    })
+}
+
+pub fn model_usage_limit(agent: &str, model: &str, q: &Value, now: i64) -> Option<Value> {
+    let tiers = tiers(agent, q);
+    let fallback_reset = q["at"].as_i64().map(|at| at + 30 * 60_000);
+    let active = |row: &Value| window_limit(row, now, fallback_reset);
+    if agent == "antigravity" {
+        let pool_limit = if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+            ["Gemini Models", "Claude and GPT models", "Argon"].into_iter().find_map(|pool| active(&tiers[pool]))
+        } else {
+            antigravity_pool(model).and_then(|pool| active(&tiers[pool]))
+        };
+        if let Some(limit) = pool_limit {
+            return Some(limit);
+        }
+    } else if let Some(limit) = active(q) {
+        return Some(limit);
+    }
+    if agent == "claude" && model.is_empty() {
+        ["Fable", "Opus", "Sonnet", "Haiku"].into_iter().find_map(|tier| active(&tiers[tier]))
+    } else {
+        model_tier(agent, model).and_then(|tier| active(&tiers[tier]))
+    }
+}
+
+pub fn clear_expired_windows(q: &mut Value, now: i64) {
+    for window in ["five_hour", "weekly"] {
+        if q[window]["resets_at"].as_i64().is_some_and(|time| time <= now) {
+            q[window] = Value::Null;
+        }
+    }
 }
 
 fn codex() -> Option<Value> {
@@ -188,9 +329,9 @@ pub fn antigravity_parse(text: &str) -> Option<Value> {
         if cols.len() < 3 {
             continue;
         }
-        let Some(left) = cols.iter().find_map(|c| c.strip_suffix('%')?.trim().parse::<f64>().ok()) else { continue };
+        let Some(left) = cols[2].strip_suffix('%').and_then(|c| c.trim().parse::<f64>().ok()).filter(|n| n.is_finite()) else { continue };
         let resets = cols.iter().find_map(|c| chrono::DateTime::parse_from_rfc3339(c).ok()).map(|d| d.timestamp_millis());
-        let name = cols[1].to_lowercase();
+        let name = cols[1].to_lowercase().replace('-', " ");
         let window = if name.contains("five hour") || name.contains("5 hour") {
             "five_hour"
         } else if name.contains("week") {
@@ -199,7 +340,12 @@ pub fn antigravity_parse(text: &str) -> Option<Value> {
             continue;
         };
         let used = (1.0 - left / 100.0).clamp(0.0, 1.0);
-        groups.push(json!({ "group": cols[0], "window": window, "used": used, "resets_at": resets }));
+        let group = if cols[0].to_ascii_lowercase().split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word == "argon") {
+            "Argon"
+        } else {
+            cols[0]
+        };
+        groups.push(json!({ "group": group, "window": window, "used": used, "resets_at": resets }));
         if q[window]["used"].as_f64().is_none_or(|u| used > u) {
             q[window] = json!({ "used": used, "resets_at": resets });
         }
@@ -236,6 +382,39 @@ mod tests {
         assert!((c["weekly"]["used"].as_f64().unwrap() - 0.40).abs() < 1e-9);
         assert_eq!(c["five_hour"]["resets_at"].as_i64().unwrap(), chrono::DateTime::parse_from_rfc3339("2026-11-23T06:00:00Z").unwrap().timestamp_millis());
     }
+    #[test]
+    fn claude_tiers_preserve_windows_and_do_not_guess_opaque_keys() {
+        let q = claude_parse(&json!({
+            "five_hour": {"utilization": 20},
+            "seven_day_fable": {"utilization": 100, "resets_at": 2000000000},
+            "five_hour_fable": {"utilization": 50},
+            "seven_day_sonnet": {"utilization": 33},
+            "cinder_cove": {"utilization": 100}
+        })).unwrap();
+        let t = tiers("claude", &q);
+        assert_eq!(t["Fable"]["five_hour"]["used"], 0.5);
+        assert_eq!(t["Fable"]["weekly"]["resets_at"], 2000000000000_i64);
+        assert_eq!(t["Sonnet"]["weekly"]["used"], 0.33);
+        assert!(q["weekly"].is_null());
+        assert!(t["cinder_cove"].is_null());
+        assert_eq!(model_usage_limit("claude", "fable", &q, 0).unwrap()["window"], "weekly");
+        assert!(model_usage_limit("claude", "opus", &q, 0).is_none());
+        assert!(model_usage_limit("claude", "fable", &q, 2000000000000).is_none());
+    }
+
+    #[test]
+    fn antigravity_routes_against_shared_pool_and_argon_tier() {
+        let q = antigravity_parse(concat!(
+            "Gemini Models\t5-hour Remaining\t90%\t2026-11-24T12:12:55Z\n",
+            "Claude and GPT models\tWeekly Remaining\t0%\t2026-12-01T07:13:45Z\n",
+            "Gemini 4 Argon\t5-hour Remaining\t0%\t2026-11-24T12:12:55Z\n",
+        )).unwrap();
+        assert_eq!(model_usage_limit("antigravity", "gemini-4-argon-high", &q, 0).unwrap()["window"], "five_hour");
+        assert!(model_usage_limit("antigravity", "Gemini 4 Neon (High)", &q, 0).is_none());
+        assert_eq!(model_usage_limit("antigravity", "claude-opus-5-5-high", &q, 0).unwrap()["window"], "weekly");
+        assert!(tiers("antigravity", &json!({}))["Argon"]["weekly"].is_null());
+    }
+
     #[test]
     fn reads_antigravity_usage() {
         let t = "Gemini Models\tWeekly Limit Remaining\t87%\t2026-11-29T15:41:45Z\nGemini Models\tFive Hour Limit Remaining\t100%\t2026-11-23T19:21:15Z\nClaude and GPT models\tFive Hour Limit Remaining\t40%\t2026-11-23T19:21:15Z\n";

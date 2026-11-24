@@ -360,7 +360,10 @@ impl Core {
     pub fn set_quota(&self, agent: &str, q: &Value) {
         let mut v = q.clone();
         v["at"] = json!(util::now_ms());
-        let _ = self.db.set_setting(&format!("quota.{agent}"), &v);
+        if let Err(error) = self.db.set_setting(&format!("quota.{agent}"), &v) {
+            tracing::warn!(agent, %error, "could not save usage probe");
+            return;
+        }
         self.bus.emit("quota", None, None, json!({ "agent": agent, "quota": v }));
     }
 
@@ -371,11 +374,60 @@ impl Core {
         }
         if let Some(q) = crate::quota::probe(agent).await {
             self.set_quota(agent, &q);
+        } else if matches!(agent, "claude" | "codex" | "antigravity") {
+            tracing::debug!(agent, "plan usage unavailable");
+            let key = format!("quota.{agent}");
+            let value = json!({ "probe_failed": true }).to_string();
+            if let Err(error) = self.db.exec(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = json_patch(settings.value, excluded.value)",
+                &[&key, &value],
+            ) {
+                tracing::warn!(agent, %error, "could not record unavailable usage");
+            }
+            self.bus.emit("quota", None, None, json!({ "agent": agent }));
         }
     }
 
-    /// Plan usage per agent for the status bar: what the CLI last reported (a window that has since reset reads as
-    /// unused), its turns in the last 5 hours and 7 days, and any limit it is under.
+    pub fn model_limit(&self, agent: &str, model: &str) -> Value {
+        let shared = self.limit_of(agent);
+        if shared["active"] == true {
+            return shared;
+        }
+        let pool = if agent == "antigravity" { crate::quota::antigravity_pool(model) } else { None };
+        let default_pools: &[&str] = if agent == "antigravity" && (model.is_empty() || model.eq_ignore_ascii_case("auto")) {
+            &["Gemini Models", "Claude and GPT models", "Argon"]
+        } else if agent == "claude" && model.is_empty() {
+            &["Fable", "Opus", "Sonnet", "Haiku"]
+        } else {
+            &[]
+        };
+        for tier in crate::quota::model_tier(agent, model).into_iter().chain(pool).chain(default_pools.iter().copied()) {
+            let limit = self.limit_of(&crate::quota::tier_key(agent, tier));
+            if limit["active"] == true {
+                return limit;
+            }
+        }
+        let q = self.db.setting(&format!("quota.{agent}"));
+        crate::quota::model_usage_limit(agent, model, &q, util::now_ms()).unwrap_or(shared)
+    }
+
+    /// Stream events can update just one window; merge them atomically with the last probe.
+    pub fn update_quota(&self, agent: &str, q: &Value) {
+        let key = format!("quota.{agent}");
+        let mut q = q.clone();
+        q["at"] = json!(util::now_ms());
+        let value = q.to_string();
+        if let Err(error) = self.db.exec(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = json_patch(settings.value, excluded.value)",
+            &[&key, &value],
+        ) {
+            tracing::warn!(agent, %error, "could not save usage update");
+            return;
+        }
+        self.bus.emit("quota", None, None, json!({ "agent": agent, "quota": self.db.setting(&key) }));
+    }
+
+    /// Plan usage per agent for the status bar: what the CLI last reported (an expired window is unknown), its turns in the last 5 hours and 7 days, and any limit it is under.
     pub fn quotas(&self) -> Vec<Value> {
         let now = util::now_ms();
         self.adapters()
@@ -385,20 +437,21 @@ impl Core {
                 let id = a.id();
                 let info = a.info();
                 let mut q = self.db.setting(&format!("quota.{id}"));
-                for w in ["five_hour", "weekly"] {
-                    if q[w]["resets_at"].as_i64().is_some_and(|r| r < now) {
-                        q[w]["used"] = json!(0.0);
-                        q[w]["resets_at"] = Value::Null;
-                    }
+                let mut tiers = crate::quota::tiers(&id, &q);
+                for (tier, windows) in tiers.as_object_mut().into_iter().flatten() {
+                    crate::quota::clear_expired_windows(windows, now);
+                    windows["limit"] = self.limit_of(&crate::quota::tier_key(&id, tier));
                 }
+                crate::quota::clear_expired_windows(&mut q, now);
                 let turns = |since: i64| self.db.scalar_i64("SELECT COUNT(*) FROM turns WHERE agent = ?1 AND started_at > ?2", &[&id, &(now - since)]).unwrap_or(0);
                 json!({
                     "id": id, "name": info.name, "hue": info.hue,
                     "five_hour": q.get("five_hour").cloned().unwrap_or(Value::Null),
                     "weekly": q.get("weekly").cloned().unwrap_or(Value::Null),
+                    "probe_failed": q["probe_failed"] == true,
                     "at": q.get("at").cloned().unwrap_or(Value::Null),
                     "turns_5h": turns(5 * 3_600_000), "turns_7d": turns(7 * 86_400_000),
-                    "limit": self.limit_of(&id),
+                    "limit": self.limit_of(&id), "tiers": tiers,
                 })
             })
             .collect()

@@ -535,6 +535,7 @@ async fn new_worker(State(core): State<CoreRef>, Path(id): Path<String>, Json(b)
             agent: s(&b, "agent"),
             task_kind: s(&b, "task_kind"),
             model: s(&b, "model"),
+            allow_limited: true,
             effort: s(&b, "effort"),
             workspace: s(&b, "workspace"),
             depends_on: vec![],
@@ -1361,7 +1362,7 @@ async fn usage(State(core): State<CoreRef>, q: Q) -> R {
                 MAX(started_at) AS last FROM turns WHERE started_at >= ?1 GROUP BY agent",
         &[&since],
     )?;
-    let limits = core.db.all("SELECT * FROM limits ORDER BY hit_at DESC", &[])?;
+    let limits = core.db.all("SELECT * FROM limits WHERE instr(agent, ':') = 0 ORDER BY hit_at DESC", &[])?;
     let recent = core.db.all(
         "SELECT tu.id, tu.agent, tu.model, tu.status, tu.error, tu.input_tokens, tu.output_tokens, tu.cost_usd, tu.started_at, tu.ended_at, t.title, t.id AS thread_id, t.project_id
          FROM turns tu LEFT JOIN threads t ON t.id = tu.thread_id ORDER BY tu.started_at DESC LIMIT 40",

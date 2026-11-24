@@ -13,6 +13,7 @@ import { openExternal } from '../native.js';
 import { dialog, toast } from '../ui.js';
 import { md } from '../md.js';
 import { ic, field, input, textarea, select, seg, toggle, loading, errorBox, empty, kicker, copyable, statusChip } from '../common.js';
+import { checkWork, drawPresence, notesInbox, presenceDot } from '../collab-presence.js';
 
 const ROLE_LABEL = { collaborator: 'Collaborator', operator: 'Operator', viewer: 'Viewer', owner: 'Owner' };
 
@@ -48,6 +49,14 @@ export async function collaborators(el, r) {
     })));
 
   let data = null;
+  const memberDots = new Map();
+  async function refreshMemberDots() {
+    const project = pid;
+    const view = await get(`collab/projects/${project}/presence`, { quiet: true }).catch(() => null);
+    if (!view || pid !== project) return;
+    const online = new Set(view.people.filter((p) => p.online).map((p) => p.user_id));
+    for (const [user, dot] of memberDots) dot.replaceChildren(presenceDot(online.has(user)));
+  }
   async function draw() {
     try {
       data = await get('collab/projects/' + pid);
@@ -109,6 +118,7 @@ export async function collaborators(el, r) {
 
   function drawPeople() {
     const { members, invites } = data;
+    memberDots.clear();
     peopleBox.replaceChildren(kicker('People in this project', h('b', { class: 'count' }, members.length)),
       members.length ? h('div', { class: 'dev-list' }, members.map(memberRow)) : h('p', { class: 'faint small' }, 'Nobody has joined yet. Only you can see and change this project.'),
       invites.length ? h('div', { class: 'collab-sub' }, kicker('Waiting to be used'), h('div', { class: 'dev-list' }, invites.map((i) => h('div', { class: 'dev' }, ic('link', 15),
@@ -117,9 +127,12 @@ export async function collaborators(el, r) {
           await del('collab/invites/' + i.id).catch((e) => toast(e.message, { err: true }));
           draw2();
         } }, 'Withdraw'))))) : null);
+    refreshMemberDots();
   }
 
   function memberRow(m) {
+    const dot = h('span', { class: 'collab-member-dot' });
+    memberDots.set(m.user_id, dot);
     const perms = h('details', { class: 'collab-perms' }, h('summary', {}, 'Permissions for ' + m.name),
       h('div', { class: 'collab-grid one', style: { '--cols': 1 } }, data.perms.map((p) => {
         const overridden = m.perms && typeof m.perms === 'object' && p.id in m.perms;
@@ -142,7 +155,7 @@ export async function collaborators(el, r) {
       h('button', { class: 'btn xs primary', onclick: () => answer(m, true) }, 'Approve'),
       h('button', { class: 'btn xs', onclick: () => answer(m, false) }, 'Decline')) : null;
     return h('div', { class: 'collab-member' }, ask,
-      h('div', { class: 'dev' }, ic('people', 15),
+      h('div', { class: 'dev' }, dot,
         h('div', {}, h('b', {}, m.name), h('small', { class: 'faint' }, `joined ${ago(m.created_at)} · last seen ${m.last_seen ? ago(m.last_seen) : 'never'}${m.last_ip ? ' from ' + m.last_ip : ''}`)),
         select(data.roles.map((x) => [x, ROLE_LABEL[x]]), m.role, async (v) => {
           await patch('collab/members/' + m.id, { role: v }).catch((e) => toast(e.message, { err: true }));
@@ -184,7 +197,11 @@ export async function collaborators(el, r) {
   }
 
   await draw();
-  const un = listen((ev) => ev.kind === 'collab' && ev.project === pid && draw2());
+  const un = listen((ev) => {
+    if (ev.project !== pid) return;
+    if (ev.kind === 'collab') draw2();
+    if (ev.kind === 'presence') refreshMemberDots();
+  });
   return () => un();
 }
 
@@ -255,6 +272,8 @@ async function joined(el, linkId) {
   const link = links.find((l) => l.id === linkId);
   if (!link) return el.replaceChildren(h('section', { class: 'panel cut' }, empty('people', 'Not joined', 'This project isn’t in your list any more.', h('a', { class: 'btn', href: '#/settings/join' }, 'Back'))));
   const head = h('section', { class: 'panel cut collab-head' });
+  const presenceHost = h('div', { class: 'collab-presence-host' });
+  const inboxHost = h('div', { class: 'collab-note-host' });
   const body = h('section', { class: 'panel cut' });
   el.replaceChildren(head, body);
   body.replaceChildren(loading('Reaching ' + link.host_name));
@@ -275,6 +294,26 @@ async function joined(el, linkId) {
   let tab = 'threads', openThread = null, live = 'ok', alive = true;
   const perms = st.perms || {};
   const me = st.member;
+  let presence = st.presence;
+  let notes = st.notes || [];
+  let notesKey;
+
+  async function refreshNotes() {
+    try {
+      notes = await get(base + 'notes', { quiet: true });
+      if (alive) drawCoordination();
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+  }
+
+  function drawCoordination() {
+    drawPresence(presenceHost, presence, live === 'ok');
+    const key = JSON.stringify([live, notes]);
+    if (notesKey === key) return;
+    notesKey = key;
+    inboxHost.replaceChildren(live === 'ok' ? notesInbox(base, notes, refreshNotes) : null);
+  }
 
   const liveTag = h('span');
   function drawHead() {
@@ -283,11 +322,13 @@ async function joined(el, linkId) {
       h('a', { class: 'linkbtn', href: '#/settings/join' }, ic('left', 13), 'All joined projects'),
       h('div', { class: 'collab-title' }, h('h2', {}, st.project?.name || link.project_name), liveTag),
       h('div', { class: 'collab-title' }, h('p', { class: 'faint small' }, `Hosted by ${st.host?.name || link.host_name} · you are ${ROLE_LABEL[me.role] || me.role} as ${me.name}`), askOperator()),
+      presenceHost, inboxHost,
       seg([['threads', 'Threads'], ['memory', 'Memory'], ['artifacts', 'Artifacts'], ['people', 'People']], tab, (v) => {
         tab = v;
         openThread = null;
         drawBody();
       }));
+    drawCoordination();
   }
 
   // an operator takes threads over without asking each time: asked for once, approved once by the owner
@@ -329,7 +370,25 @@ async function joined(el, linkId) {
   async function newThread() {
     const title = input('', { placeholder: 'What this thread is for' });
     const what = textarea('', { placeholder: 'Instructions (optional)' });
-    if (!(await dialog({ title: 'New thread', body: h('div', {}, field('Title', title), field('Instructions', what), h('p', { class: 'faint small' }, 'It belongs to you: your agents run it on this machine.')), ok: 'Create' }))) return;
+    const matches = h('div');
+    let reviewedTitle = '';
+    title.addEventListener('input', () => { matches.replaceChildren(); reviewedTitle = ''; });
+    if (!(await dialog({
+      title: 'New thread',
+      body: h('div', {}, field('Title', title), matches, field('Instructions', what), h('p', { class: 'faint small' }, 'It belongs to you: your agents run it on this machine.')),
+      ok: 'Create',
+      check: async () => {
+        const proposed = title.value.trim();
+        if (!proposed) return 'Give it a title.';
+        if (reviewedTitle === proposed) return;
+        const overlap = await checkWork(base, { title: proposed, kind: 'worker' }, perms.send_conflict_notes);
+        if (overlap) {
+          matches.replaceChildren(overlap);
+          reviewedTitle = proposed;
+          return 'Review the overlap. Choose Create again to continue.';
+        }
+      },
+    }))) return;
     try {
       const t = await post(base + 'threads', { title: title.value, instructions: what.value });
       threads.set(t.id, t);
@@ -455,10 +514,11 @@ async function joined(el, linkId) {
   }
 
   function drawPeople() {
+    const online = new Set((presence?.people || []).filter((p) => p.online).map((p) => p.user_id));
     body.replaceChildren(kicker('People', h('b', { class: 'count' }, people.length)),
-      h('div', { class: 'dev-list' }, people.map((p) => h('div', { class: 'dev' }, ic('people', 15),
-        h('div', {}, h('b', {}, p.name, p.user_id === me.user_id ? h('span', { class: 'tag' }, 'you') : null), h('small', { class: 'faint' }, (ROLE_LABEL[p.role] || p.role) + (p.last_seen ? ' · seen ' + ago(p.last_seen) : ''))))))
-      , h('p', { class: 'faint small' }, 'What each person is working on right now arrives with presence, in a later update.'));
+      h('div', { class: 'dev-list' }, people.map((p) => h('div', { class: 'dev' },
+        presence?.permission ? presenceDot(live === 'ok' && online.has(p.user_id)) : ic('people', 15),
+        h('div', {}, h('b', {}, p.name, p.user_id === me.user_id ? h('span', { class: 'tag' }, 'you') : null), h('small', { class: 'faint' }, (ROLE_LABEL[p.role] || p.role) + (p.last_seen ? ' · seen ' + ago(p.last_seen) : '')))))));
   }
 
   // one long poll at a time: answers at once when something changed, otherwise waits on the host for up to 20 s
@@ -469,6 +529,9 @@ async function joined(el, linkId) {
         const c = await get(base + `changes?since=${cursor}&wait=20`, { timeout: 45000, quiet: true });
         cursor = c.cursor;
         if (c.people) people = c.people;
+        if (c.presence) presence = c.presence;
+        if (c.notes) notes = c.notes;
+        if (c.perms) Object.assign(perms, c.perms);
         c.threads.forEach((t) => threads.set(t.id, { ...threads.get(t.id), ...t }));
         addMsgs(c.messages);
         c.memory.forEach((m) => memory.set(m.id, m));
@@ -479,6 +542,7 @@ async function joined(el, linkId) {
         }
         delay = 2000;
         if (!alive) return;
+        drawCoordination();
         if (tab === 'threads' && !openThread && (c.threads.length || c.messages.length)) drawThreads();
         else if (tab === 'threads' && openThread && c.messages.some((m) => m.thread_id === openThread)) paintMsgs();
         else if (tab === 'memory' && c.memory.length) paintMemory();

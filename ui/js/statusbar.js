@@ -25,6 +25,10 @@ function collect() {
   for (const d of data.decisions) {
     out.push({ key: 'd' + d.id, tone: 'hot', icon: 'question', label: 'Needs you', text: d.question, sub: d.title, go: threadGo({ id: d.thread_id, kind: d.kind, project_id: d.project_id }) });
   }
+  for (const n of data.conflictNotes || []) {
+    out.push({ key: 'note-' + n.id, tone: 'hot', icon: 'flag', label: 'Needs you', text: 'Review conflict note', sub: n.title,
+      go: () => import('./app.js').then((m) => m.go(n.link_id ? '#/settings/join?link=' + encodeURIComponent(n.link_id) : '#/p/' + n.project_id)) });
+  }
   // threads that need the person: the same rule (and the same "seen" marks) as Home and the board
   const need = attention(data.threads).need;
   for (const t of need.filter((t) => t.status === 'blocked')) {
@@ -85,7 +89,7 @@ function drawItem() {
 
 function drawRight() {
   const working = data.threads.filter((t) => t.status === 'working').length + data.terms.length;
-  const needs = attention(data.threads, data.decisions).count;
+  const needs = attention(data.threads, data.decisions, data.conflictNotes).count;
   const remote = !S.me.local;
   right.replaceChildren(
     h('div', { class: 'sb-meters' }, ...(data.quotas || []).map(meter)),
@@ -169,7 +173,11 @@ function rebuild() {
 
 const refresh = debounce(async () => {
   try {
-    data = await get('activity', { quiet: true, timeout: 15000 });
+    const [activity, conflictNotes] = await Promise.all([
+      get('activity', { quiet: true, timeout: 15000 }),
+      get('collab/notes-attention', { quiet: true, timeout: 10000 }).catch(() => data.conflictNotes || []),
+    ]);
+    data = { ...activity, conflictNotes };
   } catch { /* the next event or tick tries again */ }
   setActivity(data); // redraws through watchAttention, and the side rail's count with it
 }, 300);
@@ -213,7 +221,7 @@ export function initStatusBar() {
         }
         break;
       }
-      case 'quota': case 'turn': case 'running': case 'thread': case 'decision': case 'agent': case 'limits': case 'setup': case 'update': case 'project': case 'resync':
+      case 'quota': case 'turn': case 'running': case 'thread': case 'decision': case 'agent': case 'limits': case 'setup': case 'update': case 'project': case 'resync': case 'conflict-notes':
         refresh();
         break;
     }

@@ -39,6 +39,7 @@ pub struct TermEntry {
 pub struct Core {
     pub db: Db,
     pub bus: Bus,
+    pub(crate) collab_presence: crate::collab::presence::Presence,
     pub data: PathBuf,
     /// Running as a server with nobody at its screen.
     pub headless: bool,
@@ -70,6 +71,7 @@ impl Core {
     pub fn open(data: PathBuf, headless: bool) -> Result<CoreRef> {
         std::fs::create_dir_all(&data)?;
         let db = Db::open(&data.join("model-roamer.db"))?;
+        crate::collab::notes::initialize(&db)?;
         let tok_path = data.join("local.token");
         let local_token = match std::fs::read_to_string(&tok_path) {
             Ok(t) if t.trim().len() >= 32 => t.trim().to_string(),
@@ -93,6 +95,7 @@ impl Core {
         let core = Arc::new(Core {
             db,
             bus: Bus::new(),
+            collab_presence: Default::default(),
             data,
             headless,
             port: AtomicU16::new(0),

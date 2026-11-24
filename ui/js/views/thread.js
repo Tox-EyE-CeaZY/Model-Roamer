@@ -12,6 +12,7 @@ import { md, wireMd } from '../md.js';
 import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable, pickFolder } from '../common.js';
 import { runStep } from '../term.js';
 import { attachComposerVoice } from '../voice.js';
+import { mountCoordination } from '../collab-presence.js';
 
 export default async function threadView(el, r, ctx) {
   return mountThread(el, r.id, { full: true, ctx });
@@ -37,16 +38,18 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   }
   const head = h('div', { class: 'th-head' });
   const decisionsEl = h('div', { class: 'th-decisions' });
+  const coordination = h('div', { class: 'collab-coordination' });
   const log = h('div', { class: 'th-log' });
   const liveEl = h('div', { class: 'th-live', hidden: true });
   const scroller = h('div', { class: 'th-scroll' }, h('div', { class: 'th-inner' }, log, liveEl));
   const composerStops = [];
+  if (t.project_id && !t.user_id) composerStops.push(mountCoordination(coordination, t.project_id, t.id, t.kind));
   const composer = makeComposer();
   const sidebar = full ? h('aside', { class: 'th-side' }) : null;
   el.classList.add('thread', compact ? 'compact' : 'full');
   el.replaceChildren(
     compact ? null : head,
-    h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, scroller, composer.el), sidebar));
+    h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, coordination, scroller, composer.el), sidebar));
 
   let messages = [], turns = [], activity = {}, hasMore = false;
   // shown: how much of the streamed text is on screen; it catches up word by word, so every agent's reply reads as it
@@ -449,7 +452,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
         h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
       acts?.length ? timeline(acts, steps) : null,
-      wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
+      meta.conflict_note ? h('div', { class: 'collab-plain-note' }, m.body) : wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
       files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null);
     return e;
   }

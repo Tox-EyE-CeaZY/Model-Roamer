@@ -105,6 +105,15 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/voice/status", get(crate::voice::api_status))
         .route("/api/voice/setup", post(crate::voice::api_setup))
         .route("/api/voice/transcribe", post(crate::voice::api_transcribe))
+        .route("/api/local-llm/status", get(crate::local_llm::api_status))
+        .route("/api/local-llm/setup", post(crate::local_llm::api_setup))
+        .route("/api/local-llm/start", post(crate::local_llm::api_start))
+        .route("/api/local-llm/stop", post(crate::local_llm::api_stop))
+        .route(
+            "/api/local-llm/update",
+            get(crate::local_llm::api_check_update).post(crate::local_llm::api_update),
+        )
+        .route("/api/local-llm/rollback", post(crate::local_llm::api_rollback))
         // remote access
         .route("/api/network", get(network))
         .route("/api/network/tailscale-serve", post(tailscale_serve))

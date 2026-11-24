@@ -21,6 +21,7 @@ mod files;
 mod forward;
 mod git;
 mod github;
+mod local_llm;
 mod mcp;
 mod memory;
 mod net;

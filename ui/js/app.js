@@ -8,6 +8,7 @@ import { S, load, watch, project as projectOf } from './store.js';
 import { isDesktop, isPop, plat, desk, win, native, onNative, setTitle, openExternal } from './native.js';
 import { toast, dialog, showMenu, overlaid, closeMenu } from './ui.js';
 import { ic, stamp, statusChip, loading, errorBox } from './common.js';
+import { attentionCount, watchAttention } from './attention.js';
 
 const VIEWS = {
   home: () => import('./views/home.js'),
@@ -174,11 +175,14 @@ function side() {
     const r = parseRoute();
     const cur = r.view === 'project' || r.view === 'thread' ? '' : r.view === 'home' ? '' : r.view === 'artifact' ? 'artifacts' : r.view;
     const working = S.projects.reduce((n, p) => n + (p.working || 0), 0);
+    const needs = attentionCount();
     const items = NAV.map(([path, ico, label, k]) =>
       h('a', { class: 'sd-i' + (cur === path && (path !== '' || r.view === 'home') ? ' on' : ''), href: '#/' + path, title: `${label} (${k.replace('c+', 'Ctrl+').replace(',', ',')})` },
         ic(ico, 17), h('span', {}, label),
         path === 'agents' && Object.values(S.agents).some((a) => a.limit?.active) ? h('i', { class: 'sd-dot hot', title: 'An agent is at its usage limit' }) : null,
-        path === '' && working ? h('b', { class: 'sd-n', title: `${working} working` }, working) : null));
+        // Home's number is only for what waits on the person (the same count as the status bar); work in progress
+        // is a quiet dot, so a busy fleet never looks like a call for attention
+        path === '' && needs ? h('b', { class: 'sd-n hot', title: `${needs} waiting on you` }, needs) : path === '' && working ? h('i', { class: 'sd-dot', title: `${working} working` }) : null));
     const projects = S.projects.map((p) =>
       h('a', { class: 'sd-p' + (r.view === 'project' && r.id === p.id ? ' on' : ''), href: '#/p/' + p.id, style: { '--ph': p.color }, title: p.name, oncontextmenu: (e) => (e.preventDefault(), projectMenu(p, e.clientX, e.clientY)) },
         h('i', { class: 'sd-sw' }),
@@ -194,6 +198,7 @@ function side() {
     );
   };
   watch(draw);
+  watchAttention(draw);
   addEventListener('hashchange', draw);
   draw();
   try {

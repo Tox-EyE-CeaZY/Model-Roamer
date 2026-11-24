@@ -23,7 +23,7 @@ const STATUS = {
   working: ['Working', 'live'],
   waiting: ['Waiting', 'dim'],
   blocked: ['Needs you', 'hot'],
-  review: ['Ready for review', 'acc'],
+  review: ['Finished', 'dim'], // a worker's report to the lead, not a call for the person (see attention.js)
   done: ['Done', 'acc'],
   failed: ['Failed', 'hot'],
   paused: ['Paused', 'dim'],

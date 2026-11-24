@@ -7,6 +7,7 @@ import { S, watch, agentList, agentName } from '../store.js';
 import { go, openThread, projectMenu, newProject } from '../app.js';
 import { dialog, toast } from '../ui.js';
 import { ic, stamp, statusChip, empty, field, input, textarea, seg, agentModelPicker, pickFolder, timeAgo, loading, kicker } from '../common.js';
+import { attention as sortOut, markSeen, unmarkSeen, watchAttention } from '../attention.js';
 
 export default async function home(el) {
   const attention = h('section', { class: 'h-attn' });
@@ -36,14 +37,51 @@ export default async function home(el) {
     threads = lists.flat();
   }
 
+  // What waits on the person (open questions, blocked/failed/limited threads, an unread lead reply) is loud; workers
+  // that finished report to the lead, so they sit in a quiet, folded "Finished" group. attention.js decides which.
+  let finOpen = false;
+  try {
+    finOpen = localStorage.getItem('mr-fin-open') === '1';
+  } catch { /* fine */ }
+  const pname = (t) => S.projects.find((p) => p.id === t.project_id)?.name || '';
+  const seenFor = (list, what) => {
+    markSeen(list);
+    toast(what, { action: 'Undo', ms: 7000, run: () => unmarkSeen(list) });
+  };
+  const seenBtn = (t, label = 'Mark seen') => h('button', { class: 'ibtn xs attn-x', type: 'button', title: label, 'aria-label': label,
+    onclick: (e) => (e.stopPropagation(), seenFor(t, 'Marked seen. It comes back if it changes.')), html: icon('close', 12) });
+  const row = (cls, go, ...kids) => h('div', { class: cls, role: 'button', tabindex: '0', onclick: go, onkeydown: (e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), go()) }, ...kids);
+
   function drawAttention() {
-    const need = threads.filter((t) => !t.resolved && ['blocked', 'failed', 'limited', 'review'].includes(t.status));
     const decisions = S.projects.filter((p) => p.decisions);
-    if (!need.length && !decisions.length) return attention.replaceChildren();
-    attention.replaceChildren(kicker('Waiting on you', h('b', { class: 'count hot' }, need.length + decisions.reduce((n, p) => n + p.decisions, 0))),
-      h('div', { class: 'attn-list' },
-        decisions.map((p) => h('button', { class: 'attn cut', style: { '--ph': p.color }, onclick: () => go('#/p/' + p.id) }, ic('question', 18), h('div', {}, h('b', {}, plural(p.decisions, 'decision') + ' to make'), h('small', {}, p.name)), ic('right', 14))),
-        need.map((t) => h('button', { class: 'attn cut', onclick: () => openThread(t.id) }, ic(t.status === 'review' ? 'check' : 'warn', 18), h('div', {}, h('b', {}, t.title), h('small', {}, (S.projects.find((p) => p.id === t.project_id)?.name || '') + (t.status_note ? ' · ' + t.status_note : ''))), statusChip(t)))));
+    const { need, finished, count } = sortOut(threads, decisions.reduce((n, p) => n + p.decisions, 0));
+    const parts = [];
+    if (count) {
+      parts.push(kicker('Waiting on you', h('b', { class: 'count hot' }, count)),
+        h('div', { class: 'attn-list' },
+          decisions.map((p) => h('button', { class: 'attn cut', style: { '--ph': p.color }, onclick: () => go('#/p/' + p.id) }, ic('question', 18), h('div', {}, h('b', {}, plural(p.decisions, 'decision') + ' to make'), h('small', {}, p.name)), ic('right', 14))),
+          need.map((t) => t.kind === 'lead'
+            ? row('attn cut', () => go('#/p/' + t.project_id), ic('chat', 18), h('div', {}, h('b', {}, 'The lead replied'), h('small', {}, pname(t) + (t.last_body ? ' · ' + t.last_body.replace(/[#*_`>]/g, '').slice(0, 90) : ''))), h('span', { class: 'status hot' }, 'Unread'), seenBtn(t))
+            : row('attn cut', () => openThread(t.id), ic('warn', 18), h('div', {}, h('b', {}, t.title), h('small', {}, pname(t) + (t.status_note ? ' · ' + t.status_note : ''))), statusChip(t), seenBtn(t)))));
+    }
+    if (finished.length) {
+      const toggle = () => {
+        finOpen = !finOpen;
+        try {
+          localStorage.setItem('mr-fin-open', finOpen ? '1' : '');
+        } catch { /* fine */ }
+        drawAttention();
+      };
+      parts.push(h('div', { class: 'fin' + (finOpen ? ' open' : '') },
+        h('div', { class: 'fin-h' },
+          h('button', { class: 'fin-t', type: 'button', 'aria-expanded': String(finOpen), onclick: toggle, title: 'Workers that finished and reported to their lead. The lead reviews them; nothing here needs you.' },
+            h('span', {}, 'Finished'), h('b', { class: 'fin-n' }, finished.length), h('small', {}, 'the lead reviews these'), h('i', { class: 'lane-chev' + (finOpen ? ' open' : ''), html: icon('chevDown', 12) })),
+          finOpen ? h('button', { class: 'chipbtn', type: 'button', onclick: () => seenFor(finished, `Marked ${plural(finished.length, 'thread')} seen`) }, 'Mark all seen') : null),
+        finOpen ? h('div', { class: 'fin-list' }, finished.map((t) => row('fin-i', () => openThread(t.id),
+          ic('check', 14), h('div', {}, h('span', { class: 'fin-title' }, t.title), h('small', {}, pname(t) + (t.status_note ? ' · ' + t.status_note : ''))),
+          stamp(t.agent, { small: true }), seenBtn(t)))) : null));
+    }
+    attention.replaceChildren(...parts);
   }
 
   function drawRunning() {
@@ -108,7 +146,8 @@ export default async function home(el) {
   drawChats();
   const unwatch = watch((what) => (what === 'agents' ? drawFleet() : what === 'running' ? (drawRunning(), drawFleet()) : refresh()));
   const unlisten = listen((ev) => ev.kind === 'thread' && refresh());
-  return () => (unwatch(), unlisten());
+  const unseen = watchAttention(drawAttention);
+  return () => (unwatch(), unlisten(), unseen());
 }
 
 // ------------------------------------------------------------ new project

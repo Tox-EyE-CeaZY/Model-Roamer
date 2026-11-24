@@ -10,6 +10,7 @@ import { popOut, setTitle, openExternal } from '../native.js';
 import { dialog, toast, showMenu } from '../ui.js';
 import { mountThread, decisionCard } from './thread.js';
 import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+import { needsYou, isFinished } from '../attention.js';
 
 const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
 
@@ -70,8 +71,9 @@ export default async function projectView(el, r, ctx) {
 
 // ------------------------------------------------------------ board
 const LANES = [
-  ['attn', 'Needs you', (t) => !t.resolved && ['blocked', 'failed', 'limited', 'review'].includes(t.status) && !t.running],
+  ['attn', 'Needs you', (t) => !!needsYou(t)], // one rule for every screen: attention.js
   ['work', 'Working', (t) => t.running || (!t.resolved && ['working', 'queued', 'waiting', 'idle'].includes(t.status))],
+  ['fin', 'Finished', isFinished], // reported to the lead, which reviews it: folded and quiet
   ['held', 'Paused', (t) => !t.resolved && ['paused', 'cancelled'].includes(t.status) && !t.running],
   ['done', 'Done', (t) => !t.running && (t.resolved || t.status === 'done')],
 ];
@@ -85,9 +87,10 @@ async function board(el, p, r, ctx) {
   const peekEl = h('div', { class: 'b-peek', hidden: true });
   const split = h('div', { class: 'board' }, leadBox, boardEl, peekEl);
   el.append(split);
-  let threads = [], doneOpen = false;
+  let threads = [], doneOpen = false, finOpen = false;
   try {
     doneOpen = localStorage.getItem('mr-done-' + p.id) === '1';
+    finOpen = localStorage.getItem('mr-fin-' + p.id) === '1';
   } catch { /* fine */ }
 
   const stopLead = await mountThread(leadBox, p.lead.id, { compact: true });
@@ -165,15 +168,17 @@ async function board(el, p, r, ctx) {
       lanes.replaceChildren(...LANES.map(([k, label, test]) => {
         const list = threads.filter(test);
         if (!list.length && k !== 'work') return null;
-        const collapsed = k === 'done' && !doneOpen;
+        const folds = k === 'done' || k === 'fin';
+        const collapsed = folds && !(k === 'done' ? doneOpen : finOpen);
         return h('section', { class: 'lane l-' + k },
-          h('button', { class: 'lane-h', onclick: k === 'done' ? () => {
-            doneOpen = !doneOpen;
+          h('button', { class: 'lane-h', onclick: folds ? () => {
+            if (k === 'fin') finOpen = !finOpen;
+            else doneOpen = !doneOpen;
             try {
-              localStorage.setItem('mr-done-' + p.id, doneOpen ? '1' : '');
+              localStorage.setItem(`mr-${k}-` + p.id, (k === 'fin' ? finOpen : doneOpen) ? '1' : '');
             } catch { /* fine */ }
             draw();
-          } : null }, h('span', {}, label), h('b', { class: 'count' + (k === 'attn' ? ' hot' : '') }, list.length), k === 'done' ? h('i', { class: 'lane-chev' + (collapsed ? '' : ' open'), html: icon('chevDown', 12) }) : null),
+          } : null }, h('span', {}, label), h('b', { class: 'count' + (k === 'attn' ? ' hot' : '') }, list.length), folds ? h('i', { class: 'lane-chev' + (collapsed ? '' : ' open'), html: icon('chevDown', 12) }) : null),
           collapsed ? null : h('div', { class: 'lane-cards' }, list.length ? list.map(card) : h('p', { class: 'faint small lane-empty' }, 'Nothing running right now.')));
       }));
     }

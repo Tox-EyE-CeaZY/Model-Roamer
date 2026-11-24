@@ -94,6 +94,7 @@ export async function chatsPanel(box, pid) {
 /** The joined project's board link: its threads belong to people; the person's own open on this machine. */
 export function threadTag(t, me, personName) {
   if (t.user_id === me.user_id) return ' · yours';
+  if (t.kind === 'lead') return ' · ' + personName('') + '’s chat';
   if (t.kind === 'chat') return ' · ' + personName(t.user_id) + '’s chat';
   return t.user_id ? ' · ' + personName(t.user_id) : '';
 }

@@ -6,7 +6,7 @@
 .cc-note { flex: 1 1 260px; min-width: 0; font-size: 12.5px; color: var(--dim); }
 .cc-bar > .ibtn { margin-left: auto; }
 /* the thread view needs a bounded height to scroll its log and keep the composer in view */
-.cc-chat { display: flex; flex-direction: column; height: clamp(420px, calc(100vh - 290px), 900px); min-height: 0; margin: 0 calc(-1 * var(--gut, 16px)) -16px; }
+.cc-chat { display: flex; flex-direction: column; height: clamp(420px, calc(100vh - 290px), 900px); min-height: 0; min-width: 0; max-width: 100%; }
 .cc-chat.thread { border-top: 0; }
 .cc-chat > .loading, .cc-chat > .err { margin: 16px var(--gut, 16px); }
 

@@ -68,6 +68,8 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/collab/links", get(list_links).post(add_link))
         .route("/api/collab/links/{id}", delete(remove_link))
         .route("/api/collab/links/{id}/host/{*path}", any(proxy))
+        // per-person project chats and the guest's thread mirror (Stage 1c)
+        .merge(crate::collab_chat::routes())
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(core.clone(), server::auth))
         .layer(middleware::from_fn(server::headers))
@@ -109,7 +111,7 @@ fn role_defaults(role: &str) -> Map<String, Value> {
     PERMS.iter().map(|(k, _, d)| (k.to_string(), json!(d[i]))).collect()
 }
 
-fn rules_of(core: &CoreRef, project: &str) -> Value {
+pub(crate) fn rules_of(core: &crate::core::Core, project: &str) -> Value {
     core.db.one("SELECT rules FROM collab_rules WHERE project_id = ?1", &[&project]).ok().flatten().map(|r| r["rules"].clone()).filter(Value::is_object).unwrap_or(json!({}))
 }
 
@@ -135,7 +137,7 @@ fn role_rules(core: &CoreRef, project: &str, role: &str) -> Map<String, Value> {
     eff
 }
 
-fn effective(core: &CoreRef, project: &str, role: &str, overrides: &Value) -> Value {
+pub(crate) fn effective(core: &CoreRef, project: &str, role: &str, overrides: &Value) -> Value {
     let mut eff = role_rules(core, project, role);
     eff.extend(clean_perms(overrides));
     Value::Object(eff)
@@ -217,10 +219,10 @@ pub fn memory_scope(m: &Member) -> (Option<String>, Option<String>) {
 }
 
 /// Stage 1c, per-person project chats: find or make the member's own `chat` thread in the project (`user_id` set).
-/// `view_others_chats` already gates seeing other people's (see `can_see`).
-#[allow(dead_code)]
-pub fn personal_chat(_core: &CoreRef, _m: &Member) -> Option<String> {
-    None
+/// `view_others_chats` gates seeing other people's (see `can_see`). The chat runs on the member's machine; see
+/// collab_chat.rs.
+pub fn personal_chat(core: &CoreRef, m: &Member) -> Option<String> {
+    crate::collab_chat::personal_chat(core, m)
 }
 
 /// Conflict notices (planned): when someone is about to work on something another person's thread already covers,
@@ -493,12 +495,12 @@ async fn join(State(core): State<CoreRef>, ConnectInfo(addr): ConnectInfo<Socket
 // ------------------------------------------------------------------------------------------------ host (members)
 
 /// Thread fields a member may see: no local paths, sessions or the owner's settings.
-const THREAD_FIELDS: &[&str] = &[
+pub(crate) const THREAD_FIELDS: &[&str] = &[
     "id", "project_id", "parent_id", "kind", "title", "agent", "model", "status", "status_note", "task_kind", "instructions", "criteria", "branch",
     "base_branch", "merged", "resolved", "created_at", "updated_at", "user_id", "repo_id", "last_body", "message_count", "deleted_at",
 ];
 
-fn pick(v: &Value, keys: &[&str]) -> Value {
+pub(crate) fn pick(v: &Value, keys: &[&str]) -> Value {
     Value::Object(keys.iter().filter_map(|k| v.get(*k).map(|x| (k.to_string(), x.clone()))).collect())
 }
 
@@ -512,7 +514,7 @@ fn clean_message(m: &Value) -> Value {
 
 /// May this member see this thread? Their own always; the owner's shared ones with view_threads; other people's own
 /// chats only with view_others_chats.
-fn can_see(m: &Member, t: &Value) -> bool {
+pub(crate) fn can_see(m: &Member, t: &Value) -> bool {
     if t["project_id"].as_str() != Some(m.project_id.as_str()) {
         return false;
     }
@@ -535,7 +537,7 @@ fn visible_thread(core: &CoreRef, m: &Member, id: &str) -> Result<Value, ApiErr>
     Ok(t)
 }
 
-fn project_view(core: &CoreRef, pid: &str) -> Result<Value, ApiErr> {
+pub(crate) fn project_view(core: &CoreRef, pid: &str) -> Result<Value, ApiErr> {
     let p = core.project(pid)?;
     let mut out = pick(&p, &["id", "name", "instructions", "lead_agent", "repo_url", "base_branch", "color", "created_at", "updated_at"]);
     let repos = core.db.all("SELECT id, name, kind, url, base_branch FROM repos WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY created_at", &[&pid]).unwrap_or_default();
@@ -549,7 +551,7 @@ fn project_view(core: &CoreRef, pid: &str) -> Result<Value, ApiErr> {
     Ok(out)
 }
 
-fn people(core: &CoreRef, pid: &str) -> Vec<Value> {
+pub(crate) fn people(core: &crate::core::Core, pid: &str) -> Vec<Value> {
     let mut v = vec![json!({ "user_id": "", "name": core.display_name(), "role": "owner" })];
     v.extend(
         core.db
@@ -861,7 +863,7 @@ async fn h_leave(State(core): State<CoreRef>, Extension(m): Extension<Member>) -
 
 // ------------------------------------------------------------------------------------------------ guest (this machine joined a host)
 
-fn client() -> &'static reqwest::Client {
+pub(crate) fn client() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| reqwest::Client::builder().connect_timeout(Duration::from_secs(6)).build().unwrap_or_default())
 }
@@ -972,7 +974,7 @@ async fn remove_link(State(core): State<CoreRef>, Extension(_who): Extension<Who
     Ok(Json(json!({ "ok": true, "host_told": told })))
 }
 
-fn set_link_status(core: &CoreRef, l: &Value, status: &str, error: &str) {
+pub(crate) fn set_link_status(core: &CoreRef, l: &Value, status: &str, error: &str) {
     let id = s(l, "id");
     let changed = l["status"].as_str() != Some(status) || l["error"].as_str() != Some(error);
     let now = util::now_ms();

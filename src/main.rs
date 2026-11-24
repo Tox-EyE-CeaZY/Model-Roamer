@@ -12,6 +12,7 @@ mod api;
 mod artifacts;
 mod bus;
 mod collab;
+mod collab_chat;
 mod config;
 mod core;
 mod db;
@@ -190,6 +191,8 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     }
     runner::recover(&core);
     tokio::spawn(runner::watch_limits(core.clone()));
+    // joined projects: this machine's threads in them go up to their hosts (collab_chat.rs)
+    tokio::spawn(collab_chat::run(core.clone()));
     // plan usage for the status bar: now, then every ten minutes (and after every turn, in the runner)
     let cq = core.clone();
     tokio::spawn(async move {

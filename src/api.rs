@@ -484,6 +484,7 @@ async fn project_threads(State(core): State<CoreRef>, Path(id): Path<String>) ->
          FROM threads t WHERE t.project_id = ?1 AND t.deleted_at IS NULL ORDER BY t.kind = 'lead' DESC, t.created_at",
         &[&id],
     )?;
+    let rows: Vec<Value> = rows.into_iter().filter(|t| !crate::collab_chat::hidden_from_owner(&core, t)).collect();
     let running = core.running.lock().map(|r| r.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
     let rows: Vec<Value> = rows
         .into_iter()
@@ -578,7 +579,9 @@ async fn list_threads(State(core): State<CoreRef>, q: Q) -> R {
          FROM threads t WHERE t.kind = ?1 AND t.deleted_at IS NULL ORDER BY t.pinned DESC, t.updated_at DESC LIMIT 300",
         &[&kind],
     )?;
-    Ok(Json(json!(rows.into_iter().map(|mut r| { r["last_body"] = json!(util::clip(r["last_body"].as_str().unwrap_or(""), 200)); r }).collect::<Vec<_>>())))
+    // collaborators' own project chats live in their projects, not in this list
+    let rows = rows.into_iter().filter(|r| !crate::collab_chat::is_personal_chat(r));
+    Ok(Json(json!(rows.map(|mut r| { r["last_body"] = json!(util::clip(r["last_body"].as_str().unwrap_or(""), 200)); r }).collect::<Vec<_>>())))
 }
 
 async fn create_chat(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
@@ -597,6 +600,9 @@ async fn create_chat(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
 
 async fn get_thread(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let mut t = core.thread(&id)?;
+    if crate::collab_chat::hidden_from_owner(&core, &t) {
+        return Err(ApiErr(StatusCode::NOT_FOUND, "That chat is private to the person it belongs to.".into()));
+    }
     if let Some(p) = t["project_id"].as_str() {
         t["project"] = core.project(p).unwrap_or(Value::Null);
         t["repo"] = crate::repos::for_thread(&core, &t).map(|v| json!({ "id": v["repo_id"], "name": v["repo_name"] })).unwrap_or(Value::Null);
@@ -701,6 +707,9 @@ async fn restore_thread(State(core): State<CoreRef>, Path(id): Path<String>) -> 
 async fn thread_messages(State(core): State<CoreRef>, Path(id): Path<String>, q: Q) -> R {
     let before: i64 = q.get("before").and_then(|b| b.parse().ok()).unwrap_or(i64::MAX);
     let limit: i64 = q.get("limit").and_then(|b| b.parse().ok()).unwrap_or(80).clamp(1, 500);
+    if core.thread(&id).is_ok_and(|t| crate::collab_chat::hidden_from_owner(&core, &t)) {
+        return Err(ApiErr(StatusCode::NOT_FOUND, "That chat is private to the person it belongs to.".into()));
+    }
     let rows = core.db.all("SELECT * FROM (SELECT * FROM messages WHERE thread_id = ?1 AND created_at < ?2 ORDER BY created_at DESC LIMIT ?3) ORDER BY created_at", &[&id, &before, &limit])?;
     let turns = core.db.all("SELECT id, agent, model, status, error, input_tokens, output_tokens, cost_usd, started_at, ended_at FROM turns WHERE thread_id = ?1 ORDER BY started_at DESC LIMIT 100", &[&id])?;
     Ok(Json(json!({ "messages": rows, "turns": turns })))

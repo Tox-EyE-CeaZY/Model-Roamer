@@ -469,7 +469,6 @@ async function start() {
   side();
   // a phone can install the app to its home screen (needs https or localhost; harmless elsewhere)
   if (!isDesktop && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-  import('./voice.js').then((m) => m.initVoice()).catch((e) => console.error(e));
   if (!isPop) import('./statusbar.js').then((m) => m.initStatusBar()).catch((e) => console.error(e));
   addEventListener('hashchange', render);
   render();

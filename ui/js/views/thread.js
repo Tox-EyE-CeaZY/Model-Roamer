@@ -11,6 +11,7 @@ import { dialog, toast, showMenu } from '../ui.js';
 import { md, wireMd } from '../md.js';
 import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable, pickFolder } from '../common.js';
 import { runStep } from '../term.js';
+import { attachComposerVoice } from '../voice.js';
 
 export default async function threadView(el, r, ctx) {
   return mountThread(el, r.id, { full: true, ctx });
@@ -564,7 +565,9 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const refBtn = t.kind === 'lead' ? h('button', { class: 'ibtn', title: 'Reference a thread (or type @)', onclick: (e) => pickThread(e.currentTarget), html: icon('thread', 17) }) : null;
     const stepsBtn = h('button', { class: 'cmp-steps', type: 'button', title: 'How this chat shows the agent’s steps', onclick: (e) => stepsMenu(e.currentTarget) });
     const sendBtn = h('button', { class: 'cmp-send', title: 'Send (Enter)', onclick: () => go_(), html: icon('send', 17) });
+    let voice = null;
     async function go_() {
+      voice?.stop({ keepTextNow: true });
       const text = ta.value.trim();
       if (files.some((f) => !f.path)) return toast('Wait for the attachments to finish uploading');
       if (!text && !files.length && !refs.length) return ta.focus();
@@ -620,6 +623,8 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         h('button', { class: 'ibtn', title: 'Attach files', onclick: () => fileIn.click(), html: icon('clip', 17) }), fileIn, refBtn,
         ta, sendBtn),
       h('div', { class: 'cmp-hint mono' }, t.kind === 'chat' ? chatPicker() : null, h('span', {}, 'Enter sends · Shift+Enter new line · drop or paste files'), h('span', { class: 'cmp-agent' }), stepsBtn));
+    voice = attachComposerVoice(el, { onSend: () => go_() });
+    if (voice) composerStops.push(() => voice.destroy());
     setTimeout(grow);
     // threads sent here from a card's menu ("Reference in the lead chat"), now or while this was closed
     if (t.kind === 'lead') {

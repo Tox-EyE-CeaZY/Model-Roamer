@@ -685,7 +685,7 @@ export function createVoice({ composerEl, ta, onUpdate, onSend }) {
 const attached = new WeakMap();
 
 /** Attach voice controls to a rendered `.composer` element (idempotent). */
-export function attachComposerVoice(composerEl) {
+export function attachComposerVoice(composerEl, { onSend } = {}) {
   if (!composerEl || attached.has(composerEl)) return attached.get(composerEl) || null;
   const row = composerEl.querySelector('.cmp-row');
   const ta = composerEl.querySelector('.cmp-in');
@@ -697,7 +697,7 @@ export function attachComposerVoice(composerEl) {
     composerEl,
     ta,
     onUpdate: () => ta.dispatchEvent(new Event('input', { bubbles: true })),
-    onSend: () => sendBtn.click(),
+    onSend: onSend || (() => sendBtn.click()),
   });
 
   // Insert live listening / error banner above the input row, mic button beside Send, and mode button in hint bar
@@ -732,34 +732,5 @@ export function attachComposerVoice(composerEl) {
 
   attached.set(composerEl, ctrl);
   return ctrl;
-}
-
-let observerStarted = false;
-
-/** Automatically enhance every mounted chat composer (project lead, worker threads, chats, pop-outs) and clean up on removal. */
-export function initVoice() {
-  if (observerStarted || typeof document === 'undefined') return;
-  observerStarted = true;
-  wireGlobalShortcut();
-
-  const scan = (root) => {
-    if (!(root instanceof Element)) return;
-    if (root.classList.contains('composer')) attachComposerVoice(root);
-    root.querySelectorAll?.('.composer').forEach(attachComposerVoice);
-  };
-  const cleanupRemoved = (root) => {
-    if (!(root instanceof Element)) return;
-    if (root.classList.contains('composer')) attached.get(root)?.destroy();
-    root.querySelectorAll?.('.composer').forEach((el) => attached.get(el)?.destroy());
-  };
-
-  scan(document.body);
-  const obs = new MutationObserver((records) => {
-    for (const rec of records) {
-      rec.removedNodes.forEach(cleanupRemoved);
-      rec.addedNodes.forEach(scan);
-    }
-  });
-  obs.observe(document.body, { childList: true, subtree: true });
 }
 

@@ -11,6 +11,7 @@ mod agents;
 mod api;
 mod artifacts;
 mod bus;
+mod collab;
 mod config;
 mod core;
 mod db;

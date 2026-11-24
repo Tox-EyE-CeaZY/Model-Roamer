@@ -601,7 +601,8 @@ pub fn schedule(core: &CoreRef, thread: &str) {
 
 fn runnable(core: &CoreRef, thread: &str) -> Result<bool> {
     let t = core.thread(thread)?;
-    if matches!(t["status"].as_str(), Some("paused" | "cancelled" | "limited" | "waiting")) {
+    // a collaborator's thread runs on their machine, never on this one's accounts (collab::runs_here)
+    if matches!(t["status"].as_str(), Some("paused" | "cancelled" | "limited" | "waiting")) || !crate::collab::runs_here(&t) {
         return Ok(false);
     }
     if t["project_id"].is_string() {

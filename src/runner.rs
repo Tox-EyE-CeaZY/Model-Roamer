@@ -118,6 +118,8 @@ pub struct NewWorker {
     /// Thinking strength for this thread ("" = the agent's setting)
     pub effort: String,
     pub workspace: String,
+    /// Which of the project's repositories it works on: an id, a name, or "" / "primary"
+    pub repo: String,
     pub depends_on: Vec<String>,
     pub parent: Option<String>,
     pub kind: String,
@@ -141,6 +143,7 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
         a
     };
     let model = if w.model.is_empty() { core.agent_cfg(&agent)["model"].as_str().unwrap_or("").to_string() } else { w.model.clone() };
+    let repo_id = crate::repos::resolve(core, project, &w.repo)?;
     let mode = match w.workspace.as_str() {
         "shared" | "scratch" | "worktree" => w.workspace.clone(),
         m if m.starts_with("path:") => m.to_string(),
@@ -157,6 +160,9 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, 'agent')",
         &[&id, &pid_s, &w.parent, &w.kind, &w.title.trim(), &agent, &model, &status, &kind, &w.instructions, &w.criteria, &ws, &deps, &now],
     )?;
+    if !repo_id.is_empty() {
+        core.db.exec("UPDATE threads SET repo_id = ?1 WHERE id = ?2", &[&repo_id, &id])?;
+    }
     if let Some(b) = &buddy {
         core.db.exec("UPDATE threads SET buddy = ?1 WHERE id = ?2", &[&b.to_string(), &id])?;
     }
@@ -540,7 +546,7 @@ async fn prepare_workspace(core: &CoreRef, t: &Value, project: Option<&Value>) -
         ensure_project_folder(core, p).await?;
     }
     let project = match project {
-        Some(p) => Some(core.project(p["id"].as_str().unwrap_or(""))?),
+        Some(_) => Some(crate::repos::for_thread(core, t)?),
         None => None,
     };
     let ws = t["workspace"].as_str().unwrap_or("").to_string();
@@ -578,6 +584,9 @@ async fn prepare_workspace(core: &CoreRef, t: &Value, project: Option<&Value>) -
 
 /// A project linked to a repository but without a local folder gets cloned into the app's data folder.
 pub async fn ensure_project_folder(core: &CoreRef, p: &Value) -> Result<()> {
+    if let Some(rid) = p["repo_id"].as_str().filter(|r| !r.is_empty()) {
+        return crate::repos::ensure_folder(core, p["id"].as_str().unwrap_or(""), rid).await;
+    }
     let folder = p["folder"].as_str().unwrap_or("");
     let repo = p["repo_url"].as_str().unwrap_or("");
     let pid = p["id"].as_str().unwrap_or("");
@@ -716,7 +725,7 @@ enum Outcome {
 async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<bool>) -> Result<()> {
     let mut t = core.thread(thread)?;
     let project = match t["project_id"].as_str() {
-        Some(p) => Some(core.project(p)?),
+        Some(_) => Some(crate::repos::for_thread(core, &t)?),
         None => None,
     };
     let pid = project.as_ref().and_then(|p| p["id"].as_str()).map(str::to_string);
@@ -1315,11 +1324,11 @@ pub async fn resolve(core: &CoreRef, thread: &str, on: bool) -> Result<()> {
 }
 
 pub async fn cleanup_worktree(core: &CoreRef, t: &Value) {
-    let (Some(p), Some(ws)) = (t["project_id"].as_str(), workspace_of(core, t)) else { return };
+    let (Some(_), Some(ws)) = (t["project_id"].as_str(), workspace_of(core, t)) else { return };
     if t["branch"].as_str().unwrap_or("").is_empty() || !ws.starts_with(core.data.join("worktrees")) {
         return;
     }
-    if let Ok(proj) = core.project(p) {
+    if let Ok(proj) = crate::repos::for_thread(core, t) {
         let _ = git::remove_worktree(&core.project_home(&proj), &ws).await;
     }
 }
@@ -1342,7 +1351,7 @@ pub async fn merge(core: &CoreRef, t: &Value, message: &str, squash: bool) -> Re
         bail!("This thread worked directly in the project folder, so there's nothing to merge.");
     }
     let ws = workspace_of(core, t).ok_or_else(|| anyhow!("No workspace"))?;
-    let p = core.project(t["project_id"].as_str().unwrap_or(""))?;
+    let p = crate::repos::for_thread(core, t)?;
     if matches!(t["status"].as_str(), Some("working" | "queued")) {
         bail!("The thread is still working. Wait for it to finish (or pause it) before merging.");
     }
@@ -1370,7 +1379,7 @@ pub async fn open_pr(core: &CoreRef, t: &Value, title: &str, body: &str, draft: 
         bail!("This thread has no branch of its own. Pull requests need a worker in a worktree.");
     }
     let ws = workspace_of(core, t).ok_or_else(|| anyhow!("No workspace"))?;
-    let p = core.project(t["project_id"].as_str().unwrap_or(""))?;
+    let p = crate::repos::for_thread(core, t)?;
     let mut url = p["repo_url"].as_str().unwrap_or("").to_string();
     if url.is_empty() {
         url = git::remote_url(&core.project_home(&p)).await;
@@ -1426,6 +1435,7 @@ pub async fn request_review(core: &CoreRef, target: &Value, agent: &str, focus: 
             model: String::new(),
             effort: String::new(),
             workspace: ws,
+            repo: target["repo_id"].as_str().unwrap_or("").to_string(),
             depends_on: vec![],
             parent: Some(lead_thread.to_string()),
             kind: "review".into(),

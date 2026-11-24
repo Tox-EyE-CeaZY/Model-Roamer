@@ -6,7 +6,7 @@ import { get, post, listen } from '../api.js';
 import { S, watch, agentList, agentName } from '../store.js';
 import { go, openThread, projectMenu, newProject } from '../app.js';
 import { dialog, toast } from '../ui.js';
-import { ic, stamp, statusChip, empty, field, input, textarea, seg, agentModelPicker, pickFolder, timeAgo, loading, kicker } from '../common.js';
+import { ic, stamp, statusChip, empty, field, input, textarea, seg, agentModelPicker, pickFolder, folderInput, timeAgo, loading, kicker } from '../common.js';
 
 export default async function home(el) {
   const attention = h('section', { class: 'h-attn' });
@@ -134,6 +134,33 @@ export async function newProjectDialog(preset = {}) {
     return b;
   }
   const where = h('div', { class: 'np-where' });
+  // more repositories beside the first: GitHub repositories and folders, added in one go
+  const extras = [];
+  const moreBox = h('div', { class: 'np-more' });
+  const here = S.server?.headless || !S.me?.local ? 'the server' : 'this computer';
+  function addExtra(kind, value = '') {
+    const x = { kind };
+    if (kind === 'github') x.inp = input(value, { placeholder: 'https://github.com/you/another-repo  or  you/another-repo' });
+    else x.ctl = folderInput({ value });
+    extras.push(x);
+    drawMore();
+    (x.inp || x.ctl.input).focus();
+    return x;
+  }
+  function drawMore() {
+    moreBox.replaceChildren(
+      h('span', { class: 'f-l' }, 'More repositories', h('small', { class: 'faint' }, ' optional · threads choose which one they work on')),
+      ...extras.map((x) => h('div', { class: 'np-extra' },
+        h('span', { class: 'np-x-ic', title: x.kind === 'github' ? 'GitHub repository' : 'Folder on ' + here }, ic(x.kind === 'github' ? 'branch' : 'folder', 14)),
+        h('div', { class: 'grow' }, x.inp || x.ctl.el),
+        h('button', { class: 'ibtn sm', type: 'button', title: 'Remove', onclick: () => (extras.splice(extras.indexOf(x), 1), drawMore(), markRepos()), html: icon('close', 14) }))),
+      h('div', { class: 'row-btns' },
+        h('button', { class: 'btn sm', type: 'button', onclick: () => addExtra('github') }, ic('plus', 12), 'GitHub repo'),
+        h('button', { class: 'btn sm', type: 'button', onclick: () => addExtra('folder') }, ic('plus', 12), 'Folder on ' + here)));
+  }
+  const chosen = () => new Set([repoIn.value.trim(), ...extras.filter((x) => x.inp).map((x) => x.inp.value.trim())].filter(Boolean));
+  const markRepos = () => repoList.querySelectorAll('.repo-i').forEach((b) => b.classList.toggle('on', chosen().has(b.dataset.url)));
+  drawMore();
   const drawWhere = () => {
     if (source === 'folder') where.replaceChildren(field('Folder', h('div', { class: 'row' }, folderIn, browse), 'Agents work in this folder. Git repositories get a worktree per worker so they never collide.'), create);
     else if (source === 'github') {
@@ -148,12 +175,25 @@ export async function newProjectDialog(preset = {}) {
     repoList.replaceChildren(loading('Looking at your GitHub repositories'));
     try {
       const list = await get('github/repos');
-      repoList.replaceChildren(...list.slice(0, 40).map((r) => h('button', { class: 'repo-i', type: 'button', onclick: (e) => {
-        repoIn.value = r.url;
-        if (!name.value.trim()) name.value = r.full_name.split('/')[1];
-        repoList.querySelectorAll('.on').forEach((x) => x.classList.remove('on'));
-        e.currentTarget.classList.add('on');
+      // pick several: the first is the project's own, the rest are added beside it (click again to take one off)
+      repoList.replaceChildren(h('small', { class: 'faint' }, 'Pick one or several. The first is the primary; Model Roamer clones them all.'), ...list.slice(0, 40).map((r) => h('button', { class: 'repo-i', type: 'button', 'data-url': r.url, onclick: () => {
+        const ex = extras.find((x) => x.inp?.value.trim() === r.url);
+        if (repoIn.value.trim() === r.url) {
+          // the primary taken off: the next one picked becomes the primary
+          const next = extras.find((x) => x.inp?.value.trim());
+          repoIn.value = next ? next.inp.value.trim() : '';
+          if (next) extras.splice(extras.indexOf(next), 1);
+          drawMore();
+        } else if (ex) {
+          extras.splice(extras.indexOf(ex), 1);
+          drawMore();
+        } else if (!repoIn.value.trim()) {
+          repoIn.value = r.url;
+          if (!name.value.trim()) name.value = r.full_name.split('/')[1];
+        } else addExtra('github', r.url);
+        markRepos();
       } }, ic(r.private ? 'lock' : 'branch', 13), h('span', {}, r.full_name), h('small', { class: 'faint' }, r.pushed ? ago(Date.parse(r.pushed)) : ''))));
+      markRepos();
     } catch {
       repoList.replaceChildren(h('p', { class: 'faint small' }, 'Paste a repository address above. (Sign in to GitHub under Settings › GitHub to pick from a list.)'));
     }
@@ -162,6 +202,7 @@ export async function newProjectDialog(preset = {}) {
     field('Name', name),
     h('div', { class: 'field' }, h('span', { class: 'f-l' }, 'Where the code lives'), seg([['folder', 'A folder'], ['github', 'A GitHub repo'], ['none', 'Start empty']], source, (v) => ((source = v), drawWhere()))),
     where,
+    moreBox,
     field('Lead', lead.el, 'The lead plans, delegates, reviews and keeps the project’s memory. Claude, Codex and Antigravity can all lead.'),
     field('Project instructions', instr));
   drawWhere();
@@ -183,6 +224,7 @@ export async function newProjectDialog(preset = {}) {
         if (!repoIn.value.trim()) return 'Paste the repository address, or pick one.';
         b.repo_url = repoIn.value.trim();
       }
+      b.repos = extras.map((x) => (x.inp ? { url: x.inp.value.trim() } : { folder: x.ctl.get() })).filter((r) => r.url || r.folder);
       try {
         made = await post('projects', b);
       } catch (e) {

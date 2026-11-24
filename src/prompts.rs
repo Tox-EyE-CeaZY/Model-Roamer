@@ -160,8 +160,18 @@ pub fn system(core: &Core, c: &Ctx) -> String {
             s.push_str(&format!("Project folder: `{}`.\n", c.workspace));
         }
         let repo = p["repo_url"].as_str().unwrap_or("");
-        if !repo.is_empty() {
+        let rid = p["repo_id"].as_str().unwrap_or("");
+        if !rid.is_empty() {
+            // a thread on one of the project's other repositories
+            s.push_str(&format!("This thread works on the project's repository `{}` ({}), not the primary one.\n", p["repo_name"].as_str().unwrap_or(rid), if repo.is_empty() { p["folder"].as_str().unwrap_or("") } else { repo }));
+            if !repo.is_empty() {
+                s.push_str(&format!("Base branch: `{}`.\n", p["base_branch"].as_str().unwrap_or("main")));
+            }
+        } else if !repo.is_empty() {
             s.push_str(&format!("Repository: {repo}. Base branch: `{}`.\n", p["base_branch"].as_str().unwrap_or("main")));
+        }
+        if role == "lead" {
+            s.push_str(&crate::repos::describe(core, p));
         }
         let instr = p["instructions"].as_str().unwrap_or("").trim();
         if !instr.is_empty() {

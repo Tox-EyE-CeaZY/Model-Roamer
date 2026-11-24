@@ -70,7 +70,8 @@ struct Who {
 }
 
 pub async fn list(State(core): State<CoreRef>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> R {
-    let p = core.project(&id)?;
+    // ?repo= shows one of the project's other repositories
+    let p = crate::repos::view(&core, &core.project(&id)?, q.get("repo").map(String::as_str).unwrap_or(""))?;
     let home = core.project_home(&p);
     let rel = clean(q.get("path").map(String::as_str).unwrap_or("")).ok_or_else(|| bad("That path leaves the project folder."))?;
     let dir = resolve(&home, &rel)?;
@@ -81,9 +82,9 @@ pub async fn list(State(core): State<CoreRef>, Path(id): Path<String>, Query(q):
     // who is working on what
     let threads = core
         .db
-        .all("SELECT id, title, agent, status, workspace, kind FROM threads WHERE project_id = ?1 AND resolved = 0 AND deleted_at IS NULL AND kind != 'lead'", &[&id])?;
+        .all("SELECT id, title, agent, status, workspace, kind FROM threads WHERE project_id = ?1 AND repo_id = ?2 AND resolved = 0 AND deleted_at IS NULL AND kind != 'lead'", &[&id, &p["repo_id"].as_str().unwrap_or("")])?;
     let running: HashSet<String> = core.running.lock().map(|r| r.iter().filter(|(_, x): &(&String, &Running)| !x.turn_id.is_empty()).map(|(k, _)| k.clone()).collect()).unwrap_or_default();
-    let claims = core.db.all("SELECT c.path, c.note, c.thread_id, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1 AND t.resolved = 0", &[&id])?;
+    let claims = core.db.all("SELECT c.path, c.note, c.thread_id, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1 AND t.repo_id = ?2 AND t.resolved = 0", &[&id, &p["repo_id"].as_str().unwrap_or("")])?;
     let claimed: Vec<(String, Who, String)> = claims
         .iter()
         .filter_map(|c| {
@@ -176,7 +177,8 @@ pub async fn list(State(core): State<CoreRef>, Path(id): Path<String>, Query(q):
 }
 
 pub async fn read(State(core): State<CoreRef>, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> R {
-    let p = core.project(&id)?;
+    // ?repo= shows one of the project's other repositories
+    let p = crate::repos::view(&core, &core.project(&id)?, q.get("repo").map(String::as_str).unwrap_or(""))?;
     let home = core.project_home(&p);
     let rel = q.get("path").cloned().unwrap_or_default();
     let full = resolve(&home, &rel)?;

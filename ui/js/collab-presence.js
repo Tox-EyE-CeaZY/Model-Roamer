@@ -79,10 +79,10 @@ export function overlapNotices(base, matches, mayNote = true) {
       mayNote ? noteComposer(base, overlap) : null)));
 }
 
-export async function checkWork(base, work, mayNote = true) {
+export async function checkWork(base, work, mayNote = true, notesBase = base) {
   try {
     const matches = await post(base + 'overlaps', work);
-    return overlapNotices(base, matches, mayNote);
+    return overlapNotices(notesBase, matches, mayNote);
   } catch (e) {
     if (e.status === 403 || e.status === 404) return null;
     throw e;
@@ -167,5 +167,7 @@ export function mountCoordination(host, project, thread, kind) {
 }
 
 export function ownerOverlap(baseProject, title) {
-  return checkWork(endpoint(baseProject), { title, kind: 'worker' });
+  const base = endpoint(baseProject);
+  const notesBase = baseProject.startsWith('lnk_') ? `collab/links/${encodeURIComponent(baseProject)}/host/` : base;
+  return checkWork(base, { title, kind: 'worker' }, true, notesBase);
 }

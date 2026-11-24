@@ -150,7 +150,7 @@ fn clean_work(mut work: Work) -> Option<Work> {
     Some(work)
 }
 
-pub(crate) fn active_work(core: &Core, project: &str) -> Vec<Work> {
+fn active_work(core: &Core, project: &str) -> Vec<Work> {
     let threads = core.db.all(
         "SELECT t.id, t.title, t.kind, t.status, t.branch FROM threads t
          WHERE t.project_id = ?1 AND t.user_id = '' AND t.deleted_at IS NULL AND t.resolved = 0
@@ -236,18 +236,18 @@ pub(crate) fn snapshot(core: &Core, project: &str, viewer: Option<&Member>) -> V
         let permits = m["perms"]["share_presence"]
             .as_bool()
             .or_else(|| rules["rules"][&role]["share_presence"].as_bool())
-            .unwrap_or(role != "viewer");
+            .unwrap_or(role_defaults(&role)["share_presence"] == true);
         let lease = received.get(&s(m, "id")).filter(|_| permits);
         let user_id = s(m, "user_id");
         let work = lease
             .map(|l| redact(l.value.clone(), &user_id))
             .unwrap_or_default();
         Person {
+            work,
             user_id,
             name: s(m, "name"),
             role: s(m, "role"),
             online: lease.is_some(),
-            work,
         }
     }));
     View { permission, people }
@@ -429,11 +429,8 @@ pub(super) async fn owner_check(
 ) -> R {
     owner_only(&who)?;
     core.project(&project)?;
-    Ok(Json(json!(overlaps(
-        &snapshot(&core, &project, None),
-        "",
-        &work
-    ))))
+    let (view, own_user) = caller_view(&core, &json!({ "project_id": project }));
+    Ok(Json(json!(overlaps(&view, &own_user, &work))))
 }
 
 pub(super) async fn member_check(
@@ -552,6 +549,17 @@ pub(crate) async fn run(core: CoreRef) {
             live.insert(project, people);
         }
         last = live;
+        for (kind, exclusive) in [
+            ("presence", expired_links(&core.collab_presence.joined)),
+            (
+                "conflict-notes",
+                expired_links(&core.collab_presence.joined_inbox),
+            ),
+        ] {
+            for link in exclusive {
+                core.bus.emit(kind, Some(&link), None, json!({}));
+            }
+        }
         if let Err(err) = notes::deliver_owner(&core) {
             tracing::warn!("could not deliver approved conflict notes: {err}");
         }
@@ -573,6 +581,21 @@ pub(crate) async fn run(core: CoreRef) {
             }
         }
     }
+}
+
+fn expired_links<T>(cache: &Mutex<HashMap<String, Lease<T>>>) -> Vec<String> {
+    let mut expired = Vec::new();
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|id, lease| {
+            if lease.live() {
+                return true;
+            }
+            expired.push(id.clone());
+            false
+        });
+    expired
 }
 
 async fn update_joined(core: &CoreRef, link: &Value) {
@@ -801,6 +824,12 @@ mod tests {
         let text = result["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("src/sync.rs"));
         assert!(text.contains("Proposed work overlaps"));
+        db.exec(
+            "UPDATE collab_members SET perms = '{\"share_presence\":false}' WHERE id = 'member'",
+            &[],
+        )
+        .unwrap();
+        assert!(digest(&core, &t).is_empty());
         db.exec(
             "UPDATE collab_members SET revoked_at = 1 WHERE id = 'member'",
             &[],

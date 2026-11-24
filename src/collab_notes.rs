@@ -112,7 +112,7 @@ pub(super) fn rows(
     let rows = core.db.all(
         "SELECT id, sender_name, sender, recipient, thread_id, title, body, created_at, decision, deliver_at
          FROM collab_conflict_notes
-         WHERE project_id = ?1 AND decision = '' AND (recipient = ?2 OR ?3 = 1)
+         WHERE project_id = ?1 AND decision = '' AND (recipient = ?2 OR (?3 = 1 AND sender != ?2))
          ORDER BY created_at DESC LIMIT 200",
         &[&project, &user, &may_review],
     )?;
@@ -144,7 +144,10 @@ fn decide(core: &CoreRef, project: &str, member: Option<&Member>, id: &str, body
         )?
         .ok_or_else(missing)?;
     let recipient = s(&n, "recipient");
-    if (recipient != user && !operator(member)) || !live_user(core, project, &recipient) {
+    if n["sender"] == user
+        || (recipient != user && !operator(member))
+        || !live_user(core, project, &recipient)
+    {
         return Err(missing());
     }
     let now = util::now_ms();

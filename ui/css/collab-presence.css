@@ -10,7 +10,7 @@
 .collab-work-panel summary::-webkit-details-marker { display: none; }
 .collab-work-panel summary::after { content: '+'; margin-inline-start: auto; color: var(--accent); }
 .collab-work-panel[open] summary::after { content: '−'; }
-.collab-work-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr)); }
+.collab-work-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr)); max-height: min(42vh, 24rem); overflow: auto; }
 .collab-work-person { min-width: 0; padding: .55rem .75rem; border-top: 1px solid var(--line); }
 .collab-work-person-head, .collab-work { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem .55rem; }
 .collab-work { align-items: baseline; margin: .4rem 0 0 .95rem; }

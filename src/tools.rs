@@ -185,6 +185,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     if !def.roles.contains(&role) {
         bail!("{name} is for the lead only. Ask the lead in your reply instead.");
     }
+    check_collaboration_overlap(core, caller, name, args)?;
     let tid = caller["id"].as_str().unwrap_or("").to_string();
     let project = caller["project_id"].as_str().map(str::to_string);
     let a = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();
@@ -211,10 +212,6 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
-            let proposed = crate::collab::presence::Work { title: a("title"), kind: "worker".into(), ..Default::default() };
-            if !crate::collab::presence::preflight(core, caller, proposed).is_empty() {
-                bail!("This task overlaps another collaborator's work. The project chat shows the overlap and lets the person send a note. Tell the person before continuing with this task.");
-            }
             let deps: Vec<String> = args["depends_on"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
             let t = runner::create_worker(
                 core,
@@ -498,10 +495,6 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         }
         "claim_paths" => {
             let p = need_project()?;
-            let proposed = crate::collab::presence::Work { paths: proposed_claims(args), ..Default::default() };
-            if !crate::collab::presence::preflight(core, caller, proposed).is_empty() {
-                bail!("These paths overlap another collaborator's work. No paths were claimed. The person's thread shows the overlap and offers to send a note.");
-            }
             let paths: Vec<String> = args["paths"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(|s| s.trim().trim_start_matches("./").to_string())).collect()).unwrap_or_default();
             let mut conflicts = vec![];
             let others = core.db.all("SELECT c.path, c.thread_id, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1 AND c.thread_id != ?2 AND t.resolved = 0 AND t.status NOT IN ('done','cancelled','failed')", &[&p, &tid])?;
@@ -590,6 +583,25 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
 
 fn proposed_claims(args: &Value) -> Vec<String> {
     args["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(crate::collab::presence::normal_path).collect()
+}
+
+fn check_collaboration_overlap(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> Result<()> {
+    use crate::collab::presence::{preflight, Work};
+    let (proposed, message) = match name {
+        "spawn_thread" => (
+            Work { title: args["title"].as_str().unwrap_or("").trim().into(), kind: "worker".into(), ..Work::default() },
+            "This task overlaps another collaborator's work. The project chat shows the overlap and lets the person send a note. Tell the person before continuing with this task.",
+        ),
+        "claim_paths" => (
+            Work { paths: proposed_claims(args), ..Work::default() },
+            "These paths overlap another collaborator's work. No paths were claimed. The person's thread shows the overlap and offers to send a note.",
+        ),
+        _ => return Ok(()),
+    };
+    if !preflight(core, caller, proposed).is_empty() {
+        bail!("{message}");
+    }
+    Ok(())
 }
 
 fn thread_line(t: &Value) -> String {

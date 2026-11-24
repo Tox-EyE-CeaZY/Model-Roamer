@@ -292,13 +292,12 @@ async fn state(State(core): State<CoreRef>, Extension(who): Extension<Who>) -> R
 /// terminals, agent checks, questions waiting on the person, recent failures and agents that need attention.
 async fn activity(State(core): State<CoreRef>) -> R {
     let running: std::collections::HashMap<String, i64> = core.running.lock().map(|r| r.iter().map(|(k, v)| (k.clone(), v.started)).collect()).unwrap_or_default();
-    let recent = util::now_ms() - 30 * 60 * 1000;
     let mut threads = core.db.all(
-        "SELECT t.id, t.kind, t.title, t.agent, t.model, t.status, t.status_note, t.project_id, p.name AS project, t.updated_at
+        "SELECT t.id, t.kind, t.title, t.agent, t.model, t.status, t.status_note, t.project_id, p.name AS project, t.updated_at, t.unread
          FROM threads t LEFT JOIN projects p ON p.id = t.project_id
-         WHERE t.deleted_at IS NULL AND t.resolved = 0 AND (t.status IN ('working','queued','blocked','limited') OR (t.status = 'failed' AND t.updated_at > ?1))
+         WHERE t.deleted_at IS NULL AND t.resolved = 0 AND (t.status IN ('working','queued','blocked','limited','failed') OR (t.kind = 'lead' AND t.unread = 1))
          ORDER BY t.updated_at DESC LIMIT 40",
-        &[&recent],
+        &[],
     )?;
     for t in threads.iter_mut() {
         if let Some(st) = t["id"].as_str().and_then(|id| running.get(id)) {

@@ -27,6 +27,7 @@ mod os;
 mod procs;
 mod prompts;
 mod quota;
+mod repos;
 mod runner;
 mod server;
 mod setup;

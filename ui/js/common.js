@@ -231,3 +231,60 @@ export function copyable(text, { mono = true } = {}) {
 }
 
 export const agentNameOf = agentName;
+
+/** A project's repository as one short line: owner/repo, or the folder's name. */
+export const repoLabel = (r) => (r ? r.name + (r.primary ? ' (primary)' : '') : '');
+
+/** Pick one of a project's repositories (from GET projects/:id/repos). Null when there is only one to pick. */
+export function repoSelect(repos, value, onchange, props = {}) {
+  if (!repos || repos.length < 2) return null;
+  return select(repos.map((r) => [r.id, repoLabel(r)]), value || 'primary', onchange, props);
+}
+
+/** A folder path on the machine the app runs on, with Browse and a live check (exists, readable, git or not).
+ *  `get()` gives the typed path; `ok()` resolves true when the last check passed. */
+export function folderInput({ value = '', placeholder = 'Full path, e.g. /srv/code/thing or C:\code\thing', allowMissing = false, onchange } = {}) {
+  const inp = input(value, { placeholder });
+  const note = h('small', { class: 'f-h fcheck' });
+  let last = null, timer = 0, seq = 0;
+  async function check() {
+    const v = inp.value.trim();
+    const n = ++seq;
+    if (!v) return ((last = null), note.replaceChildren(), (note.className = 'f-h fcheck'), null);
+    note.className = 'f-h fcheck';
+    note.replaceChildren('Checking…');
+    try {
+      const r = await get('fs/check?path=' + encodeURIComponent(v));
+      if (n !== seq) return last;
+      last = r;
+      if (r.ok) {
+        const f = r.folder;
+        note.className = 'f-h fcheck ok';
+        note.replaceChildren(ic(f.git ? 'branch' : 'folder', 12), f.git ? `Git repository${f.branch ? ' on ' + f.branch : ''}${f.remote ? ' · ' + f.remote.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '') : ''}` : 'A plain folder (no git): threads work in it directly, without branches.');
+      } else {
+        note.className = 'f-h fcheck ' + (allowMissing && /doesn.t exist/.test(r.error) ? '' : 'bad');
+        note.replaceChildren(r.error);
+      }
+      onchange?.(r);
+      return r;
+    } catch (e) {
+      if (n === seq) note.replaceChildren(e.message);
+      return null;
+    }
+  }
+  inp.oninput = () => (clearTimeout(timer), (timer = setTimeout(check, 350)));
+  const browse = h('button', { class: 'btn', type: 'button', onclick: async () => {
+    const p = await pickFolder({ start: inp.value.trim() });
+    if (p) ((inp.value = p), check());
+  } }, ic('folder', 13), 'Browse');
+  if (value) check();
+  return {
+    el: h('div', {}, h('div', { class: 'row' }, inp, browse), note),
+    input: inp,
+    get: () => inp.value.trim(),
+    set: (v) => ((inp.value = v), check()),
+    check,
+    ok: async () => (await check())?.ok === true,
+    last: () => last,
+  };
+}

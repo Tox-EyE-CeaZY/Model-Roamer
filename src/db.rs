@@ -215,6 +215,24 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE threads ADD COLUMN buddy TEXT;",
     "ALTER TABLE threads ADD COLUMN parked_at INTEGER;",
     "ALTER TABLE threads ADD COLUMN effort TEXT NOT NULL DEFAULT '';",
+    // more than one repository per project (see repos.rs): the primary stays in projects.folder / repo_url /
+    // base_branch, so existing projects need no data moved; a thread names the repository it works on ('' = primary)
+    r#"
+    CREATE TABLE repos (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'github', -- github (cloned by Model Roamer) | folder (a folder on this machine)
+        url TEXT NOT NULL DEFAULT '',
+        folder TEXT NOT NULL DEFAULT '',
+        base_branch TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        deleted_at INTEGER
+    );
+    CREATE INDEX repos_project ON repos(project_id);
+    ALTER TABLE threads ADD COLUMN repo_id TEXT NOT NULL DEFAULT '';
+    "#,
 ];
 
 #[derive(Clone)]

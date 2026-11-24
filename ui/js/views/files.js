@@ -7,13 +7,17 @@ import { get, post } from '../api.js';
 import { S, agentName, agentHue } from '../store.js';
 import { go, openThread } from '../app.js';
 import { toast } from '../ui.js';
-import { ic, empty, loading, errorBox, timeAgo } from '../common.js';
+import { ic, empty, loading, errorBox, timeAgo, repoSelect } from '../common.js';
 
 const HOW = { claimed: 'claimed', changed: 'editing', recent: 'just changed' };
 const size = (n) => (n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
 
 export default async function filesTab(el, p, r) {
   let path = r?.q?.p || '';
+  // which of the project's repositories (?repo=), when it has several
+  const repo = r?.q?.repo && r.q.repo !== 'primary' ? r.q.repo : '';
+  const at = (rel) => `#/p/${p.id}/files` + ((rel || repo) ? '?' + new URLSearchParams({ ...(rel ? { p: rel } : {}), ...(repo ? { repo } : {}) }) : '');
+  const rq = repo ? '&repo=' + encodeURIComponent(repo) : '';
   let sel = null, data = null, dead = false;
   const bar = h('div', { class: 'fl-bar' });
   const live = h('div', { class: 'fl-live' });
@@ -30,8 +34,10 @@ export default async function filesTab(el, p, r) {
 
   function drawBar() {
     const parts = path ? path.split('/') : [];
-    const crumb = (label, to) => h('button', { class: 'linkbtn', onclick: () => go(`#/p/${p.id}/files` + (to ? '?p=' + encodeURIComponent(to) : '')) }, label);
+    const crumb = (label, to) => h('button', { class: 'linkbtn', onclick: () => go(at(to)) }, label);
+    const pick = repoSelect(p.repos, repo, (v) => go(`#/p/${p.id}/files` + (v && v !== 'primary' ? '?repo=' + encodeURIComponent(v) : '')));
     bar.replaceChildren(
+      ...(pick ? [pick] : []),
       ic('folder', 14),
       crumb(data?.root || 'Project folder', ''),
       ...parts.flatMap((seg, i) => [h('span', { class: 'faint' }, '/'), crumb(seg, parts.slice(0, i + 1).join('/'))]),
@@ -50,8 +56,8 @@ export default async function filesTab(el, p, r) {
   function row(e) {
     return h('div', {
       class: 'fl-row' + (e.marks.length ? ' hot' : '') + (sel === e.path ? ' on' : ''), tabindex: '0',
-      onclick: () => (e.dir ? go(`#/p/${p.id}/files?p=${encodeURIComponent(e.path)}`) : open(e.path)),
-      onkeydown: (ev) => ev.key === 'Enter' && (e.dir ? go(`#/p/${p.id}/files?p=${encodeURIComponent(e.path)}`) : open(e.path)),
+      onclick: () => (e.dir ? go(at(e.path)) : open(e.path)),
+      onkeydown: (ev) => ev.key === 'Enter' && (e.dir ? go(at(e.path)) : open(e.path)),
     },
     h('span', { class: 'fl-ico', html: icon(e.dir ? 'folder' : 'file', 15) }),
     h('span', { class: 'fl-name' }, e.name + (e.dir ? '/' : '')),
@@ -62,7 +68,7 @@ export default async function filesTab(el, p, r) {
 
   function drawList() {
     if (!data) return;
-    const up = data.parent !== null ? h('div', { class: 'fl-row up', tabindex: '0', onclick: () => go(`#/p/${p.id}/files` + (data.parent ? '?p=' + encodeURIComponent(data.parent) : '')) }, h('span', { class: 'fl-ico', html: icon('back', 15) }), h('span', { class: 'fl-name' }, '..')) : null;
+    const up = data.parent !== null ? h('div', { class: 'fl-row up', tabindex: '0', onclick: () => go(at(data.parent)) }, h('span', { class: 'fl-ico', html: icon('back', 15) }), h('span', { class: 'fl-name' }, '..')) : null;
     list.replaceChildren(...(data.entries.length ? [up, ...data.entries.map(row), data.truncated ? h('p', { class: 'faint small' }, 'Showing the first 2000 entries.') : null] : [up, empty('folder', 'Empty folder', 'Nothing here yet.')]).filter(Boolean));
   }
 
@@ -72,7 +78,7 @@ export default async function filesTab(el, p, r) {
     view.hidden = false;
     view.replaceChildren(loading());
     try {
-      const f = await get(`projects/${p.id}/file?path=${encodeURIComponent(rel)}`);
+      const f = await get(`projects/${p.id}/file?path=${encodeURIComponent(rel)}${rq}`);
       view.replaceChildren(
         h('div', { class: 'fl-view-h' }, h('b', { class: 'mono' }, rel), h('span', { class: 'grow' }), h('small', { class: 'faint mono' }, size(f.size)),
           h('button', { class: 'ibtn sm', title: 'Close', onclick: () => ((sel = null), (view.hidden = true), drawList()), html: icon('close', 14) })),
@@ -85,7 +91,7 @@ export default async function filesTab(el, p, r) {
 
   async function load() {
     try {
-      data = await get(`projects/${p.id}/files?path=${encodeURIComponent(path)}`);
+      data = await get(`projects/${p.id}/files?path=${encodeURIComponent(path)}${rq}`);
       if (dead) return;
       drawBar();
       drawLive();

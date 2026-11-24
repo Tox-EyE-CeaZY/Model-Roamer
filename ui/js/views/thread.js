@@ -301,6 +301,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       h('section', {}, kicker('Workspace'),
         h('dl', { class: 'facts' },
           t.task_kind ? [h('dt', {}, 'Kind'), h('dd', {}, (S.taskKinds.find((k) => k.id === t.task_kind) || {}).label || t.task_kind)] : null,
+          t.repo_id && t.repo ? [h('dt', {}, 'Repository'), h('dd', { class: 'mono' }, t.repo.name || t.repo.id)] : null,
           t.branch ? [h('dt', {}, 'Branch'), h('dd', { class: 'mono' }, t.branch)] : null,
           t.base_branch ? [h('dt', {}, 'Into'), h('dd', { class: 'mono' }, t.base_branch)] : null,
           t.workspace_path || t.kind === 'chat' ? [h('dt', {}, 'Folder'), h('dd', {}, t.workspace_path ? copyable(t.workspace_path) : h('span', { class: 'faint' }, 'Its own, made with the first message'),

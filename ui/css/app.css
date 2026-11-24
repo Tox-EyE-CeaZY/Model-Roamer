@@ -908,3 +908,31 @@ html.no-motion .sb-it.in, html.no-motion .sb-it.live > .ico { animation: none; }
 .av-frame.av-pick .md p, .av-frame.av-pick .md li, .av-frame.av-pick .md h1, .av-frame.av-pick .md h2, .av-frame.av-pick .md h3, .av-frame.av-pick .md pre { cursor: crosshair; }
 .av-frame.av-pick .md p:hover, .av-frame.av-pick .md li:hover, .av-frame.av-pick .md h1:hover, .av-frame.av-pick .md h2:hover, .av-frame.av-pick .md h3:hover, .av-frame.av-pick .md pre:hover { outline: 2px solid var(--accent); }
 .file-chip.ref { border-color: var(--accent); }
+
+/* a project's repositories (settings), the extra ones in the new-project dialog, and the folder check */
+.repos-list { display: grid; border: 1px solid var(--line); margin-bottom: 10px; }
+.repo-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-top: 1px solid var(--line); }
+.repo-row:first-child { border-top: 0; }
+.repo-row .row-btns { margin-top: 0; flex-wrap: nowrap; }
+.repo-ic { color: var(--accent); display: grid; place-items: center; }
+.repo-main { flex: 1; min-width: 0; display: grid; gap: 2px; }
+.repo-main b { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.repo-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag.hot { color: var(--hot); border-color: color-mix(in oklch, var(--hot) 50%, transparent); }
+.repo-add { display: grid; gap: 10px; padding: 12px; border: 1px dashed var(--line2); }
+.f-err { color: var(--hot); font-size: 12px; margin: 0; }
+.f-err:empty { display: none; }
+.fcheck { display: flex; align-items: center; gap: 6px; }
+.fcheck:empty { display: none; }
+.fcheck.ok { color: var(--accent); }
+.fcheck.bad { color: var(--hot); }
+.np-more { display: grid; gap: 8px; }
+.np-more > .f-l small { text-transform: none; letter-spacing: 0; font-family: var(--f-display); font-weight: 400; }
+.np-extra { display: flex; align-items: flex-start; gap: 8px; }
+.np-extra .np-x-ic { color: var(--dim); padding-top: 9px; }
+.np-extra .grow { min-width: 0; }
+.p-body > .repo-bar { margin: var(--gut) var(--gut) 0; display: flex; align-items: center; gap: 10px; }
+.p-body > .repo-bar + .git-grid { margin-top: 12px; }
+.repo-bar .sel, .fl-bar .sel { width: auto; max-width: 30ch; padding-top: 5px; padding-bottom: 5px; flex: 0 0 auto; }
+.p-sub .chipbtn { white-space: nowrap; flex: 0 0 auto; }
+.tc-repo { display: inline-flex; align-items: center; gap: 3px; color: var(--accent); max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

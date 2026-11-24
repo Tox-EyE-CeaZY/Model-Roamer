@@ -10,6 +10,9 @@ Status: Stage 1a design, 2026-11-24. Code lives in `src/collab.rs`, migration 11
 - Each **collaborator** runs their own Model Roamer (Windows or Linux) and joins one host project with a
   **per-person invite link**. Their agents run on their own machine, under their own Claude / Codex / Antigravity
   logins. Logins and API keys never cross machines.
+- **Terms of service:** every agent runs only on its own user's account, with prompts that user wrote or approved.
+  The host never runs a collaborator's thread (`collab::runs_here`, checked in `runner::runnable`), and nothing a
+  collaborator sends is injected into the owner's agents: it is a visible message the owner's permissions allowed.
 - Two Model Roamers talk **server to server**: the guest's app calls the host's API with its member token. The
   guest's browser windows only ever talk to their own local app, which proxies. The host token never reaches a
   browser, a cookie or an agent's environment.
@@ -28,7 +31,7 @@ Host side (migration 11):
 | table | what |
 |---|---|
 | `collab_users` | a person known to this host: `id` (usr_…), `name`, `instance_id` of their app, `created_at`, `revoked_at` |
-| `collab_members` | that person's membership of one project: `role`, `perms` overrides, `token_hash`, `last_seen`, `last_ip`, `revoked_at` |
+| `collab_members` | that person's membership of one project: `role`, `perms` overrides, `token_hash`, `requested_role` / `requested_at` (a role they asked for), `last_seen`, `last_ip`, `revoked_at` |
 | `collab_invites` | one per person: `project_id`, `name`, `role`, `perms`, `secret_hash`, `expires_at`, `used_at`, `used_by`, `revoked_at` |
 | `collab_rules` | per project: what each role may do (`{ "collaborator": {perm: bool}, "viewer": {...} }`) |
 | `threads.user_id` | who runs the thread: `''` = the owner (every existing thread), else a collab user id |
@@ -38,8 +41,13 @@ role, perms, **token**, status, last error, last sync).
 
 - **The owner is implicit.** The local token and the owner's paired devices (`Who::Local`, `Who::Device`) are the
   owner. No owner row is needed, so a project with no collaborators behaves exactly as before.
-- **Roles:** `owner` (implicit, everything), `collaborator`, `viewer`. Role sets the defaults; the owner can
-  override single permissions per person.
+- **Roles:** `owner` (implicit, everything), `collaborator`, `operator`, `viewer`. Role sets the defaults; the
+  owner can override single permissions per person.
+- **Operator:** a collaborator the owner trusts to move work around. A collaborator asks **once**
+  (`POST host/request-role {role: "operator"}`; one open request at a time, a second ask gets 409); the owner
+  approves or declines **once** in Settings › Collaborators (`PATCH members/{id} {approve_request}`). An operator has
+  `transfer_threads`: in Stage 2 they take threads over from the owner or others without per-thread approval;
+  everyone else asks per transfer. The owner can also invite someone straight in as an operator.
 - **Tokens:** one random 256-bit token per membership (so per person *and* per project: least privilege). Only its
   SHA-256 is stored on the host. The plain token is returned once, at join, and kept in the guest's DB (never sent
   to the guest's UI).
@@ -81,6 +89,7 @@ Host API for members (`/api/collab/host/*`, Bearer member token, every call perm
 | `POST threads` | `create_threads` | open a thread that **runs on the guest's machine** (`threads.user_id` = them) |
 | `POST threads/{id}/messages` | own thread, or `message_threads` / `message_lead` | post into a thread. Host threads run on the **owner's** agents, so this is its own permission |
 | `POST threads/{id}/merge` | `merge` | merge a thread's branch into the base branch |
+| `POST request-role` | | ask the owner once to become an operator |
 | `POST leave` | | revoke own membership |
 | `POST presence`, `POST mcp`, `POST threads/{id}/transfer` | | named extension points (501 until their stage) |
 
@@ -118,17 +127,18 @@ error after 20 s so the agent can carry on with local work.
 
 ## 6. Permissions the owner sets (Settings › Collaborators › Rules)
 
-| permission | collaborator default | viewer default | meaning |
-|---|---|---|---|
-| `view_threads` | yes | yes | see the project's shared threads (lead and workers) and their history |
-| `view_others_chats` | no | no | see other people's per-person chats (Stage 1c) |
-| `create_threads` | yes | no | open threads of their own (they run on their machine) |
-| `message_threads` | no | no | post into threads run by the owner's agents (uses the owner's plan) |
-| `message_lead` | no | no | talk to the owner's project lead (wakes it, uses the owner's plan) |
-| `edit_memory` | yes | no | write project memory |
-| `read_global_memory` | no | no | read the owner's global memory (it spans all the owner's projects) |
-| `publish_artifacts` | yes | no | publish artifacts into the project |
-| `merge` | no | no | merge threads into the base branch |
+| permission | collaborator | operator | viewer | meaning |
+|---|---|---|---|---|
+| `view_threads` | yes | yes | yes | see the project's shared threads (lead and workers) and their history |
+| `view_others_chats` | no | no | no | see other people's per-person chats (Stage 1c) |
+| `create_threads` | yes | yes | no | open threads of their own (they run on their machine) |
+| `message_threads` | no | no | no | post into threads run by the owner's agents (uses the owner's plan) |
+| `message_lead` | no | no | no | talk to the owner's project lead (wakes it, uses the owner's plan) |
+| `edit_memory` | yes | yes | no | write project memory |
+| `read_global_memory` | no | no | no | read the owner's global memory (it spans all the owner's projects) |
+| `publish_artifacts` | yes | yes | no | publish artifacts into the project |
+| `merge` | no | no | no | merge threads into the base branch |
+| `transfer_threads` | no | yes | no | take threads over from the owner or others without asking each time (Stage 2) |
 
 Always owner-only: inviting, rules, project settings, repositories, deleting anything, agent and machine settings,
 terminals, files outside the project. Effective permissions = built-in role defaults ← project rules for that role ←
@@ -170,13 +180,20 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
   member; `view_others_chats` gates the others.
 - **1d presence:** `POST host/presence {thread, doing, files}` keeps an in-memory map with a 90 s TTL (`collab::Presence`);
   the digest and the lead's prompt list who is working on what; claims (`claims` table) already stop file overlap.
-- **Runner gate:** `collab::runs_here(thread)` is false for threads with a `user_id`. The host runner must call it
-  in `runnable()` so a guest's thread is never run on the owner's accounts (one-line hook in `runner.rs`).
+- **Runner gate (done in 1a):** `collab::runs_here(thread)` is false for threads with a `user_id`, and
+  `runner::runnable` checks it, so a guest's thread is never run on the owner's accounts, even if the owner writes to
+  it. Members' messages only wake threads this machine runs.
+- **Conflict notices (planned, `collab::conflict_notice`):** when someone is about to work on something another
+  person's thread is already doing (from presence and file claims), the project chat tells them (owner,
+  collaborators and operators alike) and offers to send that thread a note. The note is a request: the thread's
+  owner approves it, and it then arrives as a plain, visible message in the owner's own session. Never automatic
+  injection into anyone's agent.
 - **Stage 2 thread transfer:** the thread's branch is pushed to the shared GitHub repo by its current runner;
   `POST host/threads/{id}/transfer {to}` flips `threads.user_id` after the push; the new holder fetches the branch,
   makes a worktree, and starts from a digest (title, instructions, criteria, last messages, a summary) instead of the
-  full history, which stays readable through paged `read_thread`. Agents ask with a `request_transfer` tool, which
-  becomes a decision for the current holder.
+  full history, which stays readable through paged `read_thread`. Members with `transfer_threads` (operators) take
+  a thread at once; anyone else's request (or an agent's `request_transfer` tool call) becomes a decision for the
+  current holder. The new holder's agents start on prompts that holder approved.
 - **Stage 3 universal chat and operator:** a project `group` thread on the host that every member sees (each message
   carries `user_id`); `collab_rules.operator` names the operator (a user's local agent or an API agent with their own
   key). `@operator` routes to that user's runner via the bridge with the group digest; `POST host/threads/{id}/claim`

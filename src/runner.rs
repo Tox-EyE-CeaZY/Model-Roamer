@@ -540,7 +540,7 @@ pub fn workspace_of(core: &CoreRef, t: &Value) -> Option<PathBuf> {
     }
 }
 
-async fn prepare_workspace(core: &CoreRef, t: &Value, project: Option<&Value>) -> Result<PathBuf> {
+pub(crate) async fn prepare_workspace(core: &CoreRef, t: &Value, project: Option<&Value>) -> Result<PathBuf> {
     let id = t["id"].as_str().unwrap_or("");
     if let Some(p) = project {
         ensure_project_folder(core, p).await?;

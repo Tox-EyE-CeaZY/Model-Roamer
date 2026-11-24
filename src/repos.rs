@@ -398,4 +398,115 @@ mod tests {
         assert!(same_url("https://github.com/A/B.git", "git@github.com:a/b"));
         assert!(!same_url("", ""));
     }
+
+    async fn git_ok(dir: &std::path::Path, args: &[&str]) -> String {
+        let o = git::run_in(dir, args, None, 60).await.unwrap();
+        assert!(o.ok(), "git {args:?}: {}", o.text());
+        o.stdout.trim().to_string()
+    }
+
+    async fn make_repo(dir: &std::path::Path, file: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        git_ok(dir, &["init", "-b", "main"]).await;
+        git::ensure_identity(dir, "T", "t@t").await;
+        std::fs::write(dir.join(file), "x\n").unwrap();
+        git::commit_all(dir, "first").await.unwrap();
+    }
+
+    fn worker(core: &CoreRef, pid: &str, rid: &str, title: &str) -> Value {
+        let id = util::id("th");
+        let now = util::now_ms();
+        core.db
+            .exec(
+                "INSERT INTO threads(id, project_id, kind, title, agent, status, workspace, repo_id, created_at, updated_at) VALUES (?1, ?2, 'worker', ?3, 'claude', 'idle', 'mode:worktree', ?4, ?5, ?5)",
+                &[&id, &pid, &title, &rid, &now],
+            )
+            .unwrap();
+        core.thread(&id).unwrap()
+    }
+
+    /// A project with its own repository, a second git folder, a plain folder and a cloned repository: each thread
+    /// works (and merges) in the one it names, and the checks refuse what they should.
+    #[tokio::test]
+    async fn several_repositories() {
+        let root = std::env::temp_dir().join(format!("mr-repos-{}", util::rand_str(6)));
+        let (a, b, c, d) = (root.join("a"), root.join("b"), root.join("c"), root.join("d"));
+        make_repo(&a, "a.txt").await;
+        make_repo(&b, "b.txt").await;
+        make_repo(&d, "d.txt").await;
+        std::fs::create_dir_all(&c).unwrap();
+        let core = crate::core::Core::open(root.join("data"), true).unwrap();
+        let pid = util::id("prj");
+        let now = util::now_ms();
+        let af = a.display().to_string();
+        core.db.exec("INSERT INTO projects(id, name, folder, base_branch, created_at, updated_at) VALUES (?1, 'P', ?2, 'main', ?3, ?3)", &[&pid, &af, &now]).unwrap();
+        let p = core.project(&pid).unwrap();
+
+        // an older project: just the primary, and threads default to it
+        assert_eq!(list(&core, &p).unwrap().len(), 1);
+        assert_eq!(resolve(&core, &pid, "").unwrap(), "");
+
+        let rb = insert(&core, &pid, &check_new(&core, &json!({ "folder": b.display().to_string() }), &list(&core, &p).unwrap()).await.unwrap()).unwrap();
+        let rc = insert(&core, &pid, &check_new(&core, &json!({ "folder": format!("{}{}", c.display(), std::path::MAIN_SEPARATOR) }), &list(&core, &p).unwrap()).await.unwrap()).unwrap();
+        assert_eq!(rb["base_branch"], "main");
+        assert_eq!(rc["kind"], "folder");
+        let (bid, cid) = (s(&rb, "id"), s(&rc, "id"));
+
+        // the checks
+        let taken = list(&core, &p).unwrap();
+        assert!(check_new(&core, &json!({ "folder": b.display().to_string() }), &taken).await.unwrap_err().to_string().contains("already"));
+        assert!(check_new(&core, &json!({ "folder": "relative/path" }), &taken).await.unwrap_err().to_string().contains("full path"));
+        assert!(check_new(&core, &json!({ "folder": root.join("nope").display().to_string() }), &taken).await.unwrap_err().to_string().contains("doesn't exist"));
+        assert!(check_new(&core, &json!({ "folder": root.join("data").join("x").display().to_string(), "create_folder": true }), &taken).await.unwrap_err().to_string().contains("data folder"));
+        assert!(check_new(&core, &json!({ "url": "not a url" }), &taken).await.is_err());
+        assert!(check_new(&core, &json!({}), &taken).await.is_err());
+        assert_eq!(check_new(&core, &json!({ "url": "you/thing" }), &taken).await.unwrap()["url"], "https://github.com/you/thing.git");
+
+        // a repository Model Roamer clones (from a file:// address here, so no network)
+        let url = format!("file:///{}", d.display().to_string().replace('\\', "/").trim_start_matches('/'));
+        let rd = check_new(&core, &json!({ "url": url, "name": "dee" }), &taken).await.unwrap();
+        let did = util::id("repo");
+        core.db.exec("INSERT INTO repos(id, project_id, name, kind, url, created_at, updated_at) VALUES (?1, ?2, 'dee', 'github', ?3, ?4, ?4)", &[&did, &pid, &s(&rd, "url"), &now]).unwrap();
+        assert_eq!(resolve(&core, &pid, "DEE").unwrap(), did);
+        assert!(resolve(&core, &pid, "nothing").is_err());
+
+        let ta = worker(&core, &pid, "", "on a");
+        let tb = worker(&core, &pid, &bid, "on b");
+        let tc = worker(&core, &pid, &cid, "on c");
+        let td = worker(&core, &pid, &did, "on d");
+        let mut ws = vec![];
+        for t in [&ta, &tb, &tc, &td] {
+            let view = for_thread(&core, t).unwrap();
+            ws.push(crate::runner::prepare_workspace(&core, t, Some(&view)).await.unwrap());
+        }
+        // a and b: worktrees of their own repository; c: the plain folder itself; d: a worktree of the fresh clone
+        assert!(ws[0].join("a.txt").exists() && !ws[0].join("b.txt").exists());
+        assert!(ws[1].join("b.txt").exists() && !ws[1].join("a.txt").exists());
+        assert_eq!(same_key(&git_ok(&ws[1], &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await), same_key(&b.join(".git").display().to_string()));
+        assert_eq!(same_key(&ws[2].display().to_string()), same_key(&c.display().to_string()));
+        assert!(ws[3].join("d.txt").exists());
+        assert!(core.db.one("SELECT folder FROM repos WHERE id = ?1", &[&did]).unwrap().unwrap()["folder"].as_str().unwrap().ends_with(&did));
+
+        // merging b's thread lands in b, not a
+        std::fs::write(ws[1].join("new.txt"), "hi\n").unwrap();
+        let tb = core.thread(tb["id"].as_str().unwrap()).unwrap();
+        crate::runner::merge(&core, &tb, "merge b", false).await.unwrap();
+        assert!(b.join("new.txt").exists() && !a.join("new.txt").exists());
+
+        // removing a repository with open threads is refused; with none, it goes and Undo brings it back
+        let r = delete_api(State(core.clone()), Path((pid.clone(), cid.clone()))).await;
+        assert!(r.is_err());
+        core.db.exec("UPDATE threads SET resolved = 1 WHERE id = ?1", &[&tc["id"].as_str().unwrap()]).unwrap();
+        assert!(delete_api(State(core.clone()), Path((pid.clone(), cid.clone()))).await.is_ok());
+        assert_eq!(list(&core, &p).unwrap().len(), 3);
+        assert!(for_thread(&core, &tc).is_ok(), "a removed repository's threads still resolve");
+        assert!(restore_api(State(core.clone()), Path((pid.clone(), cid.clone()))).await.is_ok());
+        assert_eq!(list(&core, &p).unwrap().len(), 4);
+        assert!(delete_api(State(core.clone()), Path((pid.clone(), PRIMARY.to_string()))).await.is_err());
+
+        for t in [&ta, &tb, &td] {
+            crate::runner::cleanup_worktree(&core, &core.thread(t["id"].as_str().unwrap()).unwrap()).await;
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

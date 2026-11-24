@@ -67,7 +67,7 @@ pub fn router(core: CoreRef) -> Router {
         // this machine as a guest
         .route("/api/collab/links", get(list_links).post(add_link))
         .route("/api/collab/links/{id}", delete(remove_link))
-        .route("/api/collab/links/{id}/agent-threads/{thread}", post(crate::collab_bridge::bind).delete(crate::collab_bridge::unbind))
+        .route("/api/collab/links/{id}/agent-threads/{thread}", post(crate::collab_bridge::bind_api).delete(crate::collab_bridge::unbind))
         .route("/api/collab/links/{id}/host/{*path}", any(proxy))
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(core.clone(), server::auth))

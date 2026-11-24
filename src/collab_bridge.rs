@@ -80,7 +80,22 @@ pub(crate) fn bind_row(core: &Core, thread: &Value) -> Result<Option<Value>> {
     )?)
 }
 
-pub(crate) async fn bind(
+/// Record the mapping after the caller has verified the link and host thread ownership.
+pub(crate) fn bind(
+    core: &Core,
+    thread_id: &str,
+    link_id: &str,
+    host_thread_id: Option<&str>,
+) -> Result<()> {
+    core.db.exec(
+        "INSERT INTO collab_agent_threads(thread_id, link_id, host_thread_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT(thread_id) DO UPDATE SET link_id = excluded.link_id, host_thread_id = excluded.host_thread_id",
+        &[&thread_id, &link_id, &host_thread_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) async fn bind_api(
     State(core): State<CoreRef>,
     Extension(_who): Extension<Who>,
     Path((link, local)): Path<(String, String)>,
@@ -92,11 +107,7 @@ pub(crate) async fn bind(
     }
     let remote = b["host_thread_id"].as_str().filter(|id| !id.is_empty());
     forward(&core, &link, "check_binding", remote, &json!({})).await?;
-    core.db.exec(
-        "INSERT INTO collab_agent_threads(thread_id, link_id, host_thread_id) VALUES (?1, ?2, ?3)
-         ON CONFLICT(thread_id) DO UPDATE SET link_id = excluded.link_id, host_thread_id = excluded.host_thread_id",
-        &[&local, &link, &remote],
-    )?;
+    bind(&core, &local, &link, remote)?;
     Ok(Json(
         json!({ "thread_id": local, "link_id": link, "host_thread_id": remote }),
     ))

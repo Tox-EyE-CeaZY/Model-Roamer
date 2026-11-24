@@ -151,7 +151,7 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
 | global memory | owner's host (`memory.project_id IS NULL`) | owner; members only with `read_global_memory`. A guest's own global memory stays on the guest's machine |
 | project memory | host | every member; written with `edit_memory` |
 | collaborator memory | host, `memory.user_id` (Stage 1b) | only that person (and their agents); the owner can see it exists, not read it, unless shared |
-| per-person project chat | host, a `chat` thread with `user_id` (Stage 1c) | that person; others with `view_others_chats` |
+| per-person project chat | the person's own machine (a local `lead` thread); the host keeps a `chat` row with `user_id` and copies its messages only while someone else may read it (§10) | that person; the owner with the Project chats switch; members with `view_others_chats` |
 | shared threads | host `threads` (`user_id` says whose agents run it) | members with `view_threads` |
 | artifacts | host files + signed URLs | members; publish with `publish_artifacts` |
 
@@ -176,8 +176,8 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
 
 - **1b collaborator memory:** `memory.user_id` column + unique index on `(project, user, name)`; `collab::memory_scope`
   picks the scope for a member; the `write_memory` tool gains `scope: "me"`. Bridge `host/mcp` goes live.
-- **1c per-person project chats:** `collab::personal_chat` makes or finds the `chat` thread with `user_id` for a
-  member; `view_others_chats` gates the others.
+- **1c per-person project chats (built, §10):** `collab::personal_chat` makes or finds the `chat` thread with
+  `user_id` for a member; `view_others_chats` gates the others; `collab_chat.rs` runs it on the member's machine.
 - **1d presence:** `POST host/presence {thread, doing, files}` keeps an in-memory map with a 90 s TTL (`collab::Presence`);
   the digest and the lead's prompt list who is working on what; claims (`claims` table) already stop file overlap.
 - **Runner gate (done in 1a):** `collab::runs_here(thread)` is false for threads with a `user_id`, and
@@ -199,3 +199,61 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
   key). `@operator` routes to that user's runner via the bridge with the group digest; `POST host/threads/{id}/claim`
   sets `user_id` so only the claimer's agents pick it up; the operator posts the hand-off into the claimer's
   personal chat.
+
+## 10. Per-person project chats and the guest's threads (Stage 1c)
+
+Code: `src/collab_chat.rs` (+ `prompts/collab.md`, `ui/js/views/collab_chat.js`). Every person in a project talks to
+**their own lead** in **their own project chat**. The owner's is the project's lead thread, as before. A
+collaborator's runs on their own machine, with their own agents, and is private by default.
+
+**One id on both machines.** On the guest, each joined project (a `collab_links` row) has a *local project* whose id
+is the link's id (`lnk_…`), so `collab_chat::link_of(project_id)` tells a joined project from an own one. Every
+thread in it has the same id as its row on the host:
+
+| guest (local) | host | runs on |
+|---|---|---|
+| the person's chat: `kind = lead` | `kind = chat`, `user_id` = member (`personal_chat`) | guest |
+| threads the person or their lead opens: `worker` / `review` | same kind, `user_id` = member, `parent_id` = their chat | guest |
+| the owner's and others' threads | rows as they are | their owners' machines |
+
+The local project carries the host project's name, instructions, repository URL and base branch, so worktrees,
+merges and the runner work unchanged. A joined project shows in the guest's project list; opening it shows the
+joined view with **Your chat** first (in place of the owner's), then Threads, Memory, Artifacts and People.
+
+**Sync, guest → host** (`collab_chat::run`, `push`): after local changes in a joined project (bus events, batched
+over ~1 s, plus a sweep every 5 minutes), the guest's app calls `POST host/sync` with its threads' state and the
+messages the host doesn't have yet (`upto` per thread, from the last answer; at most 200 messages a call, then it
+loops). The host upserts only the member's own threads (new ones need `create_threads`), inserts messages by id
+(never twice), attributes "You" to the member's name and **never wakes an agent**. Offline: retried 5 s → 120 s.
+
+**Context, host → guest** (`collab_chat::before_turn`): before each turn in a joined project the guest's app fetches
+`GET host/context` (8 s timeout; the last snapshot is used when the host can't be reached): people and roles, up to
+60 open and 8 recently finished threads (title, owner, agent, status, a 140-character note), the memory index,
+20 recent artifacts and the files claimed. No message bodies. The lead's instructions get it as the "A collaborative
+project you joined" section; each lead turn starts with a `<project-update>` listing only what changed since its
+last turn (threads that changed status, memory added or updated, artifacts, people who joined).
+
+**Private by default.** A person's chat messages leave their machine only while someone else may read them: the
+owner, with Settings › Collaborators › Project chats (`collab_rules.rules.chats.owner`), or a member with
+`view_others_chats`. Then the guest backfills the chat; when that stops, the host deletes its copy on the next sync.
+The host always keeps the chat's row (status), and the guest's chat bar says who can read it. Without the switch the
+owner's own windows and agents don't list or open collaborators' chats (`hidden_from_owner`).
+
+**Prompts.** `prompts/collab.md` holds the collaborative section for the owner's lead (`@host`: the people, their
+open threads, that threads belong to people, where each memory scope lives) and for a guest's lead (`@guest`: whose
+project, their role and permissions, others' threads not to duplicate, memory scopes, the project picture). Workers
+get two lines and the thread list. On the host, lead tools that act on a thread (`send_message`, `reassign_thread`,
+`merge_result`…) refuse a collaborator's thread (`collab_chat::guard_tool`); reading it is fine.
+
+| route | who | what |
+|---|---|---|
+| `GET host/chat` | member | find or make their chat; the project, their perms, who may read it |
+| `POST host/sync` | member | `{threads: [...], messages: [...]}` → `{chat_id, share_chat, upto, errors, perms, role}` |
+| `GET host/context` | member | the compact project picture above |
+| `GET/PATCH /api/collab/projects/{pid}/chats` | owner | each person's chat and who may read it; `{owner: bool}` |
+| `POST /api/collab/links/{id}/chat` | guest | make sure the joined project's local side exists; works offline once made |
+
+Hooks for later stages: `collab_chat::deliver_local(thread, author, text, meta)` posts a visible message into a
+guest's local thread (1d's approved notes); 1d can add claims to the sync body and presence lines to `digest()`.
+Not in 1c: thread transfer (Stage 2), presence and conflict notices (1d), the agent tool bridge (1b, so a guest's
+`read_memory` reads the host's project memory).

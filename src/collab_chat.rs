@@ -308,7 +308,12 @@ async fn h_context(State(core): State<CoreRef>, Extension(m): Extension<Member>)
     let memory: Vec<Value> = crate::memory::list(&core, Some(m.project_id.as_str()))?
         .into_iter()
         .filter(|r| global || !r["project_id"].is_null())
-        .map(|r| json!({ "name": r["name"], "description": util::clip(r["description"].as_str().unwrap_or(""), 140), "global": r["project_id"].is_null(), "updated_by": r["updated_by"], "updated_at": r["updated_at"] }))
+        .map(|r| {
+            // "You" is the owner, as their own windows say it
+            let by = s(&r, "updated_by");
+            let by = if by == "You" || by.starts_with("You (") { format!("{} (owner)", core.display_name()) } else { by };
+            json!({ "name": r["name"], "description": util::clip(r["description"].as_str().unwrap_or(""), 140), "global": r["project_id"].is_null(), "updated_by": by, "updated_at": r["updated_at"] })
+        })
         .collect();
     let artifacts = core.db.all("SELECT id, title, kind, updated_at FROM artifacts WHERE project_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 20", &[&m.project_id])?;
     let claims: Vec<Value> = core
@@ -616,6 +621,24 @@ pub async fn push(core: &CoreRef, link_id: &str) -> Result<bool> {
     Ok(more || (!was_shared && r["share_chat"] == true))
 }
 
+/// A local change in a joined project marks it for pushing; leaving one takes its local side away.
+fn on_event(core: &CoreRef, ev: &crate::bus::Event) {
+    if matches!(ev.kind.as_str(), "message" | "thread") {
+        if let Some(p) = ev.project.as_deref().filter(|p| p.starts_with("lnk_")) {
+            mark_dirty(p);
+        }
+    }
+    if ev.kind == "collab-links" {
+        if let Some(id) = ev.data["id"].as_str() {
+            if core.db.one("SELECT id FROM collab_links WHERE id = ?1", &[&id]).ok().flatten().is_none() {
+                if core.db.exec("UPDATE projects SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL", &[&util::now_ms(), &id]).unwrap_or(0) > 0 {
+                    core.bus.emit("project", Some(id), None, json!({ "id": id, "deleted": true }));
+                }
+            }
+        }
+    }
+}
+
 /// The guest's sync loop: local changes in joined projects go up to their hosts a moment later (batched), and every
 /// few minutes anyway (so a rule the owner changed is noticed). Offline hosts are retried with a growing pause.
 pub async fn run(core: CoreRef) {
@@ -630,27 +653,11 @@ pub async fn run(core: CoreRef) {
         let ev = tokio::time::timeout(Duration::from_secs(if has { 2 } else { 30 }), rx.recv()).await;
         match ev {
             Ok(Ok(ev)) => {
-                if matches!(ev.kind.as_str(), "message" | "thread") {
-                    if let Some(p) = ev.project.as_deref().filter(|p| p.starts_with("lnk_")) {
-                        mark_dirty(p);
-                    }
-                }
-                if ev.kind == "collab-links" {
-                    // a leave: the local side goes with it
-                    if let Some(id) = ev.data["id"].as_str() {
-                        if core.db.one("SELECT id FROM collab_links WHERE id = ?1", &[&id]).ok().flatten().is_none() {
-                            let _ = core.db.exec("UPDATE projects SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL", &[&util::now_ms(), &id]);
-                        }
-                    }
-                }
+                on_event(&core, &ev);
                 // let a burst land before pushing
                 tokio::time::sleep(Duration::from_millis(1200)).await;
                 while let Ok(ev) = rx.try_recv() {
-                    if matches!(ev.kind.as_str(), "message" | "thread") {
-                        if let Some(p) = ev.project.as_deref().filter(|p| p.starts_with("lnk_")) {
-                            mark_dirty(p);
-                        }
-                    }
+                    on_event(&core, &ev);
                 }
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {

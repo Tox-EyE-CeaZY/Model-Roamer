@@ -11,8 +11,24 @@ import { dialog, toast, showMenu } from '../ui.js';
 import { mountThread, decisionCard } from './thread.js';
 import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, folderInput, askLine, repoSelect, repoLabel, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 import { needsYou, isFinished } from '../attention.js';
+import { scrollStrip } from '../scrollstrip.js';
 
 const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
+const PANE_KEY = (id) => 'mr-proj-pane-' + id;
+
+function savedPane(id) {
+  try {
+    const v = localStorage.getItem(PANE_KEY(id));
+    if (v === 'lead' || v === 'threads') return v;
+  } catch { /* private window */ }
+  return 'lead';
+}
+
+function rememberPane(id, pane) {
+  try {
+    localStorage.setItem(PANE_KEY(id), pane);
+  } catch { /* private window */ }
+}
 
 export default async function projectView(el, r, ctx) {
   let p;
@@ -29,8 +45,76 @@ export default async function projectView(el, r, ctx) {
   el.append(headEl, body);
   el.style.setProperty('--ph', p.color);
 
+  let mobilePane = savedPane(p.id);
+  let onPaneChange = null;
+  let threadBadgeState = null;
+  let tabStrip = null;
+  let leadTabEl = null;
+  let threadsTabEl = null;
+  let threadsBadgeHost = null;
+
+  function renderThreadBadge() {
+    if (!threadsBadgeHost) return;
+    const sp = projectOf(p.id);
+    const needsYou = threadBadgeState ? threadBadgeState.needsYou : (p.decisions?.length ?? sp?.decisions ?? 0);
+    const unread = threadBadgeState ? threadBadgeState.unread : (sp?.unread ?? 0);
+    const extraUnread = threadBadgeState ? threadBadgeState.extraUnread : 0;
+    const nodes = [];
+    if (needsYou > 0) {
+      nodes.push(h('b', {
+        class: 'p-tab-badge hot',
+        title: `${needsYou} need you` + (unread ? ` · ${unread} unread` : ''),
+      }, needsYou));
+      if (extraUnread > 0) nodes.push(h('i', { class: 'p-tab-dot', title: `${unread} unread` }));
+    } else if (unread > 0) {
+      nodes.push(h('b', { class: 'p-tab-badge acc', title: `${unread} unread` }, unread));
+    }
+    threadsBadgeHost.replaceChildren(...nodes);
+    tabStrip?.update();
+  }
+
+  function syncMobileTabHighlight() {
+    leadTabEl?.classList.toggle('on', tab === '' && mobilePane === 'lead');
+    threadsTabEl?.classList.toggle('on', tab === '' && mobilePane === 'threads');
+    tabStrip?.update();
+  }
+
+  function pickMobilePane(next, e) {
+    mobilePane = next;
+    rememberPane(p.id, next);
+    if (tab === '' && onPaneChange) {
+      e?.preventDefault();
+      syncMobileTabHighlight();
+      onPaneChange(next);
+      tabStrip?.revealActive({ smooth: true });
+    }
+  }
+
   function drawHead() {
+    tabStrip?.destroy();
     const where = p.repo_url ? p.repo_url.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '') : p.folder || 'Kept by Model Roamer';
+    threadsBadgeHost = h('span', { class: 'p-tab-badges' });
+    leadTabEl = h('a', {
+      class: 'p-tab p-tab-mob' + (tab === '' && mobilePane === 'lead' ? ' on' : ''),
+      href: '#/p/' + p.id,
+      onclick: (e) => pickMobilePane('lead', e),
+    }, ic('chat', 14), 'Lead');
+    threadsTabEl = h('a', {
+      class: 'p-tab p-tab-mob' + (tab === '' && mobilePane === 'threads' ? ' on' : ''),
+      href: '#/p/' + p.id,
+      onclick: (e) => pickMobilePane('threads', e),
+    }, ic('board', 14), 'Threads', threadsBadgeHost);
+
+    const nav = h('nav', { class: 'p-tabs', 'aria-label': 'Project sections' },
+      leadTabEl,
+      threadsTabEl,
+      ...TABS.map(([k, label, ico]) => h('a', {
+        class: 'p-tab' + (k === '' ? ' p-tab-desk' : '') + (k === tab ? ' on' : ''),
+        href: '#/p/' + p.id + (k ? '/' + k : ''),
+      }, ic(ico, 14), label)));
+
+    tabStrip = scrollStrip(nav);
+
     headEl.replaceChildren(
       h('div', { class: 'p-title' },
         h('i', { class: 'p-sw' }),
@@ -38,19 +122,21 @@ export default async function projectView(el, r, ctx) {
         h('span', { class: 'p-sub mono', title: p.home }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', {}, where), p.base_branch ? [h('span', { class: 'faint' }, '·'), h('span', {}, p.base_branch)] : null,
           p.repos?.length > 1 ? h('a', { class: 'chipbtn', href: '#/p/' + p.id + '/settings', title: p.repos.map(repoLabel).join(', ') }, `+${p.repos.length - 1} more`) : null),
         h('span', { class: 'grow' }),
-        h('button', { class: 'btn primary sm', onclick: () => newThreadDialog(p.id) }, ic('plus', 13), 'New thread'),
-        h('button', { class: 'ibtn', title: 'More', onclick: (e) => {
-          const b = e.currentTarget.getBoundingClientRect();
-          showMenu([
-            { label: 'New thread…', icon: 'plus', run: () => newThreadDialog(p.id) },
-            { label: 'Pop the project chat out', icon: 'popout', run: () => popOut('#/t/' + p.lead.id, { key: 't:' + p.lead.id }) },
-            p.home && S.me.local ? { label: 'Show the folder', icon: 'folder', run: () => post('fs/reveal', { path: p.home }) } : null,
-            p.repo_url ? { label: 'Open on GitHub', icon: 'external', run: () => openExternal(p.repo_url.replace(/\.git$/, '')) } : null,
-            { sep: true },
-            { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
-          ], b.right, b.bottom + 4, { anchor: e.currentTarget });
-        }, html: icon('more', 16) })),
-      h('nav', { class: 'p-tabs' }, TABS.map(([k, label, ico]) => h('a', { class: 'p-tab' + (k === tab ? ' on' : ''), href: '#/p/' + p.id + (k ? '/' + k : '') }, ic(ico, 14), label))));
+        h('div', { class: 'p-acts' },
+          h('button', { class: 'btn primary sm', title: 'New thread', 'aria-label': 'New thread', onclick: () => newThreadDialog(p.id) }, ic('plus', 13), h('span', { class: 'p-new-lbl' }, 'New thread')),
+          h('button', { class: 'ibtn', title: 'More', 'aria-label': 'More project actions', onclick: (e) => {
+            const b = e.currentTarget.getBoundingClientRect();
+            showMenu([
+              { label: 'New thread…', icon: 'plus', run: () => newThreadDialog(p.id) },
+              { label: 'Pop the project chat out', icon: 'popout', run: () => popOut('#/t/' + p.lead.id, { key: 't:' + p.lead.id }) },
+              p.home && S.me.local ? { label: 'Show the folder', icon: 'folder', run: () => post('fs/reveal', { path: p.home }) } : null,
+              p.repo_url ? { label: 'Open on GitHub', icon: 'external', run: () => openExternal(p.repo_url.replace(/\.git$/, '')) } : null,
+              { sep: true },
+              { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
+            ], b.right, b.bottom + 4, { anchor: e.currentTarget });
+          }, html: icon('more', 16) }))),
+      tabStrip.el);
+    renderThreadBadge();
   }
   drawHead();
 
@@ -61,14 +147,26 @@ export default async function projectView(el, r, ctx) {
     }
     if (ev.kind === 'repos' && ev.project === p.id) get(`projects/${p.id}/repos`).then((l) => ((p.repos = l), drawHead())).catch(() => {});
   });
+  const unwatch = watch((w) => {
+    if (w === 'projects' || w === 'all') renderThreadBadge();
+  });
   let inner = null;
-  if (tab === '') inner = await board(body, p, r, ctx);
+  if (tab === '') {
+    inner = await board(body, p, r, ctx, {
+      getPane: () => mobilePane,
+      onPane: (fn) => (onPaneChange = fn),
+      onBadge: (info) => {
+        threadBadgeState = info;
+        renderThreadBadge();
+      },
+    });
+  }
   else if (tab === 'files') inner = await (await import('./files.js')).default(body, p, r);
   else if (tab === 'git') inner = await gitTab(body, p, r.q?.repo || '');
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'settings') inner = await settingsTab(body, p, (np) => ((p = { ...p, ...np }), drawHead()));
-  return () => (unlisten(), inner?.());
+  return () => (unlisten(), unwatch(), tabStrip?.destroy(), inner?.());
 }
 
 // ------------------------------------------------------------ board
@@ -80,14 +178,14 @@ const LANES = [
   ['done', 'Done', (t) => !t.running && (t.resolved || t.status === 'done')],
 ];
 
-async function board(el, p, r, ctx) {
+async function board(el, p, r, ctx, mobile = {}) {
   const leadBox = h('div', { class: 'b-lead' });
   const lanes = h('div', { class: 'b-lanes' });
   const decisions = h('div', { class: 'b-decisions' });
   const claimsEl = h('div', { class: 'b-claims' });
   const boardEl = h('div', { class: 'b-right' }, decisions, lanes, claimsEl);
   const peekEl = h('div', { class: 'b-peek', hidden: true });
-  const split = h('div', { class: 'board' }, leadBox, boardEl, peekEl);
+  const split = h('div', { class: 'board', dataset: { pane: mobile.getPane?.() || 'lead' } }, leadBox, boardEl, peekEl);
   el.append(split);
   let threads = [], doneOpen = false, finOpen = false;
   try {
@@ -187,12 +285,22 @@ async function board(el, p, r, ctx) {
     }
     const claims = p.claims || [];
     claimsEl.replaceChildren(...(claims.length ? [kicker('Claimed files', h('small', { class: 'faint' }, 'so agents stay out of each other’s way')), h('div', { class: 'claims' }, claims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent)))))] : []));
+    const attnList = threads.filter(LANES[0][2]);
+    const openDecs = p.decisions || [];
+    const extraDecs = openDecs.filter((d) => !attnList.some((t) => t.id === d.thread_id)).length;
+    const unread = threads.filter((t) => t.unread).length;
+    const extraUnread = threads.filter((t) => t.unread && !attnList.includes(t)).length;
+    mobile.onBadge?.({ needsYou: attnList.length + extraDecs, unread, extraUnread });
   }
 
   // A thread opened from the board sits beside the project chat, in place of the board; the address carries it
   // (#/p/<id>?t=<thread>), so Back closes it and Expand's full view comes back here.
   const peek = (id) => go('#/p/' + p.id + '?t=' + id);
   let peeked = null, stopPeek = null;
+  mobile.onPane?.((next) => {
+    split.dataset.pane = next;
+    if (peeked) go('#/p/' + p.id);
+  });
   async function showPeek(id) {
     if (id === peeked) return;
     stopPeek?.();

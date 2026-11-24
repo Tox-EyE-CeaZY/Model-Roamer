@@ -16,6 +16,8 @@ const SECTIONS = [
   ['windows', 'Windows', 'window'],
   ['github', 'Git and GitHub', 'branch'],
   ['remote', 'Remote access', 'wifi'],
+  ['collab', 'Collaborators', 'people'],
+  ['join', 'Join a project', 'link'],
   ['about', 'About and updates', 'info'],
 ];
 
@@ -24,7 +26,9 @@ export default async function settings(el, r) {
   const body = h('div', { class: 'set-body' });
   el.append(h('div', { class: 'page-h' }, h('div', {}, h('h1', {}, 'Settings'), h('p', { class: 'lede' }, 'Saved as you change them.'))),
     h('div', { class: 'set' }, h('nav', { class: 'set-nav' }, SECTIONS.map(([k, label, ico]) => h('a', { class: 'set-i' + (k === sec ? ' on' : ''), href: '#/settings/' + k }, ic(ico, 15), label))), body));
-  return ({ look, windows, github, remote, about })[sec](body);
+  // collaboration lives in its own module (views/collab.js), loaded only when opened
+  const collab = (fn) => (b) => import('./collab.js').then((m) => m[fn](b, r));
+  return ({ look, windows, github, remote, about, collab: collab('collaborators'), join: collab('joinProject') })[sec](body);
 }
 
 const save = (p) => setSetting(p).catch((e) => toast(e.message, { err: true }));

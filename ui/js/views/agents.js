@@ -57,14 +57,58 @@ async function agentCards(el, openId) {
     h('button', { class: 'btn', onclick: () => buddyDialog() }, ic('plus', 13), 'Add a pair'));
   drawBuddies();
   el.append(grid, buddyBox, h('div', { class: 'ag-custom' }, kicker('Your own agents'), h('p', { class: 'faint small' }, 'Any command-line agent that takes a prompt and prints an answer can join the fleet.'), h('button', { class: 'btn', onclick: () => customDialog() }, ic('plus', 13), 'Add an agent')));
-  const draw = () => grid.replaceChildren(...agentList().map((a) => card(a)));
+  let localState = 'stopped';
+  let localLoaded = false;
+  const refreshLocal = () => get('local-llm/status', { quiet: true }).then((st) => {
+    localState = st?.runtime?.state || 'stopped';
+    draw();
+  }).catch(() => {});
+  const startLocal = async () => {
+    localState = 'starting';
+    draw();
+    try {
+      const st = await post('local-llm/start', {}, { timeout: 90000 });
+      localState = st?.runtime?.state || 'running';
+      toast('Local model is running');
+    } catch (e) {
+      localState = 'error';
+      toast(e.message, { err: true, ms: 7000 });
+    }
+    draw();
+  };
+  const stopLocal = async () => {
+    try {
+      const st = await post('local-llm/stop');
+      localState = st?.runtime?.state || 'stopped';
+      toast('Local model stopped', { action: 'Undo', ms: 7000, run: startLocal });
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+    draw();
+  };
+  const localRt = () => ({ state: localState, start: startLocal, stop: stopLocal, refresh: refreshLocal });
+  const draw = () => {
+    const list = agentList();
+    if (!localLoaded && list.some((a) => a.id === 'local')) {
+      localLoaded = true;
+      refreshLocal();
+    }
+    grid.replaceChildren(...list.map((a) => card(a, a.id === 'local' ? localRt() : null)));
+  };
   draw();
   // the app checks every agent when it starts; ask only if none of that has come back (once per visit, never stacked)
   if (agentList().every((a) => a.pending) && !checkingAll) {
     checkingAll = get('agents?refresh=1', { timeout: 90000 }).catch(() => {}).finally(() => (checkingAll = null));
   }
   if (openId) setTimeout(() => document.getElementById('ag-' + openId)?.scrollIntoView({ block: 'center', behavior: 'smooth' }), 100);
-  return watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && (draw(), drawBuddies()));
+  const unw = watch((w) => (w === 'agents' || w === 'all' || w === 'settings') && (draw(), drawBuddies()));
+  const unl = listen((ev) => {
+    if (ev.kind === 'local_llm' && ev.data?.runtime?.state) {
+      localState = ev.data.runtime.state;
+      draw();
+    }
+  });
+  return () => (unw(), unl());
 }
 
 async function buddyDialog(b) {
@@ -110,9 +154,10 @@ function authOf(a) {
   return [a.auth?.detail || 'Sign-in unknown (try Test)', 'dim', 'question'];
 }
 
-function card(a) {
+function card(a, localRt = null) {
   const info = a.info || {};
   const cfg = a.config || {};
+  const isLocal = a.id === 'local';
   const [authText, authTone, authIco] = authOf(a);
   const busy = Object.keys(S.running).length;
   const lim = a.limit?.active ? a.limit : null;
@@ -121,7 +166,18 @@ function card(a) {
   const settings = h('div', { class: 'ag-settings', hidden: true });
 
   const actions = [];
-  if (!a.installed && !a.pending) {
+  if (isLocal) {
+    if (!a.installed && !a.pending) {
+      actions.push(h('button', { class: 'btn primary sm', onclick: () => go('#/settings/local-model') }, ic('cpu', 13), 'Open Local model settings'));
+    } else if (a.installed) {
+      const running = localRt?.state === 'running';
+      const starting = localRt?.state === 'starting';
+      actions.push(running
+        ? h('button', { class: 'btn sm danger', onclick: () => localRt.stop() }, ic('stop', 13), 'Stop')
+        : h('button', { class: 'btn sm', disabled: starting, onclick: () => localRt?.start() }, ic('play', 13), starting ? 'Starting…' : 'Start'));
+      actions.push(h('button', { class: 'btn sm', onclick: () => test(a, testOut) }, ic('play', 13), 'Test'));
+    }
+  } else if (!a.installed && !a.pending) {
     actions.push(h('button', { class: 'btn primary sm', onclick: (e) => (steps.length > 1 ? stepMenu(e.currentTarget, a, steps, 'install') : runStep({ what: 'install', agent: a.id, title: steps[0]?.label })) }, ic('download', 13), 'Install'));
   } else if (a.installed) {
     if (a.auth?.signed_in !== 'yes') actions.push(h('button', { class: 'btn primary sm', onclick: () => runStep({ what: 'login', agent: a.id, title: a.login?.label }) }, ic('login', 13), 'Sign in'));
@@ -129,18 +185,30 @@ function card(a) {
   }
   const more = h('button', { class: 'ibtn sm', title: 'More', onclick: (e) => {
     const r = e.currentTarget.getBoundingClientRect();
-    showMenu([
-      a.installed ? { label: 'Sign in again', icon: 'login', run: () => runStep({ what: 'login', agent: a.id, title: a.login?.label }) } : null,
-      a.installed && a.logout ? { label: 'Sign out', icon: 'logout', run: () => runStep({ what: 'logout', agent: a.id, title: a.logout?.label }) } : null,
-      a.installed ? { label: 'Update', icon: 'download', run: () => runStep({ what: 'update', agent: a.id }) } : null,
-      { label: a.installed ? 'Reinstall…' : 'Install with…', icon: 'download', sub: steps.map((s, i) => ({ label: s.label, run: () => runStep({ what: 'install', agent: a.id, step: i, title: s.label }) })) },
-      info.mcp === false ? null : { label: 'Add Model Roamer tools to its own config', icon: 'cpu', title: 'Not needed for Model Roamer itself; lets you use the tools from the CLI by hand', run: () => runStep({ what: 'connect', agent: a.id, title: 'Connect Model Roamer tools' }) },
-      { sep: true },
-      { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
-      a.installed ? { label: 'Refresh models', icon: 'refresh', title: 'Ask the CLI which models it offers now', run: () => post(`agents/${a.id}/models`, {}, { timeout: 90000 }).then((r) => toast(`${(r.info?.models || []).filter((m) => m.id).length} models from ${info.name}`)).catch((e) => toast(e.message, { err: true })) } : null,
-      info.site ? { label: 'Website', icon: 'external', run: () => openExternal(info.site) } : null,
-      a.id.match(/^(claude|codex|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
-    ], r.right, r.bottom + 4, { anchor: e.currentTarget });
+    const items = isLocal
+      ? [
+        { label: 'Open Local model settings', icon: 'cpu', run: () => go('#/settings/local-model') },
+        a.installed
+          ? localRt?.state === 'running'
+            ? { label: 'Stop local model', icon: 'stop', danger: true, run: () => localRt.stop() }
+            : { label: 'Start local model', icon: 'play', disabled: localRt?.state === 'starting', run: () => localRt?.start() }
+          : null,
+        { sep: true },
+        { label: 'Check again', icon: 'refresh', run: () => (localRt?.refresh(), get('agents/' + a.id, { timeout: 60000 }).catch((err) => toast(err.message, { err: true }))) },
+      ]
+      : [
+        a.installed ? { label: 'Sign in again', icon: 'login', run: () => runStep({ what: 'login', agent: a.id, title: a.login?.label }) } : null,
+        a.installed && a.logout ? { label: 'Sign out', icon: 'logout', run: () => runStep({ what: 'logout', agent: a.id, title: a.logout?.label }) } : null,
+        a.installed ? { label: 'Update', icon: 'download', run: () => runStep({ what: 'update', agent: a.id }) } : null,
+        { label: a.installed ? 'Reinstall…' : 'Install with…', icon: 'download', sub: steps.map((s, i) => ({ label: s.label, run: () => runStep({ what: 'install', agent: a.id, step: i, title: s.label }) })) },
+        info.mcp === false ? null : { label: 'Add Model Roamer tools to its own config', icon: 'cpu', title: 'Not needed for Model Roamer itself; lets you use the tools from the CLI by hand', run: () => runStep({ what: 'connect', agent: a.id, title: 'Connect Model Roamer tools' }) },
+        { sep: true },
+        { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
+        a.installed ? { label: 'Refresh models', icon: 'refresh', title: 'Ask the CLI which models it offers now', run: () => post(`agents/${a.id}/models`, {}, { timeout: 90000 }).then((r) => toast(`${(r.info?.models || []).filter((m) => m.id).length} models from ${info.name}`)).catch((e) => toast(e.message, { err: true })) } : null,
+        info.site ? { label: 'Website', icon: 'external', run: () => openExternal(info.site) } : null,
+        a.id.match(/^(claude|codex|antigravity|local)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
+      ];
+    showMenu(items, r.right, r.bottom + 4, { anchor: e.currentTarget });
   }, html: icon('more', 15) });
 
   const on = cfg.enabled !== false;

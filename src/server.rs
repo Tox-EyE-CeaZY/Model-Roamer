@@ -142,7 +142,7 @@ pub async fn auth(State(core): State<CoreRef>, mut req: Request, next: Next) -> 
 /// Small security headers on everything we serve.
 pub async fn headers(req: Request, next: Next) -> Response {
     let is_forward = req.uri().path().starts_with("/fwd/");
-    let is_artifact = req.uri().path().starts_with("/a/") || is_forward;
+    let is_artifact = req.uri().path().starts_with("/a/") || req.uri().path().contains("/artifact-file/") || is_forward;
     let mut r = next.run(req).await;
     let h = r.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
@@ -174,7 +174,9 @@ pub fn asset(path: &str) -> Response {
 
 /// Everything this server answers: the app's API plus collaboration (its own routes, same auth and headers).
 fn router(core: &CoreRef) -> axum::Router {
-    crate::api::router(core.clone()).merge(crate::collab::router(core.clone()))
+    crate::api::router(core.clone())
+        .merge(crate::collab::router(core.clone()))
+        .merge(crate::collab_view::router(core.clone()))
 }
 
 /// Open (or reopen) the listener other devices use, from the settings (command-line overrides win). Turning

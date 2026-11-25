@@ -1,71 +1,57 @@
-// Collaboration, both sides (see docs/collaboration.md):
-// - Settings › Collaborators (the owner): invite people to a project with a one-person link, set what each role may
-//   do, change one person's permissions, remove people.
-// - Settings › Join a project (a guest): paste an invite link, see the projects joined, and open one: the host's
-//   threads, memory, artifacts and people, kept live by one long poll through this app (the host token never
-//   reaches this window).
+// Collaboration management, both sides (see docs/collaboration.md):
+// - Owner: `projectPeoplePanel(el, pid)` mounts inside a project's own Settings tab (and inline in Settings › Collaborators).
+//   Settings › Collaborators is an overview of all own projects with direct links into each project's People area.
+// - Guest: Settings › Join a project is for pasting an invite link and listing/leaving joined projects.
+//   Joined projects open on the real project page (#/p/<link_id>), never inside Settings.
 
 import { h, ago } from '../util.js';
 import { get, post, patch, del, listen } from '../api.js';
 import { S } from '../store.js';
-import { go } from '../app.js';
-import { openExternal } from '../native.js';
+import { go, leaveJoinedProject } from '../app.js';
 import { dialog, toast } from '../ui.js';
-import { md } from '../md.js';
-import { ic, field, input, textarea, select, seg, toggle, loading, errorBox, empty, kicker, copyable, statusChip } from '../common.js';
-import { mountChat, chatsPanel, ensureLocal, threadTag } from './collab_chat.js';
-import { clearControl, drawInbox, drawPresence, presenceDot, requestedInbox } from '../collab-presence.js';
+import { ic, field, input, select, seg, toggle, errorBox, empty, kicker, copyable } from '../common.js';
+import { chatsPanel } from './collab_chat.js';
+import { presenceDot } from '../collab-presence.js';
+import { ROLE_LABEL } from '../collab_perms.js';
 
-const ROLE_LABEL = { collaborator: 'Collaborator', operator: 'Operator', viewer: 'Viewer', owner: 'Owner' };
+const enc = encodeURIComponent;
 
-// ------------------------------------------------------------ owner: Settings › Collaborators
-export async function collaborators(el, r) {
-  let ov;
-  try {
-    ov = await get('collab');
-  } catch (e) {
-    return el.replaceChildren(errorBox(e, () => collaborators(el, r)));
-  }
-  if (!ov.projects.length) {
-    return el.replaceChildren(h('section', { class: 'panel cut' }, empty('people', 'No projects yet', 'Make a project first; then invite people to it from here.')));
-  }
-  let pid = ov.projects.some((p) => p.id === r.q.project) ? r.q.project : ov.projects[0].id;
-  const top = h('section', { class: 'panel cut' });
+// ------------------------------------------------------------ owner: reusable per-project People & Rules panel
+/**
+ * Mount Invite + People + Rules + Project chats management scoped to a single owner project `pid`.
+ * Used both inside Project › Settings and inside Settings › Collaborators.
+ */
+export async function projectPeoplePanel(el, pid) {
   const inviteBox = h('section', { class: 'panel cut' });
   const peopleBox = h('section', { class: 'panel cut' });
   const rulesBox = h('section', { class: 'panel cut' });
   const chatsBox = h('section', { class: 'panel cut' });
-  el.replaceChildren(top, inviteBox, peopleBox, rulesBox, chatsBox);
+  el.replaceChildren(inviteBox, peopleBox, rulesBox, chatsBox);
 
   let net = null;
   try {
-    net = await get('network');
-  } catch { /* the invite still works with the default address */ }
-
-  top.replaceChildren(kicker('Collaborators', h('small', { class: 'faint' }, 'people on their own Model Roamer, working in your project')),
-    h('p', { class: 'faint small' }, 'You host the project: its threads, memory and artifacts stay on this machine. Each person joins with their own one-time link and runs their own agents on their own accounts; logins are never shared. You decide what they may do, and can remove anyone at once.'),
-    field('Project', select(ov.projects.map((p) => [p.id, `${p.name}${p.members ? ` · ${p.members} ${p.members === 1 ? 'person' : 'people'}` : ''}`]), pid, (v) => {
-      pid = v;
-      history.replaceState(history.state, '', '#/settings/collab?project=' + encodeURIComponent(v));
-      draw();
-    })));
+    net = await get('network', { quiet: true });
+  } catch { /* invite still works with default address */ }
 
   let data = null;
+  let dead = false;
   const memberDots = new Map();
+
   async function refreshMemberDots() {
-    const project = pid;
-    const view = await get(`collab/projects/${project}/presence`, { quiet: true }).catch(() => null);
-    if (!view || pid !== project) return;
-    const online = new Set(view.people.filter((p) => p.online).map((p) => p.user_id));
+    const view = await get(`collab/projects/${enc(pid)}/presence`, { quiet: true }).catch(() => null);
+    if (!view || dead) return;
+    const online = new Set((view.people || []).filter((p) => p.online).map((p) => p.user_id));
     for (const [user, dot] of memberDots) dot.replaceChildren(presenceDot(online.has(user)));
   }
+
   async function draw() {
     try {
-      data = await get('collab/projects/' + pid);
+      data = await get('collab/projects/' + enc(pid));
     } catch (e) {
-      peopleBox.replaceChildren(errorBox(e, draw));
+      if (!dead) peopleBox.replaceChildren(errorBox(e, draw));
       return;
     }
+    if (dead) return;
     drawInvite(null);
     drawPeople();
     drawRules();
@@ -76,60 +62,70 @@ export async function collaborators(el, r) {
     const listening = data?.listening || net?.listening;
     if (made) {
       const days = Math.max(1, Math.round((made.expires_at - Date.now()) / 86400000));
-      inviteBox.replaceChildren(kicker('Invite link ready', h('span', { class: 'tag' }, made.role)),
-        h('div', { class: 'pair collab-pair' }, h('div', { class: 'pair-qr', html: made.qr || '' }),
+      inviteBox.replaceChildren(
+        kicker('Invite link ready', h('span', { class: 'tag' }, ROLE_LABEL[made.role] || made.role)),
+        h('div', { class: 'pair collab-pair' },
+          h('div', { class: 'pair-qr', html: made.qr || '' }),
           h('div', { class: 'collab-made' },
-            h('p', {}, h('b', {}, made.name), ' opens Model Roamer, goes to ', h('b', {}, 'Settings › Join a project'), ' and pastes this link:'),
+            h('p', {}, h('b', {}, made.name), ' opens Model Roamer, chooses ', h('b', {}, '+ › Join a project'), ' (or ', h('b', {}, 'Settings › Join a project'), ') and pastes this link:'),
             copyable(made.link),
             h('p', { class: 'faint small' }, ic('lock', 12), ` Works once, for this one person, for ${days} ${days === 1 ? 'day' : 'days'}. Send it privately. You can withdraw it below until it’s used.`),
-            h('button', { class: 'btn sm', onclick: () => drawInvite(null) }, 'Invite someone else'))));
+            h('button', { class: 'btn sm', onclick: () => drawInvite(null) }, 'Invite someone else'))),
+      );
       return;
     }
     const name = input('', { placeholder: 'Their name, e.g. Sam' });
     let role = 'collaborator', hours = 168;
     const urls = net?.urls || [];
     const addr = urls.length ? select(urls.map((u) => [u.url, `${u.label} — ${u.url}`]), urls[0].url) : null;
-    const go1 = h('button', { class: 'btn primary', onclick: async () => {
-      if (!name.value.trim()) return name.focus();
-      go1.disabled = true;
-      try {
-        const res = await post(`collab/projects/${pid}/invites`, { name: name.value.trim(), role, expires_hours: hours, base_url: addr?.value || '' });
-        drawInvite({ ...res, name: name.value.trim(), role });
-        draw2();
-      } catch (e) {
-        toast(e.message, { err: true });
-      } finally {
-        go1.disabled = false;
-      }
-    } }, ic('link', 14), 'Make invite link');
-    inviteBox.replaceChildren(kicker('Invite a person'),
+    const go1 = h('button', {
+      class: 'btn primary',
+      type: 'button',
+      onclick: async () => {
+        if (!name.value.trim()) return name.focus();
+        go1.disabled = true;
+        try {
+          const res = await post(`collab/projects/${enc(pid)}/invites`, { name: name.value.trim(), role, expires_hours: hours, base_url: addr?.value || '' });
+          drawInvite({ ...res, name: name.value.trim(), role });
+          draw2();
+        } catch (e) {
+          toast(e.message, { err: true });
+        } finally {
+          go1.disabled = false;
+        }
+      },
+    }, ic('link', 14), 'Make invite link');
+    inviteBox.replaceChildren(
+      kicker('Invite a person'),
       !listening ? h('div', { class: 'collab-warn' }, ic('warn', 14), h('span', {}, 'Sharing is off, so nobody can reach this machine yet. Turn it on in ', h('a', { href: '#/settings/remote' }, 'Remote access'), ' first.')) : null,
       h('div', { class: 'row2' }, field('Name', name), field('Role', seg([['collaborator', 'Collaborator'], ['operator', 'Operator'], ['viewer', 'Viewer']], role, (v) => (role = v)))),
       h('p', { class: 'faint small' }, 'Operators may also take threads over from you or others without asking each time. Collaborators can ask to become one later; you approve once.'),
       field('Link works for', seg([[24, '1 day'], [168, '7 days'], [720, '30 days']], hours, (v) => (hours = +v))),
       addr ? field('Address they use', addr, 'Pick one they can reach: Tailscale for anywhere (private and encrypted), your domain with HTTPS, or the local network if they’re in the same place.') : null,
-      go1);
+      go1,
+    );
   }
 
-  // after making an invite, only the lists need redrawing (the link stays on screen)
   async function draw2() {
     try {
-      data = await get('collab/projects/' + pid);
+      data = await get('collab/projects/' + enc(pid));
     } catch { return; }
-    drawPeople();
+    if (!dead) drawPeople();
   }
 
   function drawPeople() {
     const { members, invites } = data;
     memberDots.clear();
-    peopleBox.replaceChildren(kicker('People in this project', h('b', { class: 'count' }, members.length)),
+    peopleBox.replaceChildren(
+      kicker('People in this project', h('b', { class: 'count' }, members.length)),
       members.length ? h('div', { class: 'dev-list' }, members.map(memberRow)) : h('p', { class: 'faint small' }, 'Nobody has joined yet. Only you can see and change this project.'),
       invites.length ? h('div', { class: 'collab-sub' }, kicker('Waiting to be used'), h('div', { class: 'dev-list' }, invites.map((i) => h('div', { class: 'dev' }, ic('link', 15),
-        h('div', {}, h('b', {}, i.name, ' ', h('span', { class: 'tag' }, i.role)), h('small', { class: 'faint' }, `made ${ago(i.created_at)} · expires ${new Date(i.expires_at).toLocaleDateString()}`)),
-        h('button', { class: 'btn xs', onclick: async () => {
+        h('div', {}, h('b', {}, i.name, ' ', h('span', { class: 'tag' }, ROLE_LABEL[i.role] || i.role)), h('small', { class: 'faint' }, `made ${ago(i.created_at)} · expires ${new Date(i.expires_at).toLocaleDateString()}`)),
+        h('button', { class: 'btn xs', type: 'button', onclick: async () => {
           await del('collab/invites/' + i.id).catch((e) => toast(e.message, { err: true }));
           draw2();
-        } }, 'Withdraw'))))) : null);
+        } }, 'Withdraw'))))) : null,
+    );
     refreshMemberDots();
   }
 
@@ -149,14 +145,14 @@ export async function collaborators(el, r) {
             }
           }, { title: p.id }));
       })),
-      h('button', { class: 'btn xs', onclick: async () => {
+      h('button', { class: 'btn xs', type: 'button', onclick: async () => {
         await patch('collab/members/' + m.id, { perms: {} }).catch((e) => toast(e.message, { err: true }));
         draw2();
       } }, 'Back to the role’s rules'));
     const ask = m.requested_role ? h('div', { class: 'collab-ask cut' }, ic('flag', 14),
       h('span', {}, h('b', {}, m.name), ` asks to become ${ROLE_LABEL[m.requested_role] === 'Operator' ? 'an operator' : 'a ' + m.requested_role}: they could take threads over from you or others without asking each time.`),
-      h('button', { class: 'btn xs primary', onclick: () => answer(m, true) }, 'Approve'),
-      h('button', { class: 'btn xs', onclick: () => answer(m, false) }, 'Decline')) : null;
+      h('button', { class: 'btn xs primary', type: 'button', onclick: () => answer(m, true) }, 'Approve'),
+      h('button', { class: 'btn xs', type: 'button', onclick: () => answer(m, false) }, 'Decline')) : null;
     return h('div', { class: 'collab-member' }, ask,
       h('div', { class: 'dev' }, dot,
         h('div', {}, h('b', {}, m.name), h('small', { class: 'faint' }, `joined ${ago(m.created_at)} · last seen ${m.last_seen ? ago(m.last_seen) : 'never'}${m.last_ip ? ' from ' + m.last_ip : ''}`)),
@@ -164,7 +160,7 @@ export async function collaborators(el, r) {
           await patch('collab/members/' + m.id, { role: v }).catch((e) => toast(e.message, { err: true }));
           draw2();
         }, { class: 'input sel sm' }),
-        h('button', { class: 'btn xs danger', onclick: async () => {
+        h('button', { class: 'btn xs danger', type: 'button', onclick: async () => {
           if (!(await dialog({ title: `Remove ${m.name}?`, text: 'Their app is shut out at once: the next thing it asks this machine is refused. What they already wrote here stays. To let them back in, send a new invite.', ok: 'Remove', danger: true }))) return;
           await del('collab/members/' + m.id).catch((e) => toast(e.message, { err: true }));
           draw2();
@@ -184,20 +180,22 @@ export async function collaborators(el, r) {
 
   function drawRules() {
     const roles = data.roles;
-    rulesBox.replaceChildren(kicker('Rules', h('small', { class: 'faint' }, 'what each role may do in this project')),
+    rulesBox.replaceChildren(
+      kicker('Rules', h('small', { class: 'faint' }, 'what each role may do in this project')),
       h('div', { class: 'collab-grid', style: { '--cols': roles.length } },
         h('div', { class: 'collab-perm head' }, h('span'), roles.map((r) => h('b', { class: 'mono' }, ROLE_LABEL[r]))),
         data.perms.map((p) => h('div', { class: 'collab-perm' }, h('span', {}, p.label),
           roles.map((role) => toggle(!!data.rules[role][p.id], async (v) => {
             try {
-              data.rules = await patch(`collab/projects/${pid}/rules`, { [role]: { [p.id]: v } });
+              data.rules = await patch(`collab/projects/${enc(pid)}/rules`, { [role]: { [p.id]: v } });
               draw2();
               chatsPanel(chatsBox, pid);
             } catch (e) {
               toast(e.message, { err: true });
             }
           }, { title: `${ROLE_LABEL[role]}: ${p.id}` }))))),
-      h('p', { class: 'faint small' }, ic('shield', 12), ' Always only you: inviting, these rules, project settings and repositories, deleting, agents, terminals and this machine’s settings. Nobody else ever sees your logins, tokens or local folders.'));
+      h('p', { class: 'faint small' }, ic('shield', 12), ' Always only you: inviting, these rules, project settings and repositories, deleting, agents, terminals and this machine’s settings. Nobody else ever sees your logins, tokens or local folders.'),
+    );
   }
 
   await draw();
@@ -206,12 +204,84 @@ export async function collaborators(el, r) {
     if (ev.kind === 'collab') draw2();
     if (ev.kind === 'presence') refreshMemberDots();
   });
-  return () => un();
+  return () => {
+    dead = true;
+    un();
+  };
+}
+
+// ------------------------------------------------------------ owner: Settings › Collaborators (overview + links to each project)
+export async function collaborators(el, r) {
+  let ov;
+  try {
+    ov = await get('collab');
+  } catch (e) {
+    return el.replaceChildren(errorBox(e, () => collaborators(el, r)));
+  }
+  const ownProjects = (ov.projects || []).filter((p) => !String(p.id).startsWith('lnk_'));
+  if (!ownProjects.length) {
+    return el.replaceChildren(h('section', { class: 'panel cut' }, empty('people', 'No own projects yet', 'Make a project first; then invite people to it from its Settings tab or from here.')));
+  }
+  let pid = ownProjects.some((p) => p.id === r.q.project) ? r.q.project : ownProjects[0].id;
+  const overviewBox = h('section', { class: 'panel cut' });
+  const detailHost = h('div', { class: 'collab-detail-host' });
+  el.replaceChildren(overviewBox, detailHost);
+
+  let stopDetail = null;
+  async function mountSelected() {
+    stopDetail?.();
+    stopDetail = null;
+    drawOverview();
+    stopDetail = await projectPeoplePanel(detailHost, pid);
+  }
+
+  function drawOverview() {
+    overviewBox.replaceChildren(
+      kicker('Collaborators across your projects', h('small', { class: 'faint' }, 'manage per project in Project › Settings › People')),
+      h('p', { class: 'faint small' }, 'You host your projects: threads, memory and artifacts stay on this machine. Each collaborator joins with a one-time link and runs their own agents on their own accounts.'),
+      h('div', { class: 'dev-list' }, ownProjects.map((p) => h('div', { class: 'dev collab-ov-row' + (p.id === pid ? ' on' : '') },
+        ic('board', 15),
+        h('div', {},
+          h('b', {}, p.name),
+          h('small', { class: 'faint' }, `${p.members || 0} ${p.members === 1 ? 'person' : 'people'}${p.invites ? ` · ${p.invites} pending ${p.invites === 1 ? 'invite' : 'invites'}` : ''}`)),
+        h('button', {
+          class: 'btn xs' + (p.id === pid ? ' on' : ''),
+          type: 'button',
+          onclick: () => {
+            pid = p.id;
+            history.replaceState(history.state, '', '#/settings/collab?project=' + enc(p.id));
+            mountSelected();
+          },
+        }, p.id === pid ? 'Managing below' : 'Manage here'),
+        h('a', { class: 'btn xs primary', href: `#/p/${enc(p.id)}/settings?section=people` }, 'Open in project →')))),
+    );
+  }
+
+  await mountSelected();
+  const un = listen(async (ev) => {
+    if (ev.kind !== 'collab') return;
+    try {
+      const fresh = await get('collab', { quiet: true });
+      const next = (fresh.projects || []).filter((p) => !String(p.id).startsWith('lnk_'));
+      if (next.length) {
+        ownProjects.splice(0, ownProjects.length, ...next);
+        drawOverview();
+      }
+    } catch { /* fine */ }
+  });
+  return () => {
+    un();
+    stopDetail?.();
+  };
 }
 
 // ------------------------------------------------------------ guest: Settings › Join a project
 export async function joinProject(el, r) {
-  if (r.q.link) return joined(el, r.q.link);
+  // Legacy #/settings/join?link=<id> links redirect straight to the real project page.
+  if (r.q.link) {
+    go('#/p/' + enc(r.q.link) + (r.q.inbox ? '?inbox=1' : ''));
+    return;
+  }
   const joinBox = h('section', { class: 'panel cut' });
   const listBox = h('section', { class: 'panel cut' });
   el.replaceChildren(joinBox, listBox);
@@ -219,24 +289,30 @@ export async function joinProject(el, r) {
   const link = input(r.q.invite ? location.href : '', { placeholder: 'https://their-machine.tailnet.ts.net:4630/#/join?invite=…' });
   const name = input(S.server?.name || '', { placeholder: 'Your name, as the others will see it' });
   const err = h('div', { class: 'dlg-err', hidden: true });
-  const btn = h('button', { class: 'btn primary', type: 'submit' }, ic('login', 14), 'Join');
-  joinBox.replaceChildren(kicker('Join a project'),
-    h('p', { class: 'faint small' }, 'Someone invited you to their project: paste the link they sent. Their project stays on their machine; your agents run here, on your own accounts, and nothing of yours (logins, keys, other projects) is shared.'),
-    h('form', { class: 'collab-join', onsubmit: async (e) => {
-      e.preventDefault();
-      err.hidden = true;
-      btn.disabled = true;
-      try {
-        const l = await post('collab/links', { link: link.value.trim(), name: name.value.trim() }, { timeout: 40000 });
-        toast(`Joined ${l.project_name} on ${l.host_name}`);
-        go('#/settings/join?link=' + encodeURIComponent(l.id));
-      } catch (x) {
-        err.textContent = x.message;
-        err.hidden = false;
-      } finally {
-        btn.disabled = false;
-      }
-    } }, field('Invite link', link), field('Your name', name), err, btn));
+  const btn = h('button', { class: 'btn primary', type: 'submit' }, ic('login', 14), 'Join project');
+  joinBox.replaceChildren(
+    kicker('Join a project'),
+    h('p', { class: 'faint small' }, 'Paste an invite link someone sent you. Once joined, the project appears in your sidebar Projects list like any other project. Your agents run here on your own accounts; logins and other projects are never shared.'),
+    h('form', {
+      class: 'collab-join',
+      onsubmit: async (e) => {
+        e.preventDefault();
+        err.hidden = true;
+        btn.disabled = true;
+        try {
+          const l = await post('collab/links', { link: link.value.trim(), name: name.value.trim() }, { timeout: 40000 });
+          await post(`collab/links/${enc(l.id)}/view/ensure`, {}, { timeout: 25000 }).catch(() => {});
+          toast(`Joined ${l.project_name} on ${l.host_name}`);
+          go('#/p/' + enc(l.id));
+        } catch (x) {
+          err.textContent = x.message;
+          err.hidden = false;
+        } finally {
+          btn.disabled = false;
+        }
+      },
+    }, field('Invite link', link), field('Your name', name), err, btn),
+  );
 
   async function drawList() {
     let list;
@@ -245,18 +321,24 @@ export async function joinProject(el, r) {
     } catch (e) {
       return listBox.replaceChildren(errorBox(e, drawList));
     }
-    listBox.replaceChildren(kicker('Projects you joined', h('b', { class: 'count' }, list.length)),
+    listBox.replaceChildren(
+      kicker('Projects you joined', h('b', { class: 'count' }, list.length)),
       list.length ? h('div', { class: 'conn-list' }, list.map((l) => h('div', { class: 'conn cut' }, ic('people', 16),
-        h('div', {}, h('b', {}, l.project_name), h('small', { class: 'faint' }, `${l.host_name} · you are ${ROLE_LABEL[l.role] || l.role}${l.last_sync ? ' · synced ' + ago(l.last_sync) : ''}`),
+        h('div', {},
+          h('b', {}, l.project_name),
+          h('small', { class: 'faint' }, `${l.host_name} · you are ${ROLE_LABEL[l.role] || l.role}${l.last_sync ? ' · synced ' + ago(l.last_sync) : ''}`),
           l.insecure ? h('small', { class: 'collab-bad' }, 'Plain http over the internet: ask the owner for a Tailscale or https address.') : null,
           l.error ? h('small', { class: 'collab-bad' }, l.error) : null),
         linkStatus(l),
-        h('button', { class: 'btn sm primary', disabled: l.status === 'revoked', onclick: () => go('#/settings/join?link=' + encodeURIComponent(l.id)) }, 'Open'),
-        h('button', { class: 'btn sm', onclick: async () => {
-          if (!(await dialog({ title: `Leave ${l.project_name}?`, text: `You stop seeing it, and ${l.host_name} is told. To come back you need a new invite.`, ok: 'Leave', danger: true }))) return;
-          await del('collab/links/' + l.id).catch((e) => toast(e.message, { err: true }));
-          drawList();
-        } }, 'Leave')))) : h('p', { class: 'faint small' }, 'None yet.'));
+        h('a', { class: 'btn sm primary', href: '#/p/' + enc(l.id) }, 'Open'),
+        h('button', {
+          class: 'btn sm',
+          type: 'button',
+          onclick: async () => {
+            if (await leaveJoinedProject(l)) drawList();
+          },
+        }, 'Leave')))) : h('p', { class: 'faint small' }, 'None yet. Paste an invite link above, or choose + › Join a project in the sidebar.'),
+    );
   }
   await drawList();
   const un = listen((ev) => ev.kind === 'collab-links' && drawList());
@@ -267,295 +349,4 @@ function linkStatus(l) {
   if (l.status === 'revoked') return h('span', { class: 'status hot' }, 'Removed');
   if (l.status === 'offline') return h('span', { class: 'status dim' }, 'Offline');
   return h('span', { class: 'status acc' }, 'Joined');
-}
-
-// ------------------------------------------------------------ guest: one joined project, live
-async function joined(el, linkId) {
-  const base = `collab/links/${encodeURIComponent(linkId)}/host/`;
-  const links = await get('collab/links').catch(() => []);
-  const link = links.find((l) => l.id === linkId);
-  if (!link) return el.replaceChildren(h('section', { class: 'panel cut' }, empty('people', 'Not joined', 'This project isn’t in your list any more.', h('a', { class: 'btn', href: '#/settings/join' }, 'Back'))));
-  const head = h('section', { class: 'panel cut collab-head' });
-  const presenceHost = h('div', { class: 'collab-presence-host' });
-  const inboxHost = h('div', { class: 'collab-note-host' });
-  const collabStrip = h('div', { class: 'collab-toolbar' }, presenceHost, inboxHost);
-  const body = h('section', { class: 'panel cut' });
-  el.replaceChildren(head, body);
-  body.replaceChildren(loading('Reaching ' + link.host_name));
-
-  let st;
-  try {
-    st = await get(base + 'project', { timeout: 30000 });
-  } catch (e) {
-    body.replaceChildren(errorBox(e, () => joined(el, linkId)));
-    head.replaceChildren(h('a', { class: 'linkbtn', href: '#/settings/join' }, ic('left', 13), 'All joined projects'));
-    return;
-  }
-  const threads = new Map(st.threads.map((t) => [t.id, t]));
-  const memory = new Map();
-  const artifacts = new Map();
-  let people = st.people || [];
-  let cursor = st.cursor;
-  let tab = 'chat', openThread = null, live = 'ok', alive = true, stopChat = null;
-  const perms = st.perms || {};
-  const me = st.member;
-  let presence = st.presence;
-  let notes = st.notes || [];
-  let openInbox = requestedInbox();
-
-  async function refreshNotes() {
-    try {
-      notes = await get(base + 'notes', { quiet: true });
-      if (alive) drawCoordination();
-    } catch (e) {
-      toast(e.message, { err: true });
-    }
-  }
-
-  function drawCoordination() {
-    drawPresence(presenceHost, presence, live === 'ok', linkId);
-    drawInbox(inboxHost, base, live === 'ok' ? notes : [], refreshNotes, openInbox);
-    if (live === 'ok' && notes.length) openInbox = false;
-  }
-
-  const liveTag = h('span');
-  function drawHead() {
-    liveTag.replaceChildren(live === 'ok' ? h('span', { class: 'status live' }, h('i', { class: 'pulse' }), 'Live') : live === 'revoked' ? h('span', { class: 'status hot' }, 'Removed') : h('span', { class: 'status dim' }, 'Offline, retrying'));
-    head.replaceChildren(
-      h('a', { class: 'linkbtn', href: '#/settings/join' }, ic('left', 13), 'All joined projects'),
-      h('div', { class: 'collab-title' }, h('h2', {}, st.project?.name || link.project_name), liveTag),
-      h('div', { class: 'collab-title' }, h('p', { class: 'faint small' }, `Hosted by ${st.host?.name || link.host_name} · you are ${ROLE_LABEL[me.role] || me.role} as ${me.name}`), askOperator()),
-      collabStrip,
-      seg([['chat', 'Your chat'], ['threads', 'Threads'], ['memory', 'Memory'], ['artifacts', 'Artifacts'], ['people', 'People']], tab, (v) => {
-        tab = v;
-        openThread = null;
-        drawBody();
-      }));
-    drawCoordination();
-  }
-
-  // an operator takes threads over without asking each time: asked for once, approved once by the owner
-  function askOperator() {
-    if (me.role === 'operator' || me.role === 'viewer') return null;
-    if (me.requested_role) return h('span', { class: 'tag' }, 'Operator request sent');
-    return h('button', { class: 'btn xs', title: 'Ask the owner once; then you can take threads over without asking each time', onclick: async () => {
-      if (!(await dialog({ title: 'Ask to become an operator?', text: `${st.host?.name || link.host_name} decides once. As an operator you can take threads over from them or others without asking each time.`, ok: 'Ask' }))) return;
-      try {
-        await post(base + 'request-role', { role: 'operator' });
-        me.requested_role = 'operator';
-        toast('Asked. You’ll see your role change here once they answer.');
-        drawHead();
-      } catch (e) {
-        toast(e.message, { err: true });
-      }
-    } }, ic('flag', 12), 'Ask to be an operator');
-  }
-
-  function drawBody() {
-    if (stopChat) stopChat = (stopChat(), null);
-    if (tab === 'chat') return mountChat(body, link).then((s) => (alive && tab === 'chat' ? (stopChat = s) : s()));
-    if (tab === 'threads') return openThread ? drawThread(openThread) : drawThreads();
-    if (tab === 'memory') return drawMemory();
-    if (tab === 'artifacts') return drawArtifacts();
-    return drawPeople();
-  }
-
-  function drawThreads() {
-    // the person's own chat has its own tab; their own threads open here, on this machine
-    const list = [...threads.values()].filter((t) => !t.deleted_at && !(t.kind === 'chat' && t.user_id === me.user_id));
-    body.replaceChildren(
-      kicker('Threads', perms.create_threads ? h('button', { class: 'btn xs', onclick: newThread }, ic('plus', 12), 'New thread') : null),
-      list.length ? h('div', { class: 'dev-list' }, list.map((t) => h('button', { class: 'collab-thread', onclick: () => (t.user_id === me.user_id ? go('#/t/' + t.id) : ((openThread = t.id), drawBody())) },
-        h('div', {}, h('b', {}, t.kind === 'lead' ? '★ ' : '', t.title), h('small', { class: 'faint' }, `${t.agent}${threadTag(t, me, personName)} · ${ago(t.updated_at)}`),
-          t.last_body ? h('small', { class: 'collab-last' }, t.last_body) : null),
-        statusChip(t)))) : h('p', { class: 'faint small' }, perms.view_threads ? 'No threads yet.' : 'The owner hasn’t shared threads with you.'));
-  }
-
-  const personName = (uid) => people.find((p) => p.user_id === uid)?.name || 'someone';
-
-  async function newThread() {
-    // it opens here, on this machine, and goes up to the host from there
-    try {
-      await ensureLocal(link);
-      const { newThreadDialog } = await import('./project.js');
-      return newThreadDialog(link.id);
-    } catch (e) {
-      toast(e.message, { err: true });
-    }
-  }
-
-  const msgs = new Map(); // thread id -> Map(message id -> message)
-  async function drawThread(id) {
-    const t = threads.get(id);
-    if (!t) return drawThreads();
-    const box = h('div', { class: 'collab-msgs' }, loading());
-    const own = t.user_id === me.user_id;
-    const may = own || (t.kind === 'lead' ? perms.message_lead : perms.message_threads);
-    const text = textarea('', { rows: 3, placeholder: may ? (own ? 'Write to your thread' : 'Write to the owner’s agents (uses their plan)') : 'The owner hasn’t allowed you to write here', disabled: !may });
-    const send = h('button', { class: 'btn primary sm', disabled: !may, onclick: async () => {
-      if (!text.value.trim()) return;
-      send.disabled = true;
-      try {
-        const m = await post(base + `threads/${id}/messages`, { text: text.value });
-        addMsgs([m]);
-        text.value = '';
-        paintMsgs();
-      } catch (e) {
-        toast(e.message, { err: true });
-      } finally {
-        send.disabled = false;
-      }
-    } }, ic('send', 13), 'Send');
-    body.replaceChildren(
-      h('button', { class: 'linkbtn', onclick: () => ((openThread = null), drawBody()) }, ic('left', 13), 'Threads'),
-      h('div', { class: 'collab-title' }, h('h3', {}, t.title), statusChip(t)),
-      t.instructions ? h('details', { class: 'adv' }, h('summary', {}, 'Instructions'), h('div', { class: 'md', html: md(t.instructions) })) : null,
-      box, h('div', { class: 'collab-compose' }, text, send));
-    try {
-      const r = await get(base + `threads/${id}/messages?limit=120`);
-      addMsgs(r.messages);
-    } catch (e) {
-      box.replaceChildren(errorBox(e));
-      return;
-    }
-    paintMsgs();
-  }
-  function addMsgs(list) {
-    for (const m of list) {
-      if (!msgs.has(m.thread_id)) msgs.set(m.thread_id, new Map());
-      msgs.get(m.thread_id).set(m.id, m);
-    }
-  }
-  function paintMsgs() {
-    const box = body.querySelector('.collab-msgs');
-    if (!box || !openThread) return;
-    const list = [...(msgs.get(openThread)?.values() || [])].sort((a, b) => a.created_at - b.created_at);
-    box.replaceChildren(...(list.length ? list.map((m) => h('div', { class: 'collab-msg ' + m.role },
-      h('div', { class: 'collab-msg-h' }, h('b', {}, m.author || m.role), h('small', { class: 'faint' }, ago(m.created_at))),
-      h('div', { class: 'md', html: md(m.body) }))) : [h('p', { class: 'faint small' }, 'No messages yet.')]));
-    box.scrollTop = box.scrollHeight;
-  }
-
-  async function drawMemory() {
-    body.replaceChildren(kicker('Project memory', perms.edit_memory ? h('button', { class: 'btn xs', onclick: () => editMemory() }, ic('plus', 12), 'New entry') : null), loading());
-    try {
-      const list = await get(base + 'memory');
-      memory.clear();
-      list.forEach((m) => memory.set(m.id, m));
-    } catch (e) {
-      return body.replaceChildren(errorBox(e, drawMemory));
-    }
-    paintMemory();
-  }
-  function paintMemory() {
-    const list = [...memory.values()].filter((m) => !m.deleted_at);
-    body.replaceChildren(kicker('Project memory', perms.edit_memory ? h('button', { class: 'btn xs', onclick: () => editMemory() }, ic('plus', 12), 'New entry') : null),
-      list.length ? h('div', { class: 'dev-list' }, list.map((m) => h('details', { class: 'collab-mem', ontoggle: async (e) => {
-        const d = e.currentTarget;
-        if (!d.open || d.dataset.loaded) return;
-        d.dataset.loaded = '1';
-        try {
-          const full = await get(base + 'memory/' + encodeURIComponent(m.name));
-          d.querySelector('.md').innerHTML = md(full.body);
-        } catch (x) {
-          d.querySelector('.md').textContent = x.message;
-        }
-      } }, h('summary', {}, h('b', { class: 'mono' }, m.name), m.project_id ? null : h('span', { class: 'tag' }, 'global'), h('small', { class: 'faint' }, ' ', m.description || '')),
-        h('div', { class: 'md' }, '…'),
-        perms.edit_memory && m.project_id ? h('button', { class: 'btn xs', onclick: () => editMemory(m) }, ic('edit', 12), 'Edit') : null))) : h('p', { class: 'faint small' }, 'Memory is empty.'));
-  }
-  async function editMemory(m) {
-    const name = input(m?.name || '', { placeholder: 'short-kebab-name', disabled: !!m });
-    const desc = input(m?.description || '', { placeholder: 'One line: what this entry is for' });
-    const bodyT = textarea('', { rows: 10 });
-    if (m) get(base + 'memory/' + encodeURIComponent(m.name)).then((f) => (bodyT.value = f.body)).catch(() => {});
-    if (!(await dialog({ title: m ? 'Edit ' + m.name : 'New memory entry', wide: true, body: h('div', {}, field('Name', name), field('Description', desc), field('Body', bodyT)), ok: 'Save' }))) return;
-    try {
-      await post(base + 'memory', { name: name.value, description: desc.value, body: bodyT.value });
-      toast('Saved to the project’s memory');
-      drawMemory();
-    } catch (e) {
-      toast(e.message, { err: true });
-    }
-  }
-
-  async function drawArtifacts() {
-    body.replaceChildren(kicker('Artifacts'), loading());
-    try {
-      const list = await get(base + 'artifacts');
-      artifacts.clear();
-      list.forEach((a) => artifacts.set(a.id, a));
-    } catch (e) {
-      return body.replaceChildren(errorBox(e, drawArtifacts));
-    }
-    paintArtifacts();
-  }
-  function paintArtifacts() {
-    const list = [...artifacts.values()].filter((a) => !a.deleted_at).sort((a, b) => b.updated_at - a.updated_at);
-    body.replaceChildren(kicker('Artifacts', h('b', { class: 'count' }, list.length)),
-      list.length ? h('div', { class: 'dev-list' }, list.map((a) => h('div', { class: 'dev' }, ic('artifact', 15),
-        h('div', {}, h('b', {}, a.title), h('small', { class: 'faint' }, `${a.kind} · v${a.version} · ${ago(a.updated_at)}`)),
-        h('button', { class: 'btn xs', onclick: () => openExternal(link.host_url + a.url) }, ic('external', 12), 'Open')))) : h('p', { class: 'faint small' }, 'No artifacts yet.'));
-  }
-
-  function drawPeople() {
-    const online = new Set((presence?.people || []).filter((p) => p.online).map((p) => p.user_id));
-    body.replaceChildren(kicker('People', h('b', { class: 'count' }, people.length)),
-      h('div', { class: 'dev-list' }, people.map((p) => h('div', { class: 'dev' },
-        presence?.permission ? presenceDot(live === 'ok' && online.has(p.user_id)) : ic('people', 15),
-        h('div', {}, h('b', {}, p.name, p.user_id === me.user_id ? h('span', { class: 'tag' }, 'you') : null), h('small', { class: 'faint' }, (ROLE_LABEL[p.role] || p.role) + (p.last_seen ? ' · seen ' + ago(p.last_seen) : '')))))));
-  }
-
-  // one long poll at a time: answers at once when something changed, otherwise waits on the host for up to 20 s
-  async function pump() {
-    let delay = 2000;
-    while (alive) {
-      try {
-        const c = await get(base + `changes?since=${cursor}&wait=20`, { timeout: 45000, quiet: true });
-        cursor = c.cursor;
-        if (c.people) people = c.people;
-        if (c.presence) presence = c.presence;
-        if (c.notes) notes = c.notes;
-        if (c.perms) Object.assign(perms, c.perms);
-        c.threads.forEach((t) => threads.set(t.id, { ...threads.get(t.id), ...t }));
-        addMsgs(c.messages);
-        c.memory.forEach((m) => memory.set(m.id, m));
-        c.artifacts.forEach((a) => artifacts.set(a.id, a));
-        if (live !== 'ok') {
-          live = 'ok';
-          drawHead();
-        }
-        delay = 2000;
-        if (!alive) return;
-        drawCoordination();
-        if (tab === 'threads' && !openThread && (c.threads.length || c.messages.length)) drawThreads();
-        else if (tab === 'threads' && openThread && c.messages.some((m) => m.thread_id === openThread)) paintMsgs();
-        else if (tab === 'memory' && c.memory.length) paintMemory();
-        else if (tab === 'artifacts' && c.artifacts.length) paintArtifacts();
-        else if (tab === 'people') drawPeople();
-        if (c.more) continue;
-      } catch (e) {
-        if (!alive) return;
-        const revoked = e.status === 403 && /removed|withdrawn|isn’t valid|isn't valid/i.test(e.message);
-        live = revoked ? 'revoked' : 'offline';
-        drawHead();
-        if (revoked) {
-          body.replaceChildren(errorBox(e));
-          return;
-        }
-        await new Promise((r) => setTimeout(r, delay));
-        delay = Math.min(30000, delay * 2);
-      }
-    }
-  }
-
-  drawHead();
-  drawBody();
-  pump();
-  return () => {
-    alive = false;
-    if (stopChat) stopChat();
-    clearControl(inboxHost);
-    clearControl(presenceHost);
-  };
 }

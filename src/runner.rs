@@ -868,7 +868,12 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     }
 
     // the messages this turn answers
-    let inputs = core.db.all("SELECT * FROM messages WHERE thread_id = ?1 AND pending = 1 ORDER BY created_at", &[&thread])?;
+    let inputs = core.db.all(
+        "SELECT * FROM messages WHERE thread_id = ?1 AND pending IN (1, 2)
+         AND EXISTS (SELECT 1 FROM messages WHERE thread_id = ?1 AND pending = 1)
+         ORDER BY created_at, id",
+        &[&thread],
+    )?;
     if inputs.is_empty() {
         return Ok(());
     }
@@ -913,6 +918,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         prompt.push_str(LEAD_REMINDER);
     }
     prompt.push_str(&collab_update);
+    prompt.push_str(&crate::collab::presence::digest(core, &t));
     prompt.push_str(&format_inputs(&inputs));
     let cfg = core.agent_cfg(&agent);
     let model = t["model"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| cfg["model"].as_str().unwrap_or("").to_string());
@@ -1636,6 +1642,7 @@ pub fn overview(core: &CoreRef, project: &str) -> String {
 
 /// After a crash or restart: turns that were running run again, and anything queued gets going.
 pub fn recover(core: &CoreRef) {
+    tokio::spawn(crate::collab::presence::run(core.clone()));
     let now = util::now_ms();
     let interrupted = core.db.all("SELECT id, thread_id, inputs FROM turns WHERE status = 'running'", &[]).unwrap_or_default();
     for t in &interrupted {

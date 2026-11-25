@@ -314,6 +314,27 @@ const MIGRATIONS: &[&str] = &[
         host_thread_id TEXT
     );
     "#,
+    // 13: conflict notes waiting for a person's approval (Stage 1d). IF NOT EXISTS: pre-merge 1d builds made the
+    // table at startup, so a database from one of those already has it.
+    r#"
+    CREATE TABLE IF NOT EXISTS collab_conflict_notes (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        sender_name TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        decision TEXT NOT NULL DEFAULT '',
+        decided_by TEXT,
+        deliver_at INTEGER,
+        received_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS collab_notes_project ON collab_conflict_notes(project_id, recipient, decision, created_at);
+    CREATE INDEX IF NOT EXISTS collab_notes_rate ON collab_conflict_notes(project_id, sender, created_at);
+    "#,
 ];
 
 #[derive(Clone)]

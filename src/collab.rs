@@ -38,8 +38,14 @@ use std::{
 
 type Q = Query<HashMap<String, String>>;
 
+#[path = "collab_presence.rs"]
+pub(crate) mod presence;
+#[path = "collab_notes.rs"]
+pub(crate) mod notes;
+
 pub fn router(core: CoreRef) -> Router {
     Router::new()
+        .merge(coordination_routes())
         // owner
         .route("/api/collab", get(overview))
         .route("/api/collab/projects/{pid}", get(project_admin))
@@ -60,7 +66,6 @@ pub fn router(core: CoreRef) -> Router {
         .route("/api/collab/host/memory", get(h_memory).post(h_save_memory))
         .route("/api/collab/host/memory/{name}", get(h_memory_entry))
         .route("/api/collab/host/artifacts", get(h_artifacts).post(h_publish))
-        .route("/api/collab/host/presence", post(h_presence))
         .route("/api/collab/host/mcp", post(crate::collab_bridge::host))
         .route("/api/collab/host/leave", post(h_leave))
         .route("/api/collab/host/request-role", post(h_request_role))
@@ -77,6 +82,21 @@ pub fn router(core: CoreRef) -> Router {
         .with_state(core)
 }
 
+fn coordination_routes() -> Router<CoreRef> {
+    Router::new()
+        .route("/api/collab/projects/{pid}/presence", get(presence::owner_get))
+        .route("/api/collab/projects/{pid}/overlaps", post(presence::owner_check))
+        .route("/api/collab/projects/{pid}/coordination", get(presence::coordination))
+        .route("/api/collab/projects/{pid}/notes", get(notes::owner_inbox).post(notes::owner_send))
+        .route("/api/collab/projects/{pid}/notes/{id}", post(notes::owner_decide))
+        .route("/api/collab/notes-attention", get(notes::local_count))
+        .route("/api/collab/host/presence", get(presence::member_get).post(presence::heartbeat))
+        .route("/api/collab/host/overlaps", post(presence::member_check))
+        .route("/api/collab/host/notes", get(notes::member_list).post(notes::member_send))
+        .route("/api/collab/host/notes/{id}", post(notes::member_decide))
+        .route("/api/collab/host/notes-delivery", get(notes::member_delivery).post(notes::member_receipts))
+}
+
 fn s(v: &Value, k: &str) -> String {
     v[k].as_str().unwrap_or("").trim().to_string()
 }
@@ -90,6 +110,10 @@ fn forbid(msg: impl Into<String>) -> ApiErr {
 /// What a member may do: (key, what it allows, defaults for [collaborator, operator, viewer]). Unknown keys in saved
 /// rules are ignored, so later stages add permissions here without a migration.
 pub const PERMS: &[(&str, &str, [bool; 3])] = &[
+    ("view_presence", "see who is working on what", [true, true, true]),
+    ("share_presence", "share their active threads and path claims", [true, true, false]),
+    ("send_conflict_notes", "send a note for the receiving thread's owner to review", [true, true, false]),
+    ("review_conflict_notes", "review conflict notes for other people's threads as an operator", [false, true, false]),
     ("view_threads", "see the project's shared threads and their history", [true, true, true]),
     ("view_others_chats", "see other people's own project chats", [false, false, false]),
     ("create_threads", "open threads of their own (they run on their own machine)", [true, true, false]),
@@ -224,22 +248,8 @@ pub fn personal_chat(core: &CoreRef, m: &Member) -> Option<String> {
     crate::collab_chat::personal_chat(core, m)
 }
 
-/// Conflict notices (planned): when someone is about to work on something another person's thread already covers,
-/// the project chat tells them and offers to send that thread a note. The note is only a request: the thread's owner
-/// approves it, and it then arrives as a plain, visible message in the owner's own session. Never injected
-/// automatically into anyone's agent. Inputs come from presence (1d) and claims.
-#[allow(dead_code)]
-pub fn conflict_notice(_core: &CoreRef, _project: &str, _thread: &str, _overlaps_with: &str) -> Option<Value> {
-    None
-}
-
 fn not_yet(stage: &str, what: &str) -> ApiErr {
     ApiErr(StatusCode::NOT_IMPLEMENTED, format!("{what} arrives in {stage} of collaboration; this host doesn't offer it yet."))
-}
-
-/// Stage 1d, presence: who is working on what, kept in memory with a short time to live.
-async fn h_presence(Extension(_m): Extension<Member>) -> Result<Json<Value>, ApiErr> {
-    Err(not_yet("Stage 1d", "Presence"))
 }
 
 /// Stage 2, thread transfer through the shared git repository. Members with `transfer_threads` (operators) take a
@@ -596,6 +606,8 @@ async fn h_project(State(core): State<CoreRef>, Extension(m): Extension<Member>)
     let mut me = me_json(&core, &m);
     me["threads"] = json!(threads_of(&core, &m, 0)?);
     me["people"] = json!(people(&core, &m.project_id));
+    me["presence"] = json!(presence::snapshot(&core, &m.project_id, Some(&m)));
+    me["notes"] = json!(notes::member_inbox(&core, &m)?);
     me["cursor"] = json!(cursor);
     Ok(Json(me))
 }
@@ -643,7 +655,11 @@ fn changes_since(core: &CoreRef, m: &Member, since: i64) -> Result<Value, ApiErr
     if more {
         cursor = cursor.min(last_msg.unwrap_or(cursor));
     }
-    Ok(json!({ "threads": threads, "messages": messages, "memory": mem, "artifacts": arts, "cursor": cursor, "more": more, "people": people(core, &m.project_id) }))
+    Ok(json!({
+        "threads": threads, "messages": messages, "memory": mem, "artifacts": arts, "cursor": cursor, "more": more,
+        "people": people(core, &m.project_id), "presence": presence::snapshot(core, &m.project_id, Some(m)),
+        "notes": notes::member_inbox(core, m)?, "perms": m.perms,
+    }))
 }
 
 fn has_changes(v: &Value) -> bool {
@@ -697,7 +713,7 @@ async fn h_changes(State(core): State<CoreRef>, Extension(m): Extension<Member>,
             Err(_) => break, // time's up
             Ok(Ok(ev)) => {
                 let ours = ev.project.as_deref() == Some(m.project_id.as_str()) || (ev.kind == "memory" && ev.project.is_none() && m.can("read_global_memory"));
-                if ours && matches!(ev.kind.as_str(), "message" | "thread" | "memory" | "artifact" | "collab" | "project") {
+                if ours && matches!(ev.kind.as_str(), "message" | "thread" | "memory" | "artifact" | "collab" | "project" | "presence" | "conflict-notes") {
                     // let a burst (a message and its thread update) land together
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     break;
@@ -707,6 +723,16 @@ async fn h_changes(State(core): State<CoreRef>, Extension(m): Extension<Member>,
             Ok(Err(_)) => break,
         }
     }
+    let row = core.db.one(
+        "SELECT m.role, m.perms, u.name FROM collab_members m JOIN collab_users u ON u.id = m.user_id
+         JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL
+         WHERE m.id = ?1 AND m.revoked_at IS NULL AND u.revoked_at IS NULL",
+        &[&m.id],
+    )?.ok_or_else(|| ApiErr(StatusCode::UNAUTHORIZED, "The owner removed this membership.".into()))?;
+    let mut m = m;
+    m.role = s(&row, "role");
+    m.name = s(&row, "name");
+    m.perms = effective(&core, &m.project_id, &m.role, &row["perms"]);
     Ok(Json(changes_since(&core, &m, since)?))
 }
 

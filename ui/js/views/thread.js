@@ -12,6 +12,7 @@ import { md, wireMd } from '../md.js';
 import { ic, stamp, statusChip, statusLabel, field, input, textarea, toggle, agentModelPicker, agentOptions, select, loading, errorBox, empty, timeAgo, kicker, copyable, pickFolder } from '../common.js';
 import { runStep } from '../term.js';
 import { attachComposerVoice } from '../voice.js';
+import { mountCoordination, ownerOverlap } from '../collab-presence.js';
 
 export default async function threadView(el, r, ctx) {
   return mountThread(el, r.id, { full: true, ctx });
@@ -37,16 +38,19 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
   }
   const head = h('div', { class: 'th-head' });
   const decisionsEl = h('div', { class: 'th-decisions' });
+  const coordination = h('div', { class: 'collab-coordination' });
+  const draftCoordination = h('div', { class: 'collab-coordination' });
   const log = h('div', { class: 'th-log' });
   const liveEl = h('div', { class: 'th-live', hidden: true });
   const scroller = h('div', { class: 'th-scroll' }, h('div', { class: 'th-inner' }, log, liveEl));
   const composerStops = [];
+  if (t.project_id && !t.user_id) composerStops.push(mountCoordination(coordination, t.project_id, t.id, t.kind, !compact));
   const composer = makeComposer();
   const sidebar = full ? h('aside', { class: 'th-side' }) : null;
   el.classList.add('thread', compact ? 'compact' : 'full');
   el.replaceChildren(
     compact ? null : head,
-    h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, scroller, composer.el), sidebar));
+    h('div', { class: 'th-body' }, h('div', { class: 'th-main' }, decisionsEl, coordination, scroller, draftCoordination, composer.el), sidebar));
 
   let messages = [], turns = [], activity = {}, hasMore = false;
   // shown: how much of the streamed text is on screen; it catches up word by word, so every agent's reply reads as it
@@ -449,7 +453,7 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
         h('time', { title: new Date(m.created_at).toLocaleString() }, clock(m.created_at)),
         h('button', { class: 'ibtn xs msg-more', title: 'Copy', onclick: () => navigator.clipboard?.writeText(m.body).then(() => toast('Copied')), html: icon('copy', 13) })),
       acts?.length ? timeline(acts, steps) : null,
-      wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
+      meta.conflict_note ? h('div', { class: 'collab-plain-note' }, m.body) : wireMd(h('div', { class: 'md' }, ...mdNodes(m.body)), openExternal),
       files.length ? h('div', { class: 'files' }, files.map((f) => h('span', { class: 'file-chip' }, ic('clip', 12), String(f).split(/[\\/]/).pop()))) : null);
     return e;
   }
@@ -567,11 +571,32 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
     const stepsBtn = h('button', { class: 'cmp-steps', type: 'button', title: 'How this chat shows the agent’s steps', onclick: (e) => stepsMenu(e.currentTarget) });
     const sendBtn = h('button', { class: 'cmp-send', title: 'Send (Enter)', onclick: () => go_(), html: icon('send', 17) });
     let voice = null;
+    let checkedDraft = '';
+    let checkingDraft = false;
     async function go_() {
       voice?.stop({ keepTextNow: true });
       const text = ta.value.trim();
       if (files.some((f) => !f.path)) return toast('Wait for the attachments to finish uploading');
       if (!text && !files.length && !refs.length) return ta.focus();
+      if (checkingDraft) return;
+      // Compare just a short proposed title with the local collaboration snapshot.
+      const title = text.split(/\r?\n|: /, 1)[0];
+      if (t.project_id && !t.user_id && title.length <= 100 && title.includes(' ') && checkedDraft !== text) {
+        checkingDraft = true;
+        try {
+          const overlap = await ownerOverlap(t.project_id, title);
+          if (text !== ta.value.trim()) return;
+          if (overlap) {
+            checkedDraft = text;
+            draftCoordination.replaceChildren(overlap);
+            toast('Review the overlap, then send again to continue');
+            return;
+          }
+        } catch { /* the chat remains usable if presence is temporarily unavailable */ }
+        finally { checkingDraft = false; }
+      }
+      checkedDraft = '';
+      draftCoordination.replaceChildren();
       const refText = refs.map((r) => `Referenced thread: "${r.title}" (id ${r.id}, ${r.agent}, ${r.status})${r.note ? '\n> ' + r.note.replace(/\n+/g, ' ') : ''}`).join('\n\n');
       const sent = { text: [text, refText].filter(Boolean).join('\n\n'), files: files.map((f) => f.path) };
       ta.value = '';
@@ -592,6 +617,8 @@ export async function mountThread(el, id, { full, compact, ctx } = {}) {
       ta.style.height = Math.min(ta.scrollHeight, 280) + 'px';
     };
     ta.oninput = () => {
+      checkedDraft = '';
+      draftCoordination.replaceChildren();
       // typing @ on its own opens the thread picker
       if (refBtn && /(^|\s)@$/.test(ta.value)) {
         ta.value = ta.value.slice(0, -1);

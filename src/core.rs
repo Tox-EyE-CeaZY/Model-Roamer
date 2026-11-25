@@ -39,6 +39,7 @@ pub struct TermEntry {
 pub struct Core {
     pub db: Db,
     pub bus: Bus,
+    pub(crate) collab_presence: crate::collab::presence::Presence,
     pub data: PathBuf,
     /// Running as a server with nobody at its screen.
     pub headless: bool,
@@ -93,6 +94,7 @@ impl Core {
         let core = Arc::new(Core {
             db,
             bus: Bus::new(),
+            collab_presence: Default::default(),
             data,
             headless,
             port: AtomicU16::new(0),

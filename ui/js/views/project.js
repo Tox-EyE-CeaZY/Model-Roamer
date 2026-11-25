@@ -12,6 +12,7 @@ import { mountThread, decisionCard } from './thread.js';
 import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, folderInput, askLine, repoSelect, repoLabel, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 import { needsYou, isFinished } from '../attention.js';
 import { scrollStrip } from '../scrollstrip.js';
+import { mountPresence, mountProjectInbox, ownerOverlap } from '../collab-presence.js';
 
 const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
 const PANE_KEY = (id) => 'mr-proj-pane-' + id;
@@ -43,6 +44,11 @@ export default async function projectView(el, r, ctx) {
   // a project joined from someone else's Model Roamer: its page is the joined view, with the person's own chat
   if (p.id.startsWith('lnk_') && !tab) return r.q.t ? go('#/t/' + r.q.t) : go('#/settings/join?link=' + encodeURIComponent(p.id));
   const headEl = h('div', { class: 'p-head', style: { '--ph': p.color } });
+  const presenceHost = h('div', { class: 'collab-presence-host' });
+  const inboxHost = h('div', { class: 'collab-note-host' });
+  const collabStrip = h('div', { class: 'collab-toolbar' }, presenceHost, inboxHost);
+  const stopPresence = mountPresence(presenceHost, p.id);
+  const inbox = mountProjectInbox(inboxHost, p.id);
   const body = h('div', { class: 'p-body' });
   el.append(headEl, body);
   el.style.setProperty('--ph', p.color);
@@ -137,7 +143,7 @@ export default async function projectView(el, r, ctx) {
               { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
             ], b.right, b.bottom + 4, { anchor: e.currentTarget });
           }, html: icon('more', 16) }))),
-      tabStrip.el);
+      collabStrip, tabStrip.el);
     renderThreadBadge();
   }
   drawHead();
@@ -154,7 +160,10 @@ export default async function projectView(el, r, ctx) {
   });
   let inner = null;
   if (tab === '') {
-    inner = await board(body, p, r, ctx, {
+    inner = await board(body, p, r, { ...ctx, onRoute: (update) => ctx?.onRoute?.((next) => {
+      if (next.q.inbox) inbox.open();
+      return update(next);
+    }) }, {
       getPane: () => mobilePane,
       onPane: (fn) => (onPaneChange = fn),
       onBadge: (info) => {
@@ -168,7 +177,7 @@ export default async function projectView(el, r, ctx) {
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'settings') inner = await settingsTab(body, p, (np) => ((p = { ...p, ...np }), drawHead()));
-  return () => (unlisten(), unwatch(), tabStrip?.destroy(), inner?.());
+  return () => (unlisten(), unwatch(), inbox.destroy(), stopPresence(), tabStrip?.destroy(), inner?.());
 }
 
 // ------------------------------------------------------------ board
@@ -352,11 +361,14 @@ export async function newThreadDialog(projectId, { repo = '' } = {}) {
   const ws = seg([['worktree', 'Own branch'], ['shared', 'Project folder'], ['scratch', 'Empty folder']], 'worktree', (v) => (wsv = v));
   let wsv = 'worktree';
   let made = null;
+  const matches = h('div');
+  let reviewedTitle = '';
+  title.addEventListener('input', () => { matches.replaceChildren(); reviewedTitle = ''; });
   const ok = await dialog({
     title: 'New thread',
     text: 'Opens a worker thread yourself. The lead hears about it and plans around it.',
     wide: true,
-    body: h('div', { class: 'dlg-fields' }, field('Title', title), field('Instructions', instr), field('Done when', crit),
+    body: h('div', { class: 'dlg-fields' }, field('Title', title), matches, field('Instructions', instr), field('Done when', crit),
       h('div', { class: 'row2' }, field('Kind of work', kinds, 'Routing picks the agent for the kind.'), field('Agent', pick.el)),
       repoPick ? field('Repository', repoPick, 'Which of the project’s repositories this thread works on. Its branch, merge and pull request go there.') : null,
       field('Workspace', ws, 'Own branch: a git worktree, merged when you say so. Project folder: works in place (good for research and reading).')),
@@ -366,6 +378,15 @@ export async function newThreadDialog(projectId, { repo = '' } = {}) {
       if (!instr.value.trim()) return 'Say what the agent should do.';
       const { agent: a, model: m, effort: ef } = pick.get();
       try {
+        const proposed = title.value.trim();
+        if (reviewedTitle !== proposed) {
+          const overlap = await ownerOverlap(projectId, proposed);
+          if (overlap) {
+            matches.replaceChildren(overlap);
+            reviewedTitle = proposed;
+            return 'Review the overlap. Choose Start thread again to continue.';
+          }
+        }
         made = await post(`projects/${projectId}/workers`, { title: title.value.trim(), instructions: instr.value, criteria: crit.value, task_kind: kinds.value, agent: a, model: m, effort: ef, workspace: wsv, repo: repoV });
       } catch (e) {
         return e.message;

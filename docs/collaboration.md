@@ -1,7 +1,9 @@
-# Collaboration: design (Stage 1a foundation)
+# Collaboration: design (Stage 1)
 
-Status: Stage 1b, 2026-11-24. Code lives in `src/collab.rs` and `src/collab_bridge.rs`, migrations 11–12 in `src/db.rs`, the auth hook in
-`src/server.rs`, and the UI in `ui/js/views/collab.js` (Settings › Collaborators and Settings › Join a project).
+Status: Stage 1 (1a–1d merged), 2026-11-24. Code lives in `src/collab.rs`, `src/collab_bridge.rs` (1b),
+`src/collab_chat.rs` (1c), `src/collab_presence.rs` and `src/collab_notes.rs` (1d); migrations 11–13 in `src/db.rs`; the
+auth hook in `src/server.rs`; the UI in `ui/js/views/collab.js` (Settings › Collaborators and Settings › Join a project),
+`ui/js/views/collab_chat.js` and `ui/js/collab-presence.js`.
 
 ## 1. Topology: the owner hosts
 
@@ -94,7 +96,9 @@ Host API for members (`/api/collab/host/*`, Bearer member token, every call perm
 | `POST request-role` | | ask the owner once to become an operator |
 | `POST leave` | | revoke own membership |
 | `POST mcp` | per tool | invoke one of the bridge tools listed below |
-| `POST presence`, `POST threads/{id}/transfer` | | named extension points |
+| `GET/POST presence`, `POST overlaps` | | live presence heartbeat and overlap checks (Stage 1d, §11) |
+| `GET/POST notes`, `POST notes/{id}`, `GET/POST notes-delivery` | `send_conflict_notes` to send | conflict notes (§11) |
+| `POST threads/{id}/transfer` | | named extension point (Stage 2) |
 
 Guest side: `/api/collab/links` (list/join/leave) and `/api/collab/links/{id}/host/{path}`, a narrow proxy that
 adds the token. Proxy rules: connect timeout 6 s, request timeout 20 s (long polls: `wait` + 10 s), two retries with
@@ -195,16 +199,10 @@ the person's overrides. Unknown keys are ignored, so later stages can add permis
 - **1c per-person project chats (built, §10):** `collab::personal_chat` makes or finds the `chat` thread with
   `user_id` for a member; `view_others_chats` gates the others; `collab_chat.rs` runs it on the member's machine and
   binds the chat and every synced thread to the bridge.
-- **1d presence:** `POST host/presence {thread, doing, files}` keeps an in-memory map with a 90 s TTL (`collab::Presence`);
-  the digest and the lead's prompt list who is working on what; claims (`claims` table) already stop file overlap.
+- **1d presence and conflict notes (built, §11).**
 - **Runner gate (done in 1a):** `collab::runs_here(thread)` is false for threads with a `user_id`, and
   `runner::runnable` checks it, so a guest's thread is never run on the owner's accounts, even if the owner writes to
   it. Members' messages only wake threads this machine runs.
-- **Conflict notices (planned, `collab::conflict_notice`):** when someone is about to work on something another
-  person's thread is already doing (from presence and file claims), the project chat tells them (owner,
-  collaborators and operators alike) and offers to send that thread a note. The note is a request: the thread's
-  owner approves it, and it then arrives as a plain, visible message in the owner's own session. Never automatic
-  injection into anyone's agent.
 - **Stage 2 thread transfer:** the thread's branch is pushed to the shared GitHub repo by its current runner;
   `POST host/threads/{id}/transfer {to}` flips `threads.user_id` after the push; the new holder fetches the branch,
   makes a worktree, and starts from a digest (title, instructions, criteria, last messages, a summary) instead of the
@@ -274,5 +272,25 @@ Hooks: approved notes reach a guest's local thread through 1d's `notes::deliver`
 claims and presence reach prompts through 1d's digest. Each local thread of a joined project is bound to 1b's tool
 bridge (`collab_chat::bind_bridge` → `collab_bridge::bind`, table `collab_agent_threads`) when the host makes the chat
 and whenever a sync is accepted.
-Not in 1c: thread transfer (Stage 2), presence and conflict notices (1d), the agent tool bridge (1b, so a guest's
-`read_memory` reads the host's project memory).
+Not in 1c: thread transfer (Stage 2).
+
+## 11. Presence and conflict notes (Stage 1d)
+
+Code: `src/collab_presence.rs`, `src/collab_notes.rs` (table `collab_conflict_notes`, migration 13), UI
+`ui/js/collab-presence.js` (one compact toolbar row on the project page and the joined view: presence and the
+conflict inbox, details in the shared popover).
+
+- **Presence.** Each guest's app sends a heartbeat (`POST host/presence`, every 15 s) with a summary of its own open
+  work in the joined project: thread, title, status, branch and its local file claims. The host keeps it in memory
+  for 90 s; the host supplies identities, clients only work summaries. Claims stay in the guest's local `claims`
+  table and travel only in this heartbeat; the 1b bridge never forwards `claim_paths`/`release_paths`/`list_claims`.
+- **Overlap checks.** `tools::call` runs `check_collaboration_overlap` right after a tool is authorised and before
+  anything goes to the bridge: `spawn_thread` and `claim_paths` that overlap someone else's work are refused with a
+  message, and the person's view shows the overlap and offers a note. `who_is_working_on` (every role) returns the
+  compact digest and checks a proposed title or paths. Each turn's prompt gets the same filtered digest
+  ("Collaborator activity") after 1c's `<project-update>`.
+- **Conflict notes.** A note is a request: the receiving thread's owner approves or declines each one (no
+  auto-approve). An approved note is delivered by `notes::deliver` only: idempotent (the note id is the message id),
+  a plain visible message queued with `pending = 2`, so it is read by the next turn the owner starts and never
+  schedules one. On a guest, approved notes come down through `GET host/notes-delivery` and are receipted.
+

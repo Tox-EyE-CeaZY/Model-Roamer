@@ -28,6 +28,9 @@ fn obj(props: Value, req: &[&str]) -> Value {
 }
 
 const DEFS: &[Def] = &[
+    Def { name: "who_is_working_on", roles: ALL, desc: "Read a compact live summary of other collaborators' threads, branches, status and claims. Pass a title or file paths to check a proposed task for overlaps.", schema: || obj(json!({
+        "title": {"type":"string"}, "paths": {"type":"array", "items":{"type":"string"}}
+    }), &[]) },
     // ---------------------------------------------------------------- orchestration (lead)
     Def { name: "spawn_thread", roles: LEAD, desc: "Open a worker thread for one task and hand it to an agent. It starts right away (or after the threads in depends_on finish). Give clear instructions and acceptance criteria. Returns the thread id.", schema: || obj(json!({
         "title": {"type": "string", "description": "Short title, verb first, 3-6 words"},
@@ -194,6 +197,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         bail!("{name} is for the lead only. Ask the lead in your reply instead.");
     }
     crate::collab_chat::guard_tool(core, name, args)?;
+    check_collaboration_overlap(core, caller, name, args)?;
     let tid = caller["id"].as_str().unwrap_or("").to_string();
     let project = caller["project_id"].as_str().map(str::to_string);
     let a = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();
@@ -220,6 +224,17 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     };
     tracing::info!(thread = %tid, tool = name, "tool call");
     match name {
+        "who_is_working_on" => {
+            let activity = crate::collab::presence::digest(core, caller);
+            let work = crate::collab::presence::Work {
+                title: a("title"), kind: "worker".into(), paths: proposed_claims(args), ..Default::default()
+            };
+            let overlaps = crate::collab::presence::caller_overlaps(core, caller, &work);
+            if !overlaps.is_empty() {
+                return Ok(format!("{activity}\nProposed work overlaps: {}", json!(overlaps)));
+            }
+            Ok(if activity.is_empty() { "No other active collaboration work is visible.".into() } else { activity })
+        }
         "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
@@ -574,6 +589,29 @@ fn local_memory_target(scope: Option<Scope>, project: Option<&str>) -> Result<(O
 pub(crate) fn validate_status(status: &str) -> Result<()> {
     if !matches!(status, "working" | "review" | "done" | "blocked") {
         bail!("status must be working, review, done or blocked");
+    }
+    Ok(())
+}
+
+fn proposed_claims(args: &Value) -> Vec<String> {
+    args["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(crate::collab::presence::normal_path).collect()
+}
+
+fn check_collaboration_overlap(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> Result<()> {
+    use crate::collab::presence::{preflight, Work};
+    let (proposed, message) = match name {
+        "spawn_thread" => (
+            Work { title: args["title"].as_str().unwrap_or("").trim().into(), kind: "worker".into(), ..Work::default() },
+            "This task overlaps another collaborator's work. The project chat shows the overlap and lets the person send a note. Tell the person before continuing with this task.",
+        ),
+        "claim_paths" => (
+            Work { paths: proposed_claims(args), ..Work::default() },
+            "These paths overlap another collaborator's work. No paths were claimed. The person's thread shows the overlap and offers to send a note.",
+        ),
+        _ => return Ok(()),
+    };
+    if !preflight(core, caller, proposed).is_empty() {
+        bail!("{message}");
     }
     Ok(())
 }

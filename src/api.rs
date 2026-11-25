@@ -1180,7 +1180,7 @@ async fn patch_agent(State(core): State<CoreRef>, Path(id): Path<String>, Json(b
 async fn add_custom_agent(State(core): State<CoreRef>, Json(b): Json<Value>) -> R {
     let mut list = core.settings()["custom_agents"].as_array().cloned().unwrap_or_default();
     let id = util::slug(&s(&b, "id").replace(' ', "-"), 24);
-    if ["claude", "codex", "antigravity"].contains(&id.as_str()) {
+    if ["claude", "codex", "antigravity", "local"].contains(&id.as_str()) {
         return Err(bad("That id belongs to a built-in agent."));
     }
     if s(&b, "command").is_empty() {
@@ -1204,6 +1204,16 @@ async fn remove_custom_agent(State(core): State<CoreRef>, Path(id): Path<String>
 /// A tiny real turn: proves the CLI runs, is signed in and can talk back.
 async fn test_agent(State(core): State<CoreRef>, Path(id): Path<String>) -> R {
     let a = core.adapter(&id).ok_or_else(|| bad("Unknown agent"))?;
+    if id == "local" {
+        let started = std::time::Instant::now();
+        let result = agents::local::test_connection(&core).await;
+        let (reply, error) = match result {
+            Ok(text) => (util::clip(text.trim(), 400), None),
+            Err(error) => (String::new(), Some(error.to_string())),
+        };
+        let ok = reply.to_uppercase().contains("ROAMER READY");
+        return Ok(Json(json!({ "ok": ok, "reply": reply, "error": error, "limit": null, "seconds": started.elapsed().as_secs() })));
+    }
     let prog = core.locate(&id).ok_or_else(|| bad(format!("{} isn't installed.", a.info().name)))?;
     let dir = core.data.join("scratch").join(format!("test-{id}"));
     std::fs::create_dir_all(&dir)?;

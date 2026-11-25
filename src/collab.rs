@@ -228,6 +228,21 @@ pub fn identify_member(core: &CoreRef, token: &str, ip: &str) -> Option<Member> 
     Some(Member { perms: effective(core, &project, &role, &r["perms"]), id, user_id: s(&r, "user_id"), name: s(&r, "name"), project_id: project, role, requested_role: s(&r, "requested_role") })
 }
 
+/// Recheck a member already authenticated by the host, including rules changed while an agent was running.
+pub(crate) fn refresh_member(core: &CoreRef, mut member: Member) -> Result<Member, ApiErr> {
+    let row = core.db.one(
+        "SELECT m.role, m.perms, u.name FROM collab_members m JOIN collab_users u ON u.id = m.user_id
+         JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL
+         WHERE m.id = ?1 AND m.user_id = ?2 AND m.project_id = ?3
+           AND m.revoked_at IS NULL AND u.revoked_at IS NULL",
+        &[&member.id, &member.user_id, &member.project_id],
+    )?.ok_or_else(|| ApiErr(StatusCode::UNAUTHORIZED, "The owner removed this membership.".into()))?;
+    member.role = s(&row, "role");
+    member.name = s(&row, "name");
+    member.perms = effective(core, &member.project_id, &member.role, &row["perms"]);
+    Ok(member)
+}
+
 // ------------------------------------------------------------------------------------------------ extension points
 
 /// The host's runner must not run a thread that belongs to a collaborator: its agents run on their machine, under
@@ -723,16 +738,7 @@ async fn h_changes(State(core): State<CoreRef>, Extension(m): Extension<Member>,
             Ok(Err(_)) => break,
         }
     }
-    let row = core.db.one(
-        "SELECT m.role, m.perms, u.name FROM collab_members m JOIN collab_users u ON u.id = m.user_id
-         JOIN projects p ON p.id = m.project_id AND p.deleted_at IS NULL
-         WHERE m.id = ?1 AND m.revoked_at IS NULL AND u.revoked_at IS NULL",
-        &[&m.id],
-    )?.ok_or_else(|| ApiErr(StatusCode::UNAUTHORIZED, "The owner removed this membership.".into()))?;
-    let mut m = m;
-    m.role = s(&row, "role");
-    m.name = s(&row, "name");
-    m.perms = effective(&core, &m.project_id, &m.role, &row["perms"]);
+    let m = refresh_member(&core, m)?;
     Ok(Json(changes_since(&core, &m, since)?))
 }
 
@@ -772,30 +778,34 @@ async fn h_post_message(State(core): State<CoreRef>, Extension(m): Extension<Mem
 }
 
 async fn h_create_thread(State(core): State<CoreRef>, Extension(m): Extension<Member>, Json(b): Json<Value>) -> R {
+    Ok(Json(create_member_thread(&core, &m, &b)?))
+}
+
+pub(crate) fn create_member_thread(core: &CoreRef, m: &Member, b: &Value) -> Result<Value, ApiErr> {
     m.need("create_threads")?;
-    let title = util::clip(&s(&b, "title"), 120);
+    let title = util::clip(&s(b, "title"), 120);
     if title.is_empty() {
         return Err(bad("A thread needs a title."));
     }
     let lead = core.lead_thread(&m.project_id)?;
     let id = util::id("th");
     let now = util::now_ms();
-    let agent = if s(&b, "agent").is_empty() { "guest".to_string() } else { util::slug(&s(&b, "agent"), 40) };
+    let agent = if s(b, "agent").is_empty() { "guest".to_string() } else { util::slug(&s(b, "agent"), 40) };
     let note = format!("Runs on {}'s machine", m.name);
-    let instructions = s(&b, "instructions");
+    let instructions = s(b, "instructions");
     let lead_id = s(&lead, "id");
     // paused, with no waiting message: this machine's runner never picks it up (see runs_here)
     core.db.exec(
-        "INSERT INTO threads(id, project_id, parent_id, kind, title, agent, status, status_note, instructions, created_at, updated_at, title_by, user_id)
-         VALUES (?1, ?2, ?3, 'worker', ?4, ?5, 'paused', ?6, ?7, ?8, ?8, 'person', ?9)",
-        &[&id, &m.project_id, &lead_id, &title, &agent, &note, &instructions, &now, &m.user_id],
+        "INSERT INTO threads(id, project_id, parent_id, kind, title, agent, status, status_note, instructions, created_at, updated_at, title_by, user_id, model, criteria)
+         VALUES (?1, ?2, ?3, 'worker', ?4, ?5, 'paused', ?6, ?7, ?8, ?8, 'person', ?9, ?10, ?11)",
+        &[&id, &m.project_id, &lead_id, &title, &agent, &note, &instructions, &now, &m.user_id, &s(b, "model"), &s(b, "criteria")],
     )?;
     let t = core.thread(&id)?;
     core.bus.emit("thread", Some(&m.project_id), Some(&id), t.clone());
     if !instructions.is_empty() {
-        runner::post(&core, &id, "user", &m.author(), &instructions, json!({ "user_id": m.user_id }), false)?;
+        runner::post(core, &id, "user", &m.author(), &instructions, json!({ "user_id": m.user_id }), false)?;
     }
-    Ok(Json(pick(&core.thread(&id)?, THREAD_FIELDS)))
+    Ok(pick(&core.thread(&id)?, THREAD_FIELDS))
 }
 
 async fn h_merge(State(core): State<CoreRef>, Extension(m): Extension<Member>, Path(id): Path<String>, Json(b): Json<Value>) -> R {

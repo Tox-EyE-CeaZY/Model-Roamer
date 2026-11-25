@@ -10,6 +10,24 @@ const WORKER: &str = include_str!("../prompts/worker.md");
 const REVIEW: &str = include_str!("../prompts/review.md");
 const CHAT: &str = include_str!("../prompts/chat.md");
 const HARNESS: &str = include_str!("../prompts/harness.md");
+const LOCAL: &str = include_str!("../prompts/local.md");
+
+pub(crate) fn local(thread: &Value, project: Option<&Value>, context: u32) -> String {
+    let budget = context as usize / 12;
+    let mut prompt = LOCAL.trim().to_owned();
+    for (label, value) in [
+        ("Project", project.map(|p| &p["name"])),
+        ("Project instructions", project.map(|p| &p["instructions"])),
+        ("Thread", Some(&thread["title"])),
+        ("Task", Some(&thread["instructions"])),
+        ("Acceptance criteria", Some(&thread["criteria"])),
+    ] {
+        if let Some(text) = value.and_then(Value::as_str).filter(|text| !text.trim().is_empty()) {
+            prompt.push_str(&format!("\n{label}: {}", crate::agents::local::clip_bytes(text, budget)));
+        }
+    }
+    prompt
+}
 
 /// The section of harness.md for one agent (custom agents share the generic one).
 fn harness(agent: &str) -> String {

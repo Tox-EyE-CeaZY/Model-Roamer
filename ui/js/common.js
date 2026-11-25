@@ -111,10 +111,25 @@ export function agentOptions({ leadOnly, auto, buddies = true } = {}) {
 /** How hard a model thinks. The levels come from the CLI's model list when it gives them (they differ per model),
  * else a common set; "" means the agent's own setting. Agents without a thinking setting get no options. */
 const EFFORT = { minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
+const EFFORT_LEVEL_RE = /^(minimal|low|medium|high|xhigh|extra[\s_-]+high|max|ultra)$/i;
+function antigravityAcceptsEffort(model, opt) {
+  const id = String(model || '').trim();
+  if (!id) return true;
+  const tail = id.split(/[-_]/).pop();
+  if (tail && id.length > tail.length && EFFORT_LEVEL_RE.test(tail)) return false;
+  for (const t of [id, opt?.label, opt?.note].filter(Boolean).map((s) => String(s).trim())) {
+    if (/orchestrator/i.test(t)) return false;
+    for (const m of t.matchAll(/\(([^)]+)\)/g)) {
+      if (EFFORT_LEVEL_RE.test(m[1].trim())) return false;
+    }
+  }
+  return true;
+}
 export function effortOptions(agentId, model, defaultLabel = 'Default thinking') {
   if (!['claude', 'codex', 'antigravity'].includes(agentId)) return null;
   const ms = agent(agentId).info?.models || [];
   const m = ms.find((x) => x.id === model);
+  if (agentId === 'antigravity' && !m?.efforts?.length && !antigravityAcceptsEffort(model, m)) return null;
   const lv = m?.efforts?.length ? m.efforts : [...new Set(ms.flatMap((x) => x.efforts || []))];
   const list = lv.length ? lv : agentId === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high'];
   return [['', defaultLabel], ...list.map((e) => [e, EFFORT[e] || e])];

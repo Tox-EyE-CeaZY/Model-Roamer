@@ -114,6 +114,7 @@ pub fn router(core: CoreRef) -> Router {
             get(crate::local_llm::api_check_update).post(crate::local_llm::api_update),
         )
         .route("/api/local-llm/rollback", post(crate::local_llm::api_rollback))
+        .route("/api/local-llm/cancel", post(crate::local_llm::api_cancel))
         // remote access
         .route("/api/network", get(network))
         .route("/api/network/tailscale-serve", post(tailscale_serve))

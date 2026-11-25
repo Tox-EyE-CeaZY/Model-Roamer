@@ -333,7 +333,7 @@ export default async function localModel(el) {
     try {
       await post('local-llm/cancel');
       if (!alive) return;
-      toast('Download cancelled. Partial files are kept so you can resume later.');
+      toast('Download cancelled.');
       await loadStatus({ silent: true });
     } catch (e) {
       if (!alive) return;

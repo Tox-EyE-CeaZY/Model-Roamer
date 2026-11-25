@@ -20,7 +20,10 @@ use std::{
     net::TcpListener,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -1194,6 +1197,8 @@ impl Runtime {
 struct Manager {
     root: PathBuf,
     install: Arc<AsyncMutex<()>>,
+    install_task: Mutex<Option<(u64, &'static str, tokio::task::AbortHandle)>>,
+    op_seq: AtomicU64,
     runtime: AsyncMutex<Runtime>,
     hardware: OnceCell<Hardware>,
     vulkan: AsyncMutex<HashMap<String, Option<Gpu>>>,
@@ -1214,6 +1219,8 @@ fn manager(core: &CoreRef) -> Arc<Manager> {
             Arc::new(Manager {
                 root,
                 install: Arc::default(),
+                install_task: Mutex::new(None),
+                op_seq: AtomicU64::new(0),
                 runtime: AsyncMutex::default(),
                 hardware: OnceCell::new(),
                 vulkan: AsyncMutex::default(),
@@ -1621,6 +1628,42 @@ pub async fn ensure_running(core: &CoreRef) -> Result<Endpoint> {
     tokio::spawn(async move { manager.ensure(&core).await }).await?
 }
 
+fn remove_part_files(root: &Path) {
+    for sub in ["downloads", "weights"] {
+        let Ok(entries) = fs::read_dir(root.join(sub)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".part"))
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |m| m.len()),
+            Ok(kind) if kind.is_dir() => dir_size(&entry.path()),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn free_space_for(path: &Path) -> Option<u64> {
+    let existing = path.ancestors().find(|dir| dir.exists())?;
+    free_disk_bytes(existing).ok()
+}
+
 pub async fn status(core: &CoreRef) -> Value {
     let manager = manager(core);
     let detected = manager.detected().await;
@@ -1656,6 +1699,9 @@ pub async fn status(core: &CoreRef) -> Value {
         "models": MODELS.iter().map(|model| json!({ "id": model.id, "name": model.name, "bytes": model.size })).collect::<Vec<_>>(),
         "progress": manager.progress_status.lock().unwrap().clone(),
         "runtime": manager.runtime_status.lock().unwrap().clone(),
+        "models_dir": manager.root.display().to_string(),
+        "free_bytes": free_space_for(&manager.root),
+        "used_bytes": dir_size(&manager.root),
         "idle_seconds": IDLE.as_secs(),
         "warning": warning,
         "error": manifest_error,
@@ -1694,14 +1740,17 @@ fn enqueue(core: CoreRef, operation: Install) -> R {
         Install::Update => "update",
         Install::Rollback => "rollback",
     };
+    let op_id = manager.op_seq.fetch_add(1, Ordering::Relaxed) + 1;
     manager.progress(&core, Progress::stage("starting", stage));
-    tokio::spawn(async move {
+    let mut slot = manager.install_task.lock().unwrap();
+    let task_manager = manager.clone();
+    let handle = tokio::spawn(async move {
         let _lock = lock;
         let _lock_file = lock_file;
         let result = match operation {
-            Install::Setup(model) => manager.setup(&core, model).await,
-            Install::Update => manager.update(&core).await,
-            Install::Rollback => manager.rollback(&core).await,
+            Install::Setup(model) => task_manager.setup(&core, model).await,
+            Install::Update => task_manager.update(&core).await,
+            Install::Rollback => task_manager.rollback(&core).await,
         };
         let progress = match result {
             Ok(()) => Progress::stage("ready", stage),
@@ -1710,9 +1759,32 @@ fn enqueue(core: CoreRef, operation: Install) -> R {
                 ..Progress::stage("error", stage)
             },
         };
-        manager.progress(&core, progress);
+        task_manager.progress(&core, progress);
+        let mut active = task_manager.install_task.lock().unwrap();
+        if active.as_ref().is_some_and(|(id, _, _)| *id == op_id) {
+            *active = None;
+        }
     });
+    *slot = Some((op_id, stage, handle.abort_handle()));
     Ok(Json(json!({ "started": true })))
+}
+
+async fn cancel_install(core: &CoreRef) -> bool {
+    let manager = manager(core);
+    let active = manager.install_task.lock().unwrap().take();
+    let Some((_, stage, abort)) = active else {
+        return false;
+    };
+    abort.abort();
+    // Wait for the aborted task to unwind and release any open .part handles before deleting them.
+    let _lock = manager.install.lock().await;
+    remove_part_files(&manager.root);
+    manager.progress(core, Progress::stage("cancelled", stage));
+    true
+}
+
+pub async fn api_cancel(State(core): State<CoreRef>) -> R {
+    Ok(Json(json!({ "cancelled": cancel_install(&core).await })))
 }
 
 pub async fn api_status(State(core): State<CoreRef>) -> R {
@@ -2014,5 +2086,61 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
         assert!(!dest.exists());
         assert!(!part.exists());
+    }
+
+    #[tokio::test]
+    async fn cancels_an_active_download_and_cleans_part_files() {
+        let dir = Scratch::new();
+        let core = crate::core::Core::open(dir.0.clone(), true).unwrap();
+        let mgr = manager(&core);
+        let weights_part = mgr.root.join("weights").join("model.gguf.part");
+        let engine_part = mgr.root.join("downloads").join("engine.zip.part");
+        fs::create_dir_all(weights_part.parent().unwrap()).unwrap();
+        fs::create_dir_all(engine_part.parent().unwrap()).unwrap();
+        fs::write(&engine_part, b"partial-engine").unwrap();
+
+        let mut bus = core.bus.subscribe();
+        let lock = mgr.install.clone().try_lock_owned().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let part_path = weights_part.clone();
+        let op_id = mgr.op_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let handle = tokio::spawn(async move {
+            let _lock = lock;
+            let mut file = tokio::fs::File::create(&part_path).await.unwrap();
+            file.write_all(b"partial-weights").await.unwrap();
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        *mgr.install_task.lock().unwrap() = Some((op_id, "setup", handle.abort_handle()));
+        mgr.progress(&core, Progress::stage("downloading", "model"));
+        started_rx.await.unwrap();
+        assert!(weights_part.exists());
+        assert!(engine_part.exists());
+
+        assert!(cancel_install(&core).await);
+        assert!(!weights_part.exists());
+        assert!(!engine_part.exists());
+        assert_eq!(mgr.progress_status.lock().unwrap().state, "cancelled");
+        assert!(!mgr.progress_status.lock().unwrap().running);
+
+        let mut saw_cancelled = false;
+        while let Ok(ev) = bus.try_recv() {
+            if ev.kind == "local_llm"
+                && ev.data["progress"]["state"].as_str() == Some("cancelled")
+                && ev.data["progress"]["running"].as_bool() == Some(false)
+            {
+                saw_cancelled = true;
+            }
+        }
+        assert!(saw_cancelled, "expected cancelled progress event on bus");
+        assert!(!cancel_install(&core).await);
+
+        let st = status(&core).await;
+        assert_eq!(
+            st["models_dir"].as_str(),
+            Some(mgr.root.display().to_string().as_str())
+        );
+        assert!(st["free_bytes"].as_u64().is_some_and(|free| free > 0));
+        assert_eq!(st["used_bytes"].as_u64(), Some(0));
     }
 }

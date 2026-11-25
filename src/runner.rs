@@ -6,7 +6,7 @@
 //! and moved to another agent, and survive a crash: turns that were running when the app stopped run again on start.
 
 use crate::{
-    agents::{AgentEvent, Autonomy, McpLaunch, TurnSpec},
+    agents::{local, AgentEvent, Autonomy, McpLaunch, TurnSpec},
     core::{CoreRef, Running},
     git, github, procs, prompts, tools,
     util::{self, clip},
@@ -143,10 +143,10 @@ pub async fn create_worker(core: &CoreRef, project: &str, w: NewWorker) -> Resul
     } else {
         let agent = w.agent.to_lowercase();
         if core.adapter(&agent).is_none() {
-            bail!("There's no agent called '{agent}'. Use claude, codex, antigravity or a custom agent's id.");
+            bail!("There's no agent called '{agent}'. Use a built-in or custom agent's id from Agents.");
         }
         let preferred = effective_model(core, &agent, &w.model);
-        let model = if w.allow_limited {
+        let model = if w.allow_limited || agent == "local" {
             preferred
         } else {
             choose_model(core, &agent, &w.model).ok_or_else(|| anyhow!(
@@ -312,6 +312,10 @@ pub(crate) fn model_label(model: &str) -> &str {
 
 fn choose_model(core: &CoreRef, agent: &str, requested: &str) -> Option<String> {
     let preferred = effective_model(core, agent, requested);
+    if agent == "local" {
+        let (active, _) = crate::local_llm::installation(core)?;
+        return (preferred.is_empty() || preferred == active).then_some(active);
+    }
     if core.model_limit(agent, &preferred)["active"] != true {
         return Some(preferred);
     }
@@ -528,6 +532,9 @@ fn agent_ready(core: &CoreRef, agent: &str) -> bool {
     if core.adapter(agent).is_none() || core.agent_cfg(agent)["enabled"] == false || core.is_limited(agent) {
         return false;
     }
+    if agent == "local" {
+        return crate::local_llm::installation(core).is_some();
+    }
     let st = core.status_cache.lock().ok().and_then(|c| c.get(agent).cloned());
     match st {
         Some(st) => st["installed"] != false && st["auth"]["signed_in"] != "no",
@@ -541,6 +548,9 @@ fn why_not(core: &CoreRef, agent: &str) -> String {
     }
     if core.agent_cfg(agent)["enabled"] == false {
         return "turned off".into();
+    }
+    if agent == "local" && crate::local_llm::installation(core).is_none() {
+        return "set it up in Settings → Local model".into();
     }
     if choose_model(core, agent, "").is_none() {
         return "out of usage".into();
@@ -817,6 +827,7 @@ enum Outcome {
 }
 
 fn thread_limited(core: &CoreRef, thread: &Value, agent: &str) -> bool {
+    if agent == "local" { return false; }
     let model = effective_model(core, agent, thread["model"].as_str().unwrap_or(""));
     core.model_limit(agent, &model)["active"] == true
 }
@@ -844,26 +855,44 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     if core.agent_cfg(&agent)["enabled"] == false {
         bail!("{} is turned off in Agents. Turn it on or reassign this thread.", adapter.info().name);
     }
-    let Some(program) = core.locate(&agent) else {
-        bail!("{} isn't installed on {}. Open Agents to install it, or reassign this thread.", adapter.info().name, core.display_name());
+    let in_process = agent == "local";
+    let program = if in_process { None } else {
+        Some(core.locate(&agent).ok_or_else(|| anyhow!("{} isn't installed on {}. Open Agents to install it, or reassign this thread.", adapter.info().name, core.display_name()))?)
     };
 
     // wait for a free slot for this agent
-    let slot = core.slot(&agent);
-    let permit = match slot.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            core.set_status(thread, "queued", &format!("Waiting for a free {agent} slot"))?;
-            tokio::select! {
-                p = slot.acquire_owned() => p?,
-                _ = cancel.changed() => return Ok(()),
+    let (permit, local_permit) = if in_process {
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.changed() => return Ok(()),
+            p = local::acquire(core, None, || {
+                let _ = core.set_status(thread, "queued", "Waiting for the local model");
+            }) => p?,
+            _ = tokio::time::sleep(Duration::from_secs(300)) => bail!("Timed out waiting for the local model queue."),
+        };
+        (None, Some(permit))
+    } else {
+        let slot = core.slot(&agent);
+        let permit = match slot.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                core.set_status(thread, "queued", &format!("Waiting for a free {agent} slot"))?;
+                tokio::select! {
+                    p = slot.acquire_owned() => p?,
+                    _ = cancel.changed() => return Ok(()),
+                }
             }
-        }
+        };
+        (Some(permit), None)
     };
 
     if thread_limited(core, &t, &agent) {
         drop(permit);
         on_limit(core, &t, &agent, pid.as_deref())?;
+        return Ok(());
+    }
+
+    if *cancel.borrow() {
         return Ok(());
     }
 
@@ -884,7 +913,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     core.bus.emit("read", t["project_id"].as_str(), Some(thread), json!({ "ids": input_ids, "pending": false }));
 
     core.set_status(thread, "working", "")?;
-    let workspace = match prepare_workspace(core, &t, project.as_ref()).await {
+    let workspace = match if in_process { Ok(PathBuf::new()) } else { prepare_workspace(core, &t, project.as_ref()).await } {
         Ok(w) => w,
         Err(e) => {
             requeue(core, &input_ids);
@@ -896,32 +925,42 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
 
     let turn_id = util::id("turn");
     let scratch = core.data.join("turns").join(&turn_id);
-    std::fs::create_dir_all(&scratch)?;
-    let token = util::secret();
-    core.turn_tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(token.clone(), thread.to_string());
-    let mcp = McpLaunch {
+    let token = if in_process { None } else {
+        std::fs::create_dir_all(&scratch)?;
+        let token = util::secret();
+        core.turn_tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(token.clone(), thread.to_string());
+        Some(token)
+    };
+    let mcp = token.as_ref().map(|token| McpLaunch {
         command: core.exe.display().to_string(),
         args: vec!["mcp".into()],
         env: vec![("MR_MCP_URL".into(), format!("{}/api/mcp", core.base_url())), ("MR_MCP_TOKEN".into(), token.clone())],
-    };
-    let session = (t["session_agent"].as_str() == Some(agent.as_str()) && !t["session_id"].as_str().unwrap_or("").is_empty()).then(|| t["session_id"].as_str().unwrap_or("").to_string());
+    });
+    let session = (!in_process && t["session_agent"].as_str() == Some(agent.as_str()) && !t["session_id"].as_str().unwrap_or("").is_empty()).then(|| t["session_id"].as_str().unwrap_or("").to_string());
     let target: Option<Value> = None; // a review's instructions already name the thread it reviews
+    let collab_update = if in_process { String::new() } else { crate::collab_chat::before_turn(core, &t).await };
     // a joined project: the host's project picture, fresh, and what changed there since the lead's last turn
-    let collab_update = crate::collab_chat::before_turn(core, &t).await;
-    let system = prompts::system(core, &prompts::Ctx { thread: &t, project: project.as_ref(), workspace: workspace.display().to_string(), mcp: adapter.info().mcp, target: target.as_ref() });
+    let system = if in_process { String::new() } else {
+        prompts::system(core, &prompts::Ctx { thread: &t, project: project.as_ref(), workspace: workspace.display().to_string(), mcp: adapter.info().mcp, target: target.as_ref() })
+    };
     let mut prompt = String::new();
-    if session.is_none() {
-        prompt.push_str(&recap(core, thread, &input_ids));
+    if !in_process {
+        if session.is_none() {
+            prompt.push_str(&recap(core, thread, &input_ids));
+        }
+        if t["kind"] == "lead" {
+            // every turn, so a session started under older instructions (or one with no system prompt) still knows
+            prompt.push_str(LEAD_REMINDER);
+        }
+        prompt.push_str(&collab_update);
+        prompt.push_str(&crate::collab::presence::digest(core, &t));
     }
-    if t["kind"] == "lead" {
-        // every turn, so a session started under older instructions (or one with no system prompt) still knows
-        prompt.push_str(LEAD_REMINDER);
-    }
-    prompt.push_str(&collab_update);
-    prompt.push_str(&crate::collab::presence::digest(core, &t));
     prompt.push_str(&format_inputs(&inputs));
     let cfg = core.agent_cfg(&agent);
-    let model = t["model"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| cfg["model"].as_str().unwrap_or("").to_string());
+    let mut model = t["model"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| cfg["model"].as_str().unwrap_or("").to_string());
+    if in_process && model.is_empty() {
+        if let Some((active, _)) = crate::local_llm::installation(core) { model = active; }
+    }
     let mut extra_dirs = vec![];
     if t["kind"] == "worker" || t["kind"] == "review" {
         if let Some(p) = &project {
@@ -939,15 +978,18 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         model: model.clone(),
         effort: t["effort"].as_str().filter(|e| !e.is_empty()).or(cfg["effort"].as_str()).unwrap_or("").to_string(),
         autonomy: Autonomy::parse(cfg["autonomy"].as_str().unwrap_or("full")),
-        mcp: Some(mcp.clone()),
+        mcp,
         extra_dirs,
         scratch: scratch.clone(),
         extra_args: cfg["extra_args"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
         headless: core.headless,
         lead: t["kind"] == "lead",
     };
-    let mut launch = adapter.launch(&spec)?;
-    launch.pty = launch.pty || adapter.needs_pty();
+    let cli = program.map(|program| -> Result<_> {
+        let mut launch = adapter.launch(&spec)?;
+        launch.pty = launch.pty || adapter.needs_pty();
+        Ok((program, launch))
+    }).transpose()?;
     let now = util::now_ms();
     let inputs_s = input_ids.join(",");
     core.db.exec(
@@ -970,9 +1012,18 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             let _ = writeln!(f, "{s}");
         }
     };
-    log_line(&format!("$ {} {} {}", program.shown, program.prefix.join(" "), launch.args.iter().map(|a| clip(a, 200)).collect::<Vec<_>>().join(" ")));
-
-    let mut stream = procs::stream(&program, &launch)?;
+    let mut stream = if let Some((program, launch)) = cli {
+        log_line(&format!("$ {} {} {}", program.shown, program.prefix.join(" "), launch.args.iter().map(|a| clip(a, 200)).collect::<Vec<_>>().join(" ")));
+        Some(procs::stream(&program, &launch)?)
+    } else { None };
+    let (event_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let mut native = Box::pin(async {
+        let result = local::run_owner_turn(core, &t, &model, &spec.prompt, &input_ids, &turn_id, |event| {
+            let _ = event_tx.send(Ok(event));
+        }).await;
+        let _ = event_tx.send(Err(result));
+    });
+    let mut native_ready = in_process;
     let s = core.settings();
     let idle = Duration::from_secs(s["idle_timeout_min"].as_u64().unwrap_or(25).max(2) * 60);
     let max = Duration::from_secs(s["max_turn_min"].as_u64().unwrap_or(180).max(5) * 60);
@@ -994,94 +1045,112 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
     let mut cancelled = false;
     let mut timed_out = None;
     loop {
-        let line = tokio::select! {
-            l = stream.rx.recv() => l,
-            _ = cancel.changed() => { cancelled = true; stream.kill().await; break; }
-            _ = tokio::time::sleep(idle) => { timed_out = Some(format!("no output for {} minutes", idle.as_secs() / 60)); stream.kill().await; break; }
-            _ = tokio::time::sleep_until(deadline) => { timed_out = Some(format!("the turn ran longer than {} minutes", max.as_secs() / 60)); stream.kill().await; break; }
-        };
-        let Some(line) = line else { break };
-        match line {
-            procs::Line::Exit(c) => {
-                exit = c;
-                break;
-            }
-            procs::Line::Err(e) => {
-                log_line(&format!("[stderr] {e}"));
-                if !e.trim().is_empty() {
-                    stderr_tail.push(e.clone());
-                    if stderr_tail.len() > 40 {
-                        stderr_tail.remove(0);
+        let parsed = tokio::select! {
+            biased;
+            _ = cancel.changed() => { cancelled = true; break; }
+            _ = tokio::time::sleep(idle) => { timed_out = Some(format!("no output for {} minutes", idle.as_secs() / 60)); break; }
+            _ = tokio::time::sleep_until(deadline) => { timed_out = Some(format!("the turn ran longer than {} minutes", max.as_secs() / 60)); break; }
+            Some(event) = events.recv(), if in_process => match event {
+                Ok(event) => vec![event],
+                Err(result) => {
+                    exit = Some(if result.is_ok() { 0 } else { 1 });
+                    if let Err(error) = result {
+                        let error = error.to_string();
+                        add_activity(core, &t, &turn_id, "error", "Local model", &error);
+                        errs.push(error);
                     }
-                    if let Some(until) = crate::agents::limit_in(&e).filter(|_| e.len() < 500) {
-                        limit = Some((until, e.trim().to_string()));
+                    break;
+                }
+            },
+            _ = &mut native, if native_ready => { native_ready = false; continue; }
+            line = async { stream.as_mut().unwrap().rx.recv().await }, if !in_process => match line {
+                None => break,
+                Some(procs::Line::Exit(code)) => { exit = code; break; }
+                Some(procs::Line::Err(e)) => {
+                    log_line(&format!("[stderr] {e}"));
+                    if !e.trim().is_empty() {
+                        stderr_tail.push(e.clone());
+                        if stderr_tail.len() > 40 { stderr_tail.remove(0); }
+                        if let Some(until) = crate::agents::limit_in(&e).filter(|_| e.len() < 500) {
+                            limit = Some((until, e.trim().to_string()));
+                        }
+                    }
+                    continue;
+                }
+                Some(procs::Line::Out(l)) => {
+                    log_line(&l);
+                    adapter.parse(&l, &mut st)
+                }
+            },
+        };
+        for ev in parsed {
+            match ev {
+                AgentEvent::Session(id) => new_session = Some(id),
+                AgentEvent::Delta(d) => {
+                    cur.push_str(&d);
+                    core.bus.emit("delta", pid.as_deref(), Some(thread), json!({ "turn_id": turn_id, "text": d }));
+                }
+                AgentEvent::Text(x) => {
+                    cur.clear();
+                    if !x.trim().is_empty() {
+                        segments.push(x.clone());
+                        core.bus.emit("delta", pid.as_deref(), Some(thread), json!({ "turn_id": turn_id, "block": x }));
+                        add_activity(core, &t, &turn_id, "text", "", &x);
                     }
                 }
-            }
-            procs::Line::Out(l) => {
-                log_line(&l);
-                for ev in adapter.parse(&l, &mut st) {
-                    match ev {
-                        AgentEvent::Session(id) => new_session = Some(id),
-                        AgentEvent::Delta(d) => {
-                            cur.push_str(&d);
-                            core.bus.emit("delta", pid.as_deref(), Some(thread), json!({ "turn_id": turn_id, "text": d }));
-                        }
-                        AgentEvent::Text(x) => {
-                            cur.clear();
-                            if !x.trim().is_empty() {
-                                segments.push(x.clone());
-                                core.bus.emit("delta", pid.as_deref(), Some(thread), json!({ "turn_id": turn_id, "block": x }));
-                                add_activity(core, &t, &turn_id, "text", "", &x);
-                            }
-                        }
-                        AgentEvent::Thinking(x) => {
-                            flush_text(core, &t, &turn_id, &mut cur, &mut segments);
-                            add_activity(core, &t, &turn_id, "thinking", "Thinking", &x);
-                        }
-                        AgentEvent::ToolUse { id: _, name, input } => {
-                            flush_text(core, &t, &turn_id, &mut cur, &mut segments);
-                            last_tool_seg = segments.len();
-                            add_activity(core, &t, &turn_id, "tool", name.trim_start_matches("mcp__roamer__"), &input);
-                        }
-                        AgentEvent::ToolResult { id: _, output, error } => add_activity(core, &t, &turn_id, if error { "error" } else { "result" }, if error { "Tool error" } else { "Result" }, &output),
-                        AgentEvent::Usage { input, output, cached, cost } => {
-                            usage.0 += input;
-                            usage.1 += output;
-                            usage.2 += cached;
-                            usage.3 += cost;
-                        }
-                        AgentEvent::Final(x) => final_text = Some(x),
-                        AgentEvent::Limit { until, message } => {
-                            let scoped = |m: &str| crate::quota::limit_scope(&agent, &model, m).is_some();
-                            if limit.as_ref().is_none_or(|(previous_reset, previous_message): &(Option<i64>, String)| {
-                                (scoped(&message), until.is_some()) >= (scoped(previous_message), previous_reset.is_some())
-                            }) {
-                                limit = Some((until, message));
-                            }
-                        }
-                        AgentEvent::Error(e) => {
-                            flush_text(core, &t, &turn_id, &mut cur, &mut segments);
-                            add_activity(core, &t, &turn_id, "error", "Error", &e);
-                            errs.push(e);
-                        }
-                        AgentEvent::Raw(r) => raw.push(r),
-                        AgentEvent::Quota(q) => core.update_quota(&agent, &q),
-                        AgentEvent::Context { used, window } => {
-                            let w = if window > 0 { window } else { ctx_seen.map(|c| c.1).unwrap_or(0) };
-                            ctx_seen = Some((if used > 0 { used } else { ctx_seen.map(|c| c.0).unwrap_or(0) }, w));
-                        }
-                        AgentEvent::Compacted { trigger, before } => {
-                            add_activity(core, &t, &turn_id, "info", "Compacted", &format!("The conversation was compacted to make room ({trigger}{}).", if before > 0 { format!(", {before} tokens before") } else { String::new() }));
-                            compacted.push((trigger, before));
-                        }
+                AgentEvent::Thinking(x) => {
+                    flush_text(core, &t, &turn_id, &mut cur, &mut segments);
+                    add_activity(core, &t, &turn_id, "thinking", "Thinking", &x);
+                }
+                AgentEvent::Progress(text) => add_activity(core, &t, &turn_id, "info", "Local model", &text),
+                AgentEvent::ToolUse { id: _, name, input } => {
+                    flush_text(core, &t, &turn_id, &mut cur, &mut segments);
+                    last_tool_seg = segments.len();
+                    add_activity(core, &t, &turn_id, "tool", name.trim_start_matches("mcp__roamer__"), &input);
+                }
+                AgentEvent::ToolResult { id: _, output, error } => add_activity(core, &t, &turn_id, if error { "error" } else { "result" }, if error { "Tool error" } else { "Result" }, &output),
+                AgentEvent::Usage { input, output, cached, cost } => {
+                    usage.0 += input;
+                    usage.1 += output;
+                    usage.2 += cached;
+                    usage.3 += cost;
+                }
+                AgentEvent::Final(x) => final_text = Some(x),
+                AgentEvent::Limit { until, message } => {
+                    let scoped = |m: &str| crate::quota::limit_scope(&agent, &model, m).is_some();
+                    if limit.as_ref().is_none_or(|(previous_reset, previous_message): &(Option<i64>, String)| {
+                        (scoped(&message), until.is_some()) >= (scoped(previous_message), previous_reset.is_some())
+                    }) {
+                        limit = Some((until, message));
                     }
+                }
+                AgentEvent::Error(e) => {
+                    flush_text(core, &t, &turn_id, &mut cur, &mut segments);
+                    add_activity(core, &t, &turn_id, "error", "Error", &e);
+                    errs.push(e);
+                }
+                AgentEvent::Raw(r) => raw.push(r),
+                AgentEvent::Quota(q) => core.update_quota(&agent, &q),
+                AgentEvent::Context { used, window } => {
+                    let w = if window > 0 { window } else { ctx_seen.map(|c| c.1).unwrap_or(0) };
+                    ctx_seen = Some((if used > 0 { used } else { ctx_seen.map(|c| c.0).unwrap_or(0) }, w));
+                }
+                AgentEvent::Compacted { trigger, before } => {
+                    add_activity(core, &t, &turn_id, "info", "Compacted", &format!("The conversation was compacted to make room ({trigger}{}).", if before > 0 { format!(", {before} tokens before") } else { String::new() }));
+                    compacted.push((trigger, before));
                 }
             }
         }
     }
+    drop(native);
+    if cancelled || timed_out.is_some() {
+        if let Some(stream) = stream.as_mut() { stream.kill().await; }
+    }
     drop(permit);
-    core.turn_tokens.lock().unwrap_or_else(|p| p.into_inner()).remove(&token);
+    drop(local_permit);
+    if let Some(token) = token {
+        core.turn_tokens.lock().unwrap_or_else(|p| p.into_inner()).remove(&token);
+    }
     flush_text(core, &t, &turn_id, &mut cur, &mut segments);
     // the reply: what the CLI called final, else the text after its last tool call, else all of it
     let mut reply = final_text.clone().filter(|f| !f.trim().is_empty()).unwrap_or_else(|| {
@@ -1096,7 +1165,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         }
         reply = raw.join("\n").trim().to_string();
     }
-    if limit.is_none() && reply.trim().is_empty() {
+    if !in_process && limit.is_none() && reply.trim().is_empty() {
         for e in errs.iter().chain(stderr_tail.iter()) {
             if let Some(until) = crate::agents::limit_in(e)
                 .or_else(|| crate::quota::model_restriction(&agent, &model, e).then_some(None))
@@ -1115,7 +1184,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         });
 
     // a transient failure, unless the agent got real work done anyway (an error text alone doesn't count as a reply)
-    let transient = !cancelled
+    let transient = !in_process && !cancelled
         && limit.is_none()
         && (errs.iter().chain(stderr_tail.iter()).any(|e| transient_error(e)) || (reply.len() < 600 && transient_error(&reply)))
         && (reply.trim().is_empty() || transient_error(&reply));
@@ -1146,7 +1215,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         Outcome::Failed
     } else if session_failed {
         Outcome::RetryFresh
-    } else if timed_out.is_some() || (reply.trim().is_empty() && (exit.unwrap_or(1) != 0 || !errs.is_empty())) {
+    } else if timed_out.is_some() || (in_process && exit != Some(0)) || (reply.trim().is_empty() && (exit.unwrap_or(1) != 0 || !errs.is_empty())) {
         Outcome::Failed
     } else {
         Outcome::Done
@@ -1229,7 +1298,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
             let detail = clip(&err_s, 1500);
             let hint = if transient {
                 format!(" It kept failing after {} tries. If Claude Code is open somewhere else on this computer, close it; otherwise sign {} in again.", TRANSIENT_RETRIES.len() + 1, adapter.info().name)
-            } else if stderr_tail.iter().chain(errs.iter()).any(|e| { let l = e.to_lowercase(); l.contains("login") || l.contains("log in") || l.contains("sign in") || l.contains("unauthorized") || l.contains("authenticat") }) {
+            } else if !in_process && stderr_tail.iter().chain(errs.iter()).any(|e| { let l = e.to_lowercase(); l.contains("login") || l.contains("log in") || l.contains("sign in") || l.contains("unauthorized") || l.contains("authenticat") }) {
                 format!(" It looks like {} needs to sign in again: open Agents and choose Sign in.", adapter.info().name)
             } else {
                 String::new()
@@ -1256,7 +1325,7 @@ async fn run_turn(core: &CoreRef, thread: &str, cancel: &mut watch::Receiver<boo
         }
         Outcome::Done => {
             // tools called through the text protocol run now, and their results start the next round
-            let (clean, calls) = tools::text_calls(&reply);
+            let (clean, calls) = if in_process { (reply, vec![]) } else { tools::text_calls(&reply) };
             if !clean.trim().is_empty() {
                 post(core, thread, "agent", &adapter.info().name, &clean, json!({ "agent": agent, "model": model, "turn_id": turn_id }), false)?;
                 core.db.exec("UPDATE threads SET unread = 1 WHERE id = ?1", &[&thread])?;
@@ -1644,12 +1713,19 @@ pub fn overview(core: &CoreRef, project: &str) -> String {
 pub fn recover(core: &CoreRef) {
     tokio::spawn(crate::collab::presence::run(core.clone()));
     let now = util::now_ms();
-    let interrupted = core.db.all("SELECT id, thread_id, inputs FROM turns WHERE status = 'running'", &[]).unwrap_or_default();
+    let interrupted = core.db.all("SELECT id, thread_id, inputs, agent, error FROM turns WHERE status = 'running'", &[]).unwrap_or_default();
     for t in &interrupted {
         let ids: Vec<String> = t["inputs"].as_str().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+        let tid = t["thread_id"].as_str().unwrap_or("");
+        if t["agent"] == "local" && t["error"] == local::WRITE_MARKER {
+            let detail = "Model Roamer stopped while a local tool could have changed the project. Check what the tool did before choosing Retry.";
+            let _ = core.db.exec("UPDATE turns SET status = 'failed', error = ?1, ended_at = ?2 WHERE id = ?3", &[&detail, &now, &t["id"].as_str().unwrap_or("")]);
+            let _ = core.set_status(tid, "failed", detail);
+            note(core, tid, detail);
+            continue;
+        }
         requeue(core, &ids);
         let _ = core.db.exec("UPDATE turns SET status = 'failed', error = 'Interrupted: Model Roamer stopped during this turn', ended_at = ?1 WHERE id = ?2", &[&now, &t["id"].as_str().unwrap_or("")]);
-        let tid = t["thread_id"].as_str().unwrap_or("");
         let _ = post(core, tid, "wake", "Model Roamer", &format!("<wake reason=\"restarted\" at=\"{}\">Model Roamer restarted while you were working. Check the state of your workspace, then carry on.</wake>", util::now_iso()), json!({}), false);
         let _ = core.db.exec("UPDATE messages SET pending = 1 WHERE id = (SELECT id FROM messages WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT 1)", &[&tid]);
     }

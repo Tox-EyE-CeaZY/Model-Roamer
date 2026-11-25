@@ -20,7 +20,7 @@ use std::{
     net::TcpListener,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -94,6 +94,15 @@ fn model(id: &str) -> Result<&'static Model> {
         .iter()
         .find(|m| m.id == id)
         .context("Unknown local model")
+}
+
+pub(crate) fn model_options() -> Vec<crate::agents::ModelOpt> {
+    MODELS.iter().map(|m| crate::agents::ModelOpt {
+        id: m.id.into(),
+        label: m.name.into(),
+        note: "Select and download this model in Settings → Local model.".into(),
+        ..Default::default()
+    }).collect()
 }
 
 impl Model {
@@ -884,10 +893,29 @@ fn remove_dir(path: &Path) -> io::Result<()> {
 pub struct Endpoint {
     pub base_url: String,
     pub api_key: String,
+    pub context: u32,
+    pub model: String,
+    stopped: Arc<AtomicBool>,
     lease: Arc<()>,
 }
 
 impl Endpoint {
+    pub(crate) fn was_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(base_url: String) -> Self {
+        Self {
+            base_url,
+            api_key: "fake-key".into(),
+            model: "fake-model".into(),
+            context: 4096,
+            stopped: Arc::default(),
+            lease: Arc::default(),
+        }
+    }
+
     fn in_use(&self) -> bool {
         Arc::strong_count(&self.lease) > 1
     }
@@ -957,6 +985,7 @@ async fn healthy(endpoint: &Endpoint, route: &str) -> bool {
 async fn launch(
     exe: &Path,
     weights: &Path,
+    model_id: &str,
     profile: Profile,
     hardware: &Hardware,
 ) -> Result<Running> {
@@ -966,6 +995,9 @@ async fn launch(
     let endpoint = Endpoint {
         base_url: format!("http://127.0.0.1:{port}"),
         api_key: crate::util::secret(),
+        context: profile.context,
+        model: model_id.into(),
+        stopped: Arc::default(),
         lease: Arc::new(()),
     };
     let mut command = engine_command(exe);
@@ -984,6 +1016,8 @@ async fn launch(
         ])
         .arg(weights)
         .args([
+            "--alias",
+            model_id,
             "--jinja",
             "--parallel",
             "1",
@@ -1193,6 +1227,7 @@ impl Runtime {
 
 struct Manager {
     root: PathBuf,
+    turns: Arc<crate::agents::local::Queue>,
     install: Arc<AsyncMutex<()>>,
     runtime: AsyncMutex<Runtime>,
     hardware: OnceCell<Hardware>,
@@ -1201,7 +1236,7 @@ struct Manager {
     runtime_status: Mutex<RuntimeStatus>,
 }
 
-fn manager(core: &CoreRef) -> Arc<Manager> {
+fn manager(core: &crate::core::Core) -> Arc<Manager> {
     static HOSTS: OnceLock<Mutex<HashMap<PathBuf, Arc<Manager>>>> = OnceLock::new();
     let path = core.data.join("models");
     let root = std::path::absolute(&path).unwrap_or(path);
@@ -1213,6 +1248,7 @@ fn manager(core: &CoreRef) -> Arc<Manager> {
         .or_insert_with(|| {
             Arc::new(Manager {
                 root,
+                turns: Arc::default(),
                 install: Arc::default(),
                 runtime: AsyncMutex::default(),
                 hardware: OnceCell::new(),
@@ -1222,6 +1258,21 @@ fn manager(core: &CoreRef) -> Arc<Manager> {
             })
         })
         .clone()
+}
+
+pub(crate) fn turn_queue(core: &crate::core::Core) -> Arc<crate::agents::local::Queue> {
+    manager(core).turns.clone()
+}
+
+pub(crate) fn installation(core: &crate::core::Core) -> Option<(String, String)> {
+    let manager = manager(core);
+    let selection = Current::read(&manager.root).ok()?.active?;
+    manager.installed(&selection).ok()?;
+    Some((selection.model, selection.tag))
+}
+
+pub(crate) fn setup_progress(core: &crate::core::Core) -> Value {
+    json!(manager(core).progress_status.lock().unwrap().clone())
 }
 
 impl Manager {
@@ -1316,14 +1367,14 @@ impl Manager {
             let exe = platform_asset(true)
                 .and_then(|asset| installed_engine(&self.root, &selection.tag, &asset))
                 .unwrap_or_else(|| cpu.clone());
-            match launch(&exe, &weights, preferred, &hardware).await {
+            match launch(&exe, &weights, model.id, preferred, &hardware).await {
                 Ok(process) => return Ok(process),
                 Err(error) => {
                     runtime.force_cpu = Some(format!("GPU launch failed. Using CPU. {error}"));
                 }
             }
         }
-        launch(&cpu, &weights, profile(&hardware, model, true), &hardware).await
+        launch(&cpu, &weights, model.id, profile(&hardware, model, true), &hardware).await
     }
 
     async fn install_packages(
@@ -1742,6 +1793,9 @@ pub async fn api_start(State(core): State<CoreRef>) -> R {
 pub async fn api_stop(State(core): State<CoreRef>) -> R {
     let manager = manager(&core);
     let mut runtime = manager.runtime.lock().await;
+    if let Some(process) = &runtime.process {
+        process.endpoint.stopped.store(true, Ordering::Relaxed);
+    }
     let state = stopped_status(runtime.stop().await);
     manager.runtime_status(&core, state.clone());
     drop(runtime);
@@ -1913,6 +1967,9 @@ mod tests {
         let endpoint = Endpoint {
             base_url: String::new(),
             api_key: String::new(),
+            context: 4096,
+            model: "test".into(),
+            stopped: Arc::default(),
             lease: Arc::new(()),
         };
         let mut last_active = Instant::now();

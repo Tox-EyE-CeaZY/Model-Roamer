@@ -8,6 +8,7 @@ pub mod claude;
 pub mod codex;
 pub mod custom;
 pub mod gemini;
+pub mod local;
 
 use crate::procs::{self, Launch, Resolved};
 use serde::Serialize;
@@ -28,6 +29,8 @@ pub enum AgentEvent {
     /// A complete text block (replaces any streamed deltas for it).
     Text(String),
     Thinking(String),
+    /// Progress from an operation that can take a while before the first response.
+    Progress(String),
     /// `id` pairs a result with its call; the timeline shows them in order, so it is parsed but not read yet.
     ToolUse { #[allow(dead_code)] id: String, name: String, input: String },
     ToolResult { #[allow(dead_code)] id: String, output: String, error: bool },
@@ -207,6 +210,7 @@ pub fn registry(custom: &Value) -> Vec<Arc<dyn AgentAdapter>> {
         Arc::new(claude::Claude),
         Arc::new(codex::Codex),
         Arc::new(antigravity::Antigravity),
+        Arc::new(local::Local),
     ];
     if let Some(list) = custom.as_array() {
         for c in list {

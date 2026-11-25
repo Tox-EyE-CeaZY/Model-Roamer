@@ -36,7 +36,7 @@ const DEFS: &[Def] = &[
         "title": {"type": "string", "description": "Short title, verb first, 3-6 words"},
         "instructions": {"type": "string", "description": "The task: what to do, context, files/areas it owns, what not to touch"},
         "criteria": {"type": "string", "description": "Acceptance criteria: what done looks like and how to verify it"},
-        "agent": {"type": "string", "description": "claude | codex | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
+        "agent": {"type": "string", "description": "claude | codex | antigravity | local | a custom agent id | auto (route by task_kind and headroom)"},
         "task_kind": {"type": "string", "description": "plan | core | refactor | review | docs | design | frontend | creative | research | backend | api | data | infra | scripts | tests | general"},
         "model": {"type": "string", "description": "Optional model for that agent"},
         "effort": {"type": "string", "description": "Optional thinking strength for this thread (low | medium | high | xhigh | max, as the model allows). Use lower for simple edits and higher for hard design or debugging; leave empty for the agent's default."},
@@ -185,15 +185,183 @@ pub fn describe(role: &str, bridged: bool) -> String {
     out
 }
 
+const LOCAL_TOOLS: &[&str] = &[
+    "check_status", "list_threads", "read_thread", "spawn_thread", "read_memory",
+    "write_memory", "send_message", "ask_user", "who_is_working_on", "claim_paths",
+    "release_paths", "list_claims", "set_title",
+];
+
+pub(crate) fn local_writes(name: &str) -> bool {
+    !matches!(name, "check_status" | "list_threads" | "read_thread" | "read_memory" | "who_is_working_on" | "list_claims")
+}
+
+fn local_allowed(core: &CoreRef, thread: &Value, member: Option<&crate::collab::Member>, name: &str) -> bool {
+    if local_writes(name) && crate::agents::Autonomy::parse(core.agent_cfg("local")["autonomy"].as_str().unwrap_or("")) == crate::agents::Autonomy::ReadOnly {
+        return false;
+    }
+    if let Some(m) = member {
+        return match name {
+            "check_status" | "list_threads" | "read_thread" => m.can("view_threads"),
+            "who_is_working_on" => m.can("view_threads") && m.can("view_presence"),
+            "spawn_thread" => m.can("create_threads"),
+            "write_memory" => m.can("edit_memory"),
+            "read_memory" | "post_to_chat" => true,
+            _ => false,
+        };
+    }
+    if !LOCAL_TOOLS.contains(&name) {
+        return false;
+    }
+    let bridged = crate::collab_bridge::bind_row(core, thread).ok().flatten().is_some();
+    let project = thread["project_id"].is_string();
+    match name {
+        "check_status" | "list_threads" | "who_is_working_on" => project,
+        "spawn_thread" | "send_message" | "claim_paths" | "release_paths" | "list_claims" if !project => false,
+        "read_thread" if project => true,
+        _ => DEFS.iter().any(|d| d.name == name && available(d, role_of(thread), bridged)),
+    }
+}
+
+pub(crate) fn local_list(core: &CoreRef, thread: &Value, member: Option<&crate::collab::Member>) -> Vec<Value> {
+    let mut result: Vec<_> = DEFS.iter().filter(|d| local_allowed(core, thread, member, d.name)).map(|d| {
+        let mut parameters = (d.schema)();
+        let mut description = d.desc;
+        if d.name == "check_status" {
+            description = "See the status of open threads in this project.";
+        }
+        if d.name == "spawn_thread" {
+            for key in ["effort", "workspace", "depends_on", "repo", "allow_limited"] {
+                parameters["properties"].as_object_mut().unwrap().remove(key);
+            }
+            if member.is_some() {
+                description = "Save a paused thread draft for the requesting collaborator. It will not run here.";
+            }
+        }
+        if let Some(m) = member {
+            if d.name == "write_memory" || (d.name == "read_memory" && !m.can("read_global_memory")) {
+                parameters["properties"]["scope"]["enum"] = json!(["collaborator", "project"]);
+                parameters["properties"]["scope"].as_object_mut().unwrap().remove("description");
+            }
+            if d.name == "read_memory" && !m.can("read_global_memory") {
+                description = "Read your private notes or shared project memory. Pass name for a full entry or query to search.";
+            }
+        }
+        json!({ "type": "function", "function": { "name": d.name, "description": description, "parameters": parameters } })
+    }).collect();
+    if local_allowed(core, thread, member, "post_to_chat") {
+        result.push(json!({ "type": "function", "function": {
+            "name": "post_to_chat",
+            "description": "Post a note in the requesting collaborator's own project chat. Prefer replying normally.",
+            "parameters": obj(json!({ "text": { "type": "string" } }), &["text"])
+        }}));
+    }
+    result
+}
+
+pub(crate) enum Caller<'a> {
+    Thread(&'a Value),
+    Member { thread: &'a Value, identity: &'a crate::collab::Member },
+}
+
+impl<'a> From<&'a Value> for Caller<'a> {
+    fn from(thread: &'a Value) -> Self {
+        Self::Thread(thread)
+    }
+}
+
+fn local_thread_lines(rows: Vec<Value>, filter: &str) -> String {
+    let lines = rows.iter().filter(|r| match filter {
+        "" => true,
+        "open" => r["resolved"] == 0,
+        "parked" => r["resolved"] == 0 && r["parked_at"].is_i64(),
+        status => r["status"] == status,
+    }).map(thread_line).collect::<Vec<_>>();
+    if lines.is_empty() { "No visible threads.".into() } else { lines.join("\n") }
+}
+
+fn member_local_call(core: &CoreRef, thread: &Value, m: &crate::collab::Member, name: &str, args: &Value) -> Result<String> {
+    use crate::{collab, collab_bridge};
+    let arg = |k: &str| args[k].as_str().unwrap_or("").trim();
+    let thread = collab::visible_thread(core, m, thread["id"].as_str().unwrap_or("")).map_err(|e| anyhow!(e.1))?;
+    if thread["user_id"] != m.user_id || !crate::collab_chat::is_personal_chat(&thread) {
+        bail!("The shared local model needs your own project chat.");
+    }
+    match name {
+        "list_threads" | "check_status" => {
+            let rows = collab::threads_of(core, m, 0).map_err(|e| anyhow!(e.1))?;
+            let rows = rows.into_iter().filter(|r| {
+                !crate::collab_chat::is_personal_chat(r) || r["user_id"] == m.user_id
+            }).collect();
+            Ok(local_thread_lines(rows, if name == "check_status" { "open" } else { arg("status") }))
+        }
+        "read_thread" => {
+            let id = arg("thread_id");
+            let target = collab::visible_thread(core, m, id).map_err(|e| anyhow!(e.1))?;
+            if crate::collab_chat::is_personal_chat(&target) && target["user_id"] != m.user_id {
+                bail!("No such thread.");
+            }
+            let history = collab::thread_history(core, m, id, args["before"].as_i64().unwrap_or(i64::MAX), args["limit"].as_i64().unwrap_or(8).clamp(1, 20))
+                .map_err(|e| anyhow!(e.1))?;
+            Ok(format_history(&history["thread"], history["messages"].as_array().map(Vec::as_slice).unwrap_or_default()))
+        }
+        "read_memory" => {
+            let (name, query) = (arg("name"), arg("query"));
+            let rows = collab_bridge::member_memory(core, m, Scope::parse(arg("scope"))?, name, query).map_err(|e| anyhow!(e.1))?;
+            Ok(memory::render(&rows, name, query))
+        }
+        "write_memory" => {
+            let saved = collab_bridge::save_member_memory(core, m, args).map_err(|e| anyhow!(e.1))?;
+            Ok(format!("Saved memory '{}' ({}).", saved["name"].as_str().unwrap_or(""), saved["scope"].as_str().unwrap_or("")))
+        }
+        "who_is_working_on" => {
+            let mut view = collab::presence::snapshot(core, &m.project_id, Some(m));
+            for person in &mut view.people {
+                person.work.retain(|w| w.kind != "chat");
+            }
+            let work = collab::presence::Work { title: arg("title").into(), kind: "worker".into(), paths: proposed_claims(args), ..Default::default() };
+            let matches = collab::presence::overlaps(&view, &m.user_id, &work);
+            let active: Vec<_> = view.people.iter().filter(|p| p.user_id != m.user_id && p.online).flat_map(|p| {
+                p.work.iter().map(|w| json!({ "person": p.name, "thread": w.thread, "title": w.title, "status": w.status }))
+            }).take(12).collect();
+            Ok(json!({ "active": active, "overlaps": matches }).to_string())
+        }
+        "spawn_thread" => {
+            let draft = collab::create_member_thread(core, m, args).map_err(|e| anyhow!(e.1))?;
+            Ok(format!("Saved paused thread draft {}.", draft["id"].as_str().unwrap_or("")))
+        }
+        "post_to_chat" => {
+            let text = arg("text");
+            if text.is_empty() { bail!("Write a note first."); }
+            runner::post(core, thread["id"].as_str().unwrap_or(""), "agent", "Local Operator", text, json!({ "user_id": m.user_id }), false)?;
+            Ok("Posted to your project chat.".into())
+        }
+        _ => bail!("That tool isn't available to the shared local model."),
+    }
+}
+
 /// Run a tool for the agent working in `caller`. The result is text for the agent.
-pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> Result<String> {
+pub async fn call<'a>(core: &CoreRef, caller: impl Into<Caller<'a>>, name: &str, args: &Value) -> Result<String> {
     if !args.is_object() {
         bail!("Tool arguments must be an object.");
+    }
+    let caller = match caller.into() {
+        Caller::Thread(thread) => thread,
+        Caller::Member { thread, identity } => {
+            let member = crate::collab::refresh_member(core, identity.clone()).map_err(|e| anyhow!(e.1))?;
+            if !local_allowed(core, thread, Some(&member), name) {
+                bail!("The project's owner hasn't allowed this local model tool.");
+            }
+            return member_local_call(core, thread, &member, name, args);
+        }
+    };
+    let local = caller["agent"] == "local";
+    if local && !local_allowed(core, caller, None, name) {
+        bail!("This local model tool isn't available in the current thread.");
     }
     let role = role_of(caller);
     let binding = crate::collab_bridge::bind_row(core, caller)?;
     let def = DEFS.iter().find(|d| d.name == name).ok_or_else(|| anyhow!("Unknown tool {name}"))?;
-    if !available(def, role, binding.is_some()) {
+    if !local && !available(def, role, binding.is_some()) {
         bail!("{name} is for the lead only. Ask the lead in your reply instead.");
     }
     crate::collab_chat::guard_tool(core, name, args)?;
@@ -271,6 +439,9 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "send_message" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
+            if local && t["id"] == tid {
+                bail!("Reply directly to this chat.");
+            }
             runner::post(core, t["id"].as_str().unwrap(), "user", &format!("Lead ({})", caller["agent"].as_str().unwrap_or("")), &a("text"), json!({ "from_thread": tid }), true)?;
             let id = t["id"].as_str().unwrap();
             if args["interrupt"] != false && runner::turn_active(core, id) {
@@ -282,7 +453,10 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "list_threads" => {
             let p = need_project()?;
             let filter = a("status");
-            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, repo_id, resolved, parked_at, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, repo_id, resolved, parked_at, merged, task_kind, updated_at, context, user_id FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            if local {
+                return Ok(local_thread_lines(rows.into_iter().filter(|r| !crate::collab_chat::is_personal_chat(r)).collect(), &filter));
+            }
             let rows: Vec<Value> = rows
                 .into_iter()
                 .filter(|r| match filter.as_str() {
@@ -300,6 +474,9 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "read_thread" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
+            if local && crate::collab_chat::is_personal_chat(&t) {
+                bail!("No such thread.");
+            }
             let n = args["limit"].as_i64().unwrap_or(12).clamp(1, 60);
             let before = args["before"].as_i64().unwrap_or(i64::MAX);
             let msgs = core.db.all(
@@ -310,6 +487,10 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         }
         "check_status" => {
             let p = need_project()?;
+            if local {
+                let rows = core.db.all("SELECT * FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' AND resolved = 0 ORDER BY created_at LIMIT 80", &[&p])?;
+                return Ok(local_thread_lines(rows.into_iter().filter(|r| !crate::collab_chat::is_personal_chat(r)).collect(), ""));
+            }
             Ok(runner::overview(core, &p))
         }
         "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind"), &a("model")).map(|(agent, model, why)| format!("{agent} ({}): {why}\n\n{}", runner::model_label(&model), runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),

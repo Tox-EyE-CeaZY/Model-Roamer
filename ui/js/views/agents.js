@@ -121,7 +121,10 @@ function card(a) {
   const settings = h('div', { class: 'ag-settings', hidden: true });
 
   const actions = [];
-  if (!a.installed && !a.pending) {
+  const local = a.id === 'local';
+  if (local) {
+    actions.push(...localActions(a));
+  } else if (!a.installed && !a.pending) {
     actions.push(h('button', { class: 'btn primary sm', onclick: (e) => (steps.length > 1 ? stepMenu(e.currentTarget, a, steps, 'install') : runStep({ what: 'install', agent: a.id, title: steps[0]?.label })) }, ic('download', 13), 'Install'));
   } else if (a.installed) {
     if (a.auth?.signed_in !== 'yes') actions.push(h('button', { class: 'btn primary sm', onclick: () => runStep({ what: 'login', agent: a.id, title: a.login?.label }) }, ic('login', 13), 'Sign in'));
@@ -129,7 +132,11 @@ function card(a) {
   }
   const more = h('button', { class: 'ibtn sm', title: 'More', onclick: (e) => {
     const r = e.currentTarget.getBoundingClientRect();
-    showMenu([
+    showMenu(local ? [
+      { label: 'Open Local model settings', icon: 'cpu', run: () => go('#/settings/local-model') },
+      { sep: true },
+      { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
+    ] : [
       a.installed ? { label: 'Sign in again', icon: 'login', run: () => runStep({ what: 'login', agent: a.id, title: a.login?.label }) } : null,
       a.installed && a.logout ? { label: 'Sign out', icon: 'logout', run: () => runStep({ what: 'logout', agent: a.id, title: a.logout?.label }) } : null,
       a.installed ? { label: 'Update', icon: 'download', run: () => runStep({ what: 'update', agent: a.id }) } : null,
@@ -139,7 +146,7 @@ function card(a) {
       { label: 'Check again', icon: 'refresh', run: () => get('agents/' + a.id, { timeout: 60000 }).catch((e) => toast(e.message, { err: true })) },
       a.installed ? { label: 'Refresh models', icon: 'refresh', title: 'Ask the CLI which models it offers now', run: () => post(`agents/${a.id}/models`, {}, { timeout: 90000 }).then((r) => toast(`${(r.info?.models || []).filter((m) => m.id).length} models from ${info.name}`)).catch((e) => toast(e.message, { err: true })) } : null,
       info.site ? { label: 'Website', icon: 'external', run: () => openExternal(info.site) } : null,
-      a.id.match(/^(claude|codex|antigravity)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
+      a.id.match(/^(claude|codex|antigravity|local)$/) ? null : { label: 'Remove this agent', icon: 'trash', danger: true, run: async () => (await del('agents/' + a.id), toast('Removed'), location.reload()) },
     ], r.right, r.bottom + 4, { anchor: e.currentTarget });
   }, html: icon('more', 15) });
 
@@ -164,6 +171,28 @@ function card(a) {
       if (!settings.hidden && !settings.childElementCount) drawSettings(settings, a);
     } }, ic('settings', 13), 'Settings'), more),
     settings);
+}
+
+// The in-process local agent has no CLI to sign in to or update: setup lives in Settings › Local model,
+// and the card only opens that screen and starts or stops the llama.cpp runtime.
+function localActions(a) {
+  const open = h('button', { class: 'btn sm' + (a.installed ? '' : ' primary'), onclick: () => go('#/settings/local-model') }, ic('cpu', 13), a.installed ? 'Open Local model settings' : 'Set up in Local model settings');
+  if (!a.installed) return [open];
+  const btn = h('button', { class: 'btn sm', disabled: true }, ic('play', 13), 'Start');
+  const show = (st) => {
+    const state = st?.runtime?.state || 'stopped';
+    const on = state === 'running' || state === 'starting';
+    btn.disabled = state === 'starting';
+    btn.replaceChildren(ic(on ? 'stop' : 'play', 13), state === 'starting' ? 'Starting…' : on ? 'Stop' : 'Start');
+    btn.onclick = async () => {
+      btn.disabled = true;
+      if (!on) btn.replaceChildren(h('span', { class: 'spin' }), 'Starting…');
+      try { show(await post(on ? 'local-llm/stop' : 'local-llm/start', {}, { timeout: 90000 })); }
+      catch (e) { toast(e.message, { err: true }); get('local-llm/status', { quiet: true }).then(show, () => show(null)); }
+    };
+  };
+  get('local-llm/status', { quiet: true }).then(show, () => show(null));
+  return [open, btn];
 }
 
 function stepMenu(anchor, a, steps, what) {

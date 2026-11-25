@@ -14,6 +14,7 @@ mod bus;
 mod collab;
 mod collab_bridge;
 mod collab_chat;
+mod collab_view;
 mod config;
 mod core;
 mod db;

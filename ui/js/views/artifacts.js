@@ -1,5 +1,6 @@
 // Artifacts: pages, documents, images and files the agents publish. They are served by whichever machine runs the
 // work, so a phone or laptop connected to a server sees them too. HTML runs sandboxed in its own origin.
+// Also serves a joined project's Artifacts tab via the guest proxy, hiding publish/edit actions when not permitted.
 
 import { h, ago } from '../util.js';
 import { icon } from '../icons.js';
@@ -17,10 +18,15 @@ const OPEN_KEY = 'mr-art-open';
 const DND_ART = 'application/x-roamer-artifact';
 const DND_FLD = 'application/x-roamer-folder';
 
+const proxyUrl = (linkId, artId) => `/api/collab/links/${encodeURIComponent(linkId)}/artifact-file/${encodeURIComponent(artId)}/`;
+
 /** The library: a folder tree on the left (projects, their threads, chats, and folders anyone made), the open folder
  * on the right with breadcrumbs. Drag artifacts and folders onto a folder, a crumb or the tree to move them. */
 export default async function artifacts(el, r, opts = {}) {
+  const collab = opts.collab || null;
   const project = opts.project || r?.q?.project || '';
+  const access = () => (collab ? collab.getAccess() : null);
+
   let folders = {}, arts = [], root = null, cur = r?.q?.f || null;
   let open;
   try {
@@ -37,14 +43,26 @@ export default async function artifacts(el, r, opts = {}) {
   const crumbs = h('div', { class: 'art-crumbs' });
   const grid = h('div', { class: 'art-grid' });
   const q = input('', { placeholder: 'Filter artifacts', type: 'search' });
-  if (!opts.project)
+  const toolActs = h('span', { class: 'row' });
+
+  function drawToolActs() {
+    const acc = access();
+    const canFolders = !collab || acc.canManageArtifactFolders;
+    const canPublish = !collab ? !!opts.project : acc.canPublishArtifact;
+    toolActs.replaceChildren(
+      canFolders ? h('button', { class: 'btn sm', onclick: () => newFolder(cur) }, ic('folder', 13), 'New folder') : null,
+      canPublish ? h('button', { class: 'btn sm' + (collab ? ' primary' : ''), onclick: () => newArtifact(project, cur, collab, load) }, ic('plus', 13), collab ? 'Publish' : 'New') : null,
+    );
+  }
+  drawToolActs();
+
+  if (!opts.project) {
     el.append(h('div', { class: 'page-h' }, h('div', {}, h('h1', {}, 'Artifacts'), h('p', { class: 'lede' }, 'What the agents made for you to look at: pages, reports, diagrams, images. Each project and chat files its own; make folders of your own and drag things where you want them.')),
       h('button', { class: 'btn', onclick: () => newArtifact(project, cur) }, ic('plus', 14), 'New')));
+  }
   el.append(h('div', { class: 'art-layout' + (opts.project ? ' in-project' : '') }, tree,
     h('section', { class: 'art-main' },
-      h('div', { class: 'toolbar' }, crumbs, h('span', { class: 'grow' }), q,
-        h('button', { class: 'btn sm', onclick: () => newFolder(cur) }, ic('folder', 13), 'New folder'),
-        opts.project ? h('button', { class: 'btn sm', onclick: () => newArtifact(project, cur) }, ic('plus', 13), 'New') : null),
+      h('div', { class: 'toolbar' }, crumbs, h('span', { class: 'grow' }), q, toolActs),
       grid)));
 
   const kids = (id) => Object.values(folders).filter((f) => (f.parent_id || null) === id && (id !== null || !root || f.id === root));
@@ -66,22 +84,46 @@ export default async function artifacts(el, r, opts = {}) {
     return seen;
   };
 
+  let alive = true;
   async function load() {
+    if (!alive) return;
+    if (collab && access().revoked) {
+      grid.replaceChildren(empty('lock', 'Artifacts unavailable', 'You no longer have access to this project.'));
+      return;
+    }
     try {
-      const [fl, list] = await Promise.all([get('folders' + (project ? '?project=' + project : '')), get('artifacts' + (project ? '?project=' + project : ''))]);
-      folders = Object.fromEntries(fl.folders.map((f) => [f.id, f]));
+      let fl, list;
+      if (collab) {
+        [fl, list] = await Promise.all([
+          get(collab.base + 'folders').catch(() => ({ folders: [], root: null })),
+          get(collab.base + 'artifacts-list'),
+        ]);
+        list = (Array.isArray(list) ? list : []).map((a) => ({
+          ...a,
+          _linkId: collab.linkId,
+          url: proxyUrl(collab.linkId, a.id),
+        }));
+      } else {
+        [fl, list] = await Promise.all([
+          get('folders' + (project ? '?project=' + project : '')),
+          get('artifacts' + (project ? '?project=' + project : '')),
+        ]);
+      }
+      if (!alive) return;
+      folders = Object.fromEntries((fl.folders || []).map((f) => [f.id, f]));
       root = fl.root || null;
       arts = list;
       if (cur && !folders[cur]) cur = null;
       if (!cur && root) cur = root;
       draw();
     } catch (e) {
-      grid.replaceChildren(errorBox(e, load));
+      if (alive) grid.replaceChildren(errorBox(e, load));
     }
   }
 
-  // ---------------------------------------------------------- moving things
+  // ---------------------------------------------------------- moving things (owner only)
   async function moveInto(target, e) {
+    if (collab) return;
     const art = e.dataTransfer.getData(DND_ART), fld = e.dataTransfer.getData(DND_FLD);
     try {
       if (art) {
@@ -102,8 +144,7 @@ export default async function artifacts(el, r, opts = {}) {
       toast(err.message, { err: true });
     }
   }
-  /** Props that make an element a place to drop artifacts and folders. */
-  const dropTo = (target) => ({
+  const dropTo = (target) => (collab ? {} : {
     ondragover: (e) => {
       if (![...e.dataTransfer.types].some((t) => t === DND_ART || t === DND_FLD)) return;
       e.preventDefault();
@@ -117,15 +158,13 @@ export default async function artifacts(el, r, opts = {}) {
       moveInto(target, e);
     },
   });
-  const dragOf = (type, id) => ({ draggable: 'true', ondragstart: (e) => (e.dataTransfer.setData(type, id), (e.dataTransfer.effectAllowed = 'move'), e.currentTarget.classList.add('dragging')), ondragend: (e) => e.currentTarget.classList.remove('dragging') });
+  const dragOf = (type, id) => (collab ? {} : { draggable: 'true', ondragstart: (e) => (e.dataTransfer.setData(type, id), (e.dataTransfer.effectAllowed = 'move'), e.currentTarget.classList.add('dragging')), ondragend: (e) => e.currentTarget.classList.remove('dragging') });
 
   // ---------------------------------------------------------- drawing
   function openFolder(id) {
     cur = id;
     if (id) for (const f of chain(id)) if (f.id !== id) open.add(f.id);
     saveOpen();
-    // the folder you're in is part of the address (without a history entry of its own), so Back from an artifact
-    // returns to this very folder
     if (!opts.project) {
       try {
         history.replaceState(history.state, '', '#/artifacts' + (id && id !== root ? '?f=' + id : ''));
@@ -137,17 +176,23 @@ export default async function artifacts(el, r, opts = {}) {
   function node(f, depth) {
     const ch = kids(f.id);
     const isOpen = open.has(f.id);
-    const row = h('div', { class: 'at-row' + (cur === f.id ? ' on' : ''), style: { '--d': depth }, ...dragOf(DND_FLD, f.id), ...dropTo(f.id),
-      onclick: () => openFolder(f.id), oncontextmenu: (e) => (e.preventDefault(), folderMenu(f, e.clientX, e.clientY)) },
-      ch.length ? h('button', { class: 'at-tw' + (isOpen ? ' open' : ''), type: 'button', title: isOpen ? 'Collapse' : 'Expand', onclick: (e) => {
-        e.stopPropagation();
-        isOpen ? open.delete(f.id) : open.add(f.id);
-        saveOpen();
-        drawTree();
-      }, html: icon('right', 11) }) : h('i', { class: 'at-tw' }),
-      ic(f.auto_key?.startsWith('project:') ? 'board' : f.auto_key?.startsWith('thread:') ? 'thread' : f.auto_key === 'chats' ? 'chat' : 'folder', 14),
-      h('span', { class: 'at-name' }, f.name),
-      f.count ? h('small', {}, String(f.count)) : null);
+    const row = h('div', {
+      class: 'at-row' + (cur === f.id ? ' on' : ''),
+      style: { '--d': depth },
+      ...dragOf(DND_FLD, f.id),
+      ...dropTo(f.id),
+      onclick: () => openFolder(f.id),
+      oncontextmenu: collab ? null : (e) => (e.preventDefault(), folderMenu(f, e.clientX, e.clientY)),
+    },
+    ch.length ? h('button', { class: 'at-tw' + (isOpen ? ' open' : ''), type: 'button', title: isOpen ? 'Collapse' : 'Expand', onclick: (e) => {
+      e.stopPropagation();
+      isOpen ? open.delete(f.id) : open.add(f.id);
+      saveOpen();
+      drawTree();
+    }, html: icon('right', 11) }) : h('i', { class: 'at-tw' }),
+    ic(f.auto_key?.startsWith('project:') ? 'board' : f.auto_key?.startsWith('thread:') ? 'thread' : f.auto_key === 'chats' ? 'chat' : 'folder', 14),
+    h('span', { class: 'at-name' }, f.name),
+    f.count ? h('small', {}, String(f.count)) : null);
     return [row, ...(isOpen ? ch.flatMap((c) => node(c, depth + 1)) : [])];
   }
   function drawTree() {
@@ -163,17 +208,20 @@ export default async function artifacts(el, r, opts = {}) {
       ...(root ? [] : [h('button', { class: 'crumb', type: 'button', ...dropTo(null), onclick: () => openFolder(null) }, 'All')]),
       ...parts.flatMap((f, i) => [
         root && i === 0 ? null : h('i', { class: 'crumb-sep' }, '/'),
-        h('button', { class: 'crumb' + (f.id === cur ? ' on' : ''), type: 'button', ...dropTo(f.id), onclick: () => openFolder(f.id), oncontextmenu: (e) => (e.preventDefault(), folderMenu(f, e.clientX, e.clientY)) }, f.name),
+        h('button', { class: 'crumb' + (f.id === cur ? ' on' : ''), type: 'button', ...dropTo(f.id), onclick: () => openFolder(f.id), oncontextmenu: collab ? null : (e) => (e.preventDefault(), folderMenu(f, e.clientX, e.clientY)) }, f.name),
       ]));
   }
   function folderCard(f) {
     const n = (f.count || 0) + kids(f.id).length;
-    return h('button', { class: 'fld-card cut', type: 'button', ...dragOf(DND_FLD, f.id), ...dropTo(f.id), onclick: () => openFolder(f.id), oncontextmenu: (e) => (e.preventDefault(), folderMenu(f, e.clientX, e.clientY)) },
+    return h('button', { class: 'fld-card cut', type: 'button', ...dragOf(DND_FLD, f.id), ...dropTo(f.id), onclick: () => openFolder(f.id), oncontextmenu: collab ? null : (e) => (e.preventDefault(), folderMenu(f, e.clientX, e.clientY)) },
       ic(f.auto_key?.startsWith('thread:') ? 'thread' : f.auto_key?.startsWith('project:') ? 'board' : f.auto_key === 'chats' ? 'chat' : 'folder', 20),
       h('b', {}, f.name), h('small', { class: 'faint' }, n ? `${n} item${n === 1 ? '' : 's'}` : 'Empty'));
   }
+  function artHref(a) {
+    return '#/a/' + a.id + (collab ? '?link=' + encodeURIComponent(collab.linkId) : '');
+  }
   function artCard(a) {
-    return h('a', { class: 'art-card cut', href: '#/a/' + a.id, ...dragOf(DND_ART, a.id), oncontextmenu: (e) => (e.preventDefault(), menu(a, e.clientX, e.clientY, load, { move: () => moveDialog(a) })) },
+    return h('a', { class: 'art-card cut', href: artHref(a), ...dragOf(DND_ART, a.id), oncontextmenu: (e) => (e.preventDefault(), menu(a, e.clientX, e.clientY, load, { move: collab ? null : () => moveDialog(a), collab })) },
       h('div', { class: 'ac-thumb k-' + a.kind }, a.kind === 'image' || a.kind === 'svg' ? h('img', { src: a.url, alt: '', loading: 'lazy', draggable: 'false' }) : a.kind === 'html' ? h('iframe', { src: a.url, loading: 'lazy', tabindex: '-1', sandbox: 'allow-scripts', scrolling: 'no' }) : h('i', { html: icon(KIND_ICON[a.kind] || 'file', 34) })),
       h('div', { class: 'ac-meta' }, h('b', {}, a.title), h('small', { class: 'faint' }, [a.kind, a.version > 1 ? 'v' + a.version : null, a.project_name, ago(a.updated_at)].filter(Boolean).join(' · ')), a.agent ? stamp(a.agent, { small: true }) : null));
   }
@@ -182,17 +230,27 @@ export default async function artifacts(el, r, opts = {}) {
     drawCrumbs();
     const f = q.value.trim().toLowerCase();
     if (f) {
-      const hits = arts.filter((a) => (a.title + ' ' + a.description + ' ' + (a.thread_title || '')).toLowerCase().includes(f));
+      const hits = arts.filter((a) => (a.title + ' ' + (a.description || '') + ' ' + (a.thread_title || '')).toLowerCase().includes(f));
       return grid.replaceChildren(...(hits.length ? hits.map(artCard) : [empty('search', 'Nothing matches', 'Try another word. The filter looks through every folder.')]));
     }
-    if (!arts.length && !Object.keys(folders).length) return grid.replaceChildren(empty('artifact', 'Nothing published yet', 'When an agent makes something to look at (a mock-up, a report, a chart) it publishes it here with the publish_artifact tool, filed under its project and thread. Ask for one in any thread.'));
+    if (!arts.length && !Object.keys(folders).length) {
+      const canPub = !collab || access().canPublishArtifact;
+      return grid.replaceChildren(empty('artifact', 'Nothing published yet', 'When an agent makes something to look at (a mock-up, a report, a chart) it publishes it here.', canPub ? h('button', { class: 'btn sm primary', onclick: () => newArtifact(project, cur, collab, load) }, ic('plus', 13), 'Publish artifact') : null));
+    }
     const subs = cur === null ? kids(null) : kids(cur);
     const here = arts.filter((a) => (cur === null ? !a.folder_id || !folders[a.folder_id] : a.folder_id === cur));
-    if (!subs.length && !here.length) return grid.replaceChildren(h('div', { class: 'fld-empty', ...dropTo(cur) }, empty('folder', 'This folder is empty', 'Drag artifacts or folders here, or make a folder inside it.', h('button', { class: 'btn sm', onclick: () => newFolder(cur) }, ic('folder', 13), 'New folder'))));
+    if (!subs.length && !here.length) {
+      const canFolders = !collab;
+      const canPub = collab && access().canPublishArtifact;
+      return grid.replaceChildren(h('div', { class: 'fld-empty', ...dropTo(cur) },
+        empty('folder', 'This folder is empty', canFolders ? 'Drag artifacts or folders here, or make a folder inside it.' : 'Nothing published in this folder yet.',
+          canFolders ? h('button', { class: 'btn sm', onclick: () => newFolder(cur) }, ic('folder', 13), 'New folder')
+            : canPub ? h('button', { class: 'btn sm primary', onclick: () => newArtifact(project, cur, collab, load) }, ic('plus', 13), 'Publish artifact') : null)));
+    }
     grid.replaceChildren(...subs.map(folderCard), ...here.map(artCard));
   }
 
-  // ---------------------------------------------------------- folder actions
+  // ---------------------------------------------------------- folder actions (owner only)
   async function newFolder(parent) {
     const name = await askLine('New folder', '', 'Name', { ok: 'Make it', placeholder: 'e.g. Designs' });
     if (!name?.trim()) return;
@@ -239,19 +297,33 @@ export default async function artifacts(el, r, opts = {}) {
   q.oninput = draw;
   grid.replaceChildren(loading());
   await load();
-  return listen((ev) => (ev.kind === 'artifact' || ev.kind === 'resync') && load());
+  const unlisten = listen((ev) => !collab && (ev.kind === 'artifact' || ev.kind === 'resync') && load());
+  const unlive = collab?.onLiveChange?.(({ permsChanged, artifactsChanged }) => {
+    if (permsChanged) {
+      drawToolActs();
+      draw();
+    }
+    if (artifactsChanged) load();
+  });
+  return () => {
+    alive = false;
+    unlisten();
+    unlive?.();
+  };
 }
 
 function menu(a, x, y, after, extra = {}) {
+  const href = '#/a/' + a.id + (extra.collab ? '?link=' + encodeURIComponent(extra.collab.linkId) : '');
+  const manage = !extra.collab;
   showMenu([
-    { label: 'Open', icon: 'eye', run: () => go('#/a/' + a.id) },
-    { label: 'Open in its own window', icon: 'popout', run: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }) },
+    { label: 'Open', icon: 'eye', run: () => go(href) },
+    { label: 'Open in its own window', icon: 'popout', run: () => popOut(href, { key: 'a:' + a.id, w: 1100, h: 820 }) },
     { label: 'Open in your browser', icon: 'external', run: () => openOutside(location.origin + a.url) },
     { label: 'Download', icon: 'download', run: () => window.open(a.url + '?download=1') },
-    { sep: true },
-    { label: 'Rename…', icon: 'edit', run: () => rename(a).then(after) },
-    extra.move ? { label: 'Move to folder…', icon: 'folder', run: extra.move } : null,
-    { label: 'Delete', icon: 'trash', danger: true, run: () => remove(a).then(after) },
+    manage ? { sep: true } : null,
+    manage ? { label: 'Rename…', icon: 'edit', run: () => rename(a).then(after) } : null,
+    manage && extra.move ? { label: 'Move to folder…', icon: 'folder', run: extra.move } : null,
+    manage ? { label: 'Delete', icon: 'trash', danger: true, run: () => remove(a).then(after) } : null,
   ].filter(Boolean), x, y);
 }
 
@@ -267,36 +339,55 @@ async function remove(a) {
   toast(`Deleted ${a.title}`, { action: 'Undo', ms: 9000, run: () => patch('artifacts/' + a.id, { restore: true }) });
 }
 
-async function newArtifact(project, folder) {
+async function newArtifact(project, folder, collab = null, onDone = null) {
   const title = input('', { placeholder: 'Title' });
   let kind = 'markdown';
   const content = textarea('', { rows: 10, placeholder: 'Markdown, HTML or text' });
-  const kindSel = select([['markdown', 'Markdown'], ['html', 'HTML page'], ['text', 'Text']], kind, (v) => (kind = v));
+  const kindSel = select([['markdown', 'Markdown'], ['html', 'HTML page'], ['text', 'Text'], ['svg', 'SVG']], kind, (v) => (kind = v));
   let made = null;
   const ok = await dialog({
-    title: 'New artifact',
+    title: collab ? 'Publish shared artifact' : 'New artifact',
     wide: true,
     body: h('div', { class: 'dlg-fields' }, field('Title', title), field('Kind', kindSel), field('Content', content)),
     ok: 'Publish',
     check: async () => {
       if (!title.value.trim()) return 'Give it a title.';
       try {
-        made = await post('artifacts', { title: title.value.trim(), kind, content: content.value, project_id: project || null, folder_id: folder || '' });
+        if (collab) {
+          made = await post(collab.base + 'view/artifacts', { title: title.value.trim(), kind, content: content.value, folder_id: folder || '' });
+        } else {
+          made = await post('artifacts', { title: title.value.trim(), kind, content: content.value, project_id: project || null, folder_id: folder || '' });
+        }
       } catch (e) {
         return e.message;
       }
     },
   });
-  if (ok && made) go('#/a/' + made.id);
+  if (ok && made) {
+    if (collab) {
+      toast(`Published ${made.title}`, { action: 'Open', run: () => go(`#/a/${made.id}?link=${encodeURIComponent(collab.linkId)}`) });
+      onDone?.();
+    } else {
+      go('#/a/' + made.id);
+    }
+  }
 }
 
 // ------------------------------------------------------------ viewer
 export async function viewer(el, r, ctx) {
+  const linkId = r?.q?.link || '';
   let a;
   try {
-    a = await get('artifacts/' + r.id);
+    if (linkId) {
+      a = await get(`collab/links/${encodeURIComponent(linkId)}/host/artifacts/${encodeURIComponent(r.id)}`);
+      a.url = proxyUrl(linkId, a.id);
+      const localProj = await get('projects/' + encodeURIComponent(linkId)).catch(() => null);
+      if (localProj?.lead?.id) a.lead_id = localProj.lead.id;
+    } else {
+      a = await get('artifacts/' + r.id);
+    }
   } catch (e) {
-    return el.replaceChildren(empty('artifact', 'That artifact isn’t here', e.message, h('a', { class: 'btn', href: '#/artifacts' }, 'All artifacts')));
+    return el.replaceChildren(empty('artifact', 'That artifact isn’t here', e.message, h('a', { class: 'btn', href: linkId ? `#/p/${encodeURIComponent(linkId)}/artifacts` : '#/artifacts' }, linkId ? 'Project artifacts' : 'All artifacts')));
   }
   setTitle(`${a.title} · Artifact`);
   ctx?.setPopTitle?.(a.title);
@@ -304,18 +395,18 @@ export async function viewer(el, r, ctx) {
   const head = h('div', { class: 'av-head' });
   el.classList.add('artifact-view');
   el.append(head, frame);
-  // ---- comments: select text (or Alt+click a part of a page, or click an image) and send a note about it
   let pop = null, cmode = a.kind === 'image' ? 'spot' : 'text', sendTo = localStorage.getItem('mr-art-comment-to') || 'lead';
   const closePop = () => (pop?.remove(), (pop = null));
   function comment({ quote, where, x, y }) {
     closePop();
-    const to = a.thread_id && sendTo === 'thread' ? 'thread' : 'lead';
+    const canThread = !linkId && !!a.thread_id;
+    const to = canThread && sendTo === 'thread' ? 'thread' : 'lead';
     const note = textarea('', { rows: 3, placeholder: 'What should change, or what do you want to know?' });
     let dest = to;
     const send = async () => {
       const text = note.value.trim();
       if (!text) return note.focus();
-      const target = dest === 'thread' ? a.thread_id : a.lead_id;
+      const target = dest === 'thread' && canThread ? a.thread_id : a.lead_id;
       if (!target) return toast('There’s nowhere to send this.', { err: true });
       const lines = [`Comment on the artifact "${a.title}" (version ${a.version}, id ${a.id})${where ? ', ' + where : ''}:`];
       if (quote) lines.push('', ...quote.split('\n').map((l) => '> ' + l));
@@ -338,7 +429,7 @@ export async function viewer(el, r, ctx) {
       quote ? h('blockquote', { class: 'av-quote' }, quote.length > 220 ? quote.slice(0, 220) + '…' : quote) : where ? h('div', { class: 'faint small mono' }, where) : null,
       note,
       h('div', { class: 'av-pop-row' },
-        a.thread_id ? seg([['lead', 'To the lead'], ['thread', 'To its thread']], dest, (v) => (dest = v)) : h('span', { class: 'faint small' }, 'To the lead'),
+        canThread ? seg([['lead', 'To the lead'], ['thread', 'To its thread']], dest, (v) => (dest = v)) : h('span', { class: 'faint small' }, linkId ? 'To your project chat' : 'To the lead'),
         h('span', { class: 'grow' }),
         h('button', { class: 'btn sm', onclick: closePop }, 'Cancel'),
         h('button', { class: 'btn sm primary', onclick: send }, 'Send')));
@@ -348,22 +439,19 @@ export async function viewer(el, r, ctx) {
     pop.style.top = Math.max(8, Math.min(y - box.top + 8, box.height - 220)) + 'px';
     note.focus();
   }
-  // a floating button near the selection, so commenting is one click
   let tip = null;
   const closeTip = () => (tip?.remove(), (tip = null));
-  function showTip(x, y, ctx) {
+  function showTip(x, y, ctx2) {
     closeTip();
-    tip = h('button', { class: 'av-tip btn sm primary', onmousedown: (e) => e.preventDefault(), onclick: () => (closeTip(), comment({ ...ctx, x, y })) }, ic('chat', 13), 'Comment');
+    tip = h('button', { class: 'av-tip btn sm primary', onmousedown: (e) => e.preventDefault(), onclick: () => (closeTip(), comment({ ...ctx2, x, y })) }, ic('chat', 13), 'Comment');
     el.append(tip);
     const box = el.getBoundingClientRect();
     tip.style.left = Math.max(8, Math.min(x - box.left, box.width - 110)) + 'px';
     tip.style.top = Math.max(8, y - box.top + 6) + 'px';
   }
-  // what a click points at: some selected text, a whole element, or one spot (pages), as the person chooses
   const modes = () => (a.kind === 'html' ? [['text', 'Select text'], ['element', 'Pick element'], ['spot', 'Pick spot'], ['lasso', 'Lasso']] : a.kind === 'image' ? [['spot', 'Pick spot'], ['lasso', 'Lasso']] : a.kind === 'markdown' || a.kind === 'text' ? [['text', 'Select text'], ['element', 'Pick paragraph']] : []);
   const tellPage = () => frame.querySelector('iframe.av-if')?.contentWindow?.postMessage({ mr: 'mode', mode: cmode }, '*');
   const setMode = (m) => ((cmode = m), closePop(), closeTip(), tellPage(), frame.classList.toggle('av-pick', m !== 'text'));
-  // text shown in the page itself (markdown, plain text)
   frame.addEventListener('click', (e) => {
     if (cmode !== 'element' || (a.kind !== 'markdown' && a.kind !== 'text')) return;
     const b = e.target.closest?.('p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, td, th');
@@ -376,23 +464,21 @@ export async function viewer(el, r, ctx) {
     const sel = getSelection();
     const t = sel?.toString().trim();
     if (!t || !frame.contains(sel.anchorNode)) return closeTip();
-    const r = sel.getRangeAt(0).getBoundingClientRect();
-    showTip(r.left, r.bottom, { quote: t.slice(0, 1500) });
+    const rr = sel.getRangeAt(0).getBoundingClientRect();
+    showTip(rr.left, rr.bottom, { quote: t.slice(0, 1500) });
   }, 0));
-  // a picture: click to point at a spot
   frame.addEventListener('click', (e) => {
     const img = e.target.closest?.('.av-img img');
     if (!img || cmode === 'lasso') return;
-    const r = img.getBoundingClientRect();
-    const px = Math.round(((e.clientX - r.left) / r.width) * 100), py = Math.round(((e.clientY - r.top) / r.height) * 100);
+    const rr = img.getBoundingClientRect();
+    const px = Math.round(((e.clientX - rr.left) / rr.width) * 100), py = Math.round(((e.clientY - rr.top) / rr.height) * 100);
     comment({ where: `at ${px}% across, ${py}% down the image`, x: e.clientX, y: e.clientY });
   });
-  // a picture, lasso: drag a box over the part
   frame.addEventListener('mousedown', (e) => {
     const img = e.target.closest?.('.av-img img');
     if (!img || cmode !== 'lasso') return;
     e.preventDefault();
-    const r = img.getBoundingClientRect();
+    const rr = img.getBoundingClientRect();
     const box = h('div', { style: 'position:fixed;z-index:40;border:2px dashed var(--accent);background:color-mix(in oklch, var(--accent) 14%, transparent);pointer-events:none' });
     document.body.append(box);
     const x0 = e.clientX, y0 = e.clientY;
@@ -403,12 +489,11 @@ export async function viewer(el, r, ctx) {
       box.remove();
       if (Math.abs(m.clientX - x0) < 5 && Math.abs(m.clientY - y0) < 5) return;
       const pc = (v, o, n) => Math.max(0, Math.min(100, Math.round(((v - o) / n) * 100)));
-      comment({ where: `the box from ${pc(Math.min(x0, m.clientX), r.left, r.width)}% across, ${pc(Math.min(y0, m.clientY), r.top, r.height)}% down to ${pc(Math.max(x0, m.clientX), r.left, r.width)}% across, ${pc(Math.max(y0, m.clientY), r.top, r.height)}% down the image`, x: m.clientX, y: m.clientY });
+      comment({ where: `the box from ${pc(Math.min(x0, m.clientX), rr.left, rr.width)}% across, ${pc(Math.min(y0, m.clientY), rr.top, rr.height)}% down to ${pc(Math.max(x0, m.clientX), rr.left, rr.width)}% across, ${pc(Math.max(y0, m.clientY), rr.top, rr.height)}% down the image`, x: m.clientX, y: m.clientY });
     };
     addEventListener('mousemove', mv);
     addEventListener('mouseup', up);
   });
-  // a page (HTML): the page tells us what was selected, or Alt+clicked
   const onPage = (ev) => {
     const f = frame.querySelector('iframe');
     if (!f || ev.source !== f.contentWindow || !ev.data?.mr) return;
@@ -421,42 +506,44 @@ export async function viewer(el, r, ctx) {
     else if (d.mr === 'lasso') {
       const list = (d.els || []).map((x) => `- ${x.el}${x.text ? ': "' + x.text + '"' : ''}`);
       comment({ quote: list.join('\n'), where: `${list.length} element${list.length === 1 ? '' : 's'} inside a box from ${d.px1}% across, ${d.py1}% down to ${d.px2}% across, ${d.py2}% down the page`, x: fr.left + d.x, y: fr.top + d.y });
-    }
-    else if (d.mr === 'pin') {
+    } else if (d.mr === 'pin') {
       const spot = d.mode === 'spot' ? `the spot ${d.px}% across and ${d.py}% down the page, on ${d.el || 'the page'}` : 'the element ' + d.el;
       comment({ quote: d.mode === 'spot' ? '' : d.text, where: spot, x: fr.left + d.x, y: fr.top + d.y });
     }
   };
   window.addEventListener('message', onPage);
   el.addEventListener('keydown', (e) => e.key === 'Escape' && (closePop(), closeTip()));
+  const viewerHref = '#/a/' + a.id + (linkId ? '?link=' + encodeURIComponent(linkId) : '');
   const drawHead = () => head.replaceChildren(
-    isPop ? null : h('button', { class: 'ibtn', title: 'Back', onclick: () => back('#/artifacts'), html: icon('back', 16) }),
+    isPop ? null : h('button', { class: 'ibtn', title: 'Back', onclick: () => back(linkId ? `#/p/${encodeURIComponent(linkId)}/artifacts` : '#/artifacts'), html: icon('back', 16) }),
     h('div', { class: 'av-title' }, h('h1', {}, a.title), h('small', { class: 'faint' }, [a.kind, 'v' + a.version, a.thread_title ? 'from ' + a.thread_title : null, 'updated ' + ago(a.updated_at)].filter(Boolean).join(' · '))),
     a.agent ? stamp(a.agent, { small: true }) : null,
     h('span', { class: 'grow' }),
     modes().length ? h('span', { class: 'av-modes', title: 'What a click comments on' }, seg(modes(), cmode, setMode)) : null,
     h('button', { class: 'btn sm', onclick: () => draw(true) }, ic('reload', 13), 'Reload'),
-    a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
-    isPop ? null : h('button', { class: 'ibtn', title: 'Open in its own window', onclick: () => popOut('#/a/' + a.id, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 16) }),
+    !linkId && a.thread_id ? h('button', { class: 'btn sm', onclick: () => openThread(a.thread_id) }, ic('thread', 13), 'Thread') : null,
+    isPop ? null : h('button', { class: 'ibtn', title: 'Open in its own window', onclick: () => popOut(viewerHref, { key: 'a:' + a.id, w: 1100, h: 820 }), html: icon('popout', 16) }),
     h('button', { class: 'ibtn', title: 'Open in your browser', onclick: () => openOutside(location.origin + a.url), html: icon('external', 16) }),
-    h('button', { class: 'ibtn', title: 'More', onclick: (e) => menu(a, e.clientX, e.clientY, async () => ((a = await get('artifacts/' + a.id)), drawHead())), html: icon('more', 16) }));
+    h('button', { class: 'ibtn', title: 'More', onclick: (e) => menu(a, e.clientX, e.clientY, async () => ((a = linkId ? a : await get('artifacts/' + a.id)), drawHead()), { collab: linkId ? { linkId } : null }), html: icon('more', 16) }));
   async function draw(bust) {
     const src = a.url + (bust ? '?t=' + Date.now() : '');
     if (a.kind === 'markdown' || a.kind === 'text') {
       frame.replaceChildren(loading());
       try {
-        const text = await (await fetch(src, { credentials: 'same-origin' })).text();
+        const res = await fetch(src, { credentials: 'same-origin' });
+        if (!res.ok) throw new Error(`Couldn't load artifact (${res.status})`);
+        const text = await res.text();
         frame.replaceChildren(a.kind === 'markdown' ? wireMd(h('div', { class: 'md doc', html: md(text) }), openExternal) : h('pre', { class: 'doc mono' }, text));
       } catch (e) {
-        frame.replaceChildren(errorBox(e));
+        frame.replaceChildren(errorBox(e, () => draw(true)));
       }
     } else if (a.kind === 'image') frame.replaceChildren(h('div', { class: 'av-img' }, h('img', { src, alt: a.title })));
-    else if (a.kind === 'file') frame.replaceChildren(empty('download', a.entry, a.description || 'A file to download.', h('a', { class: 'btn primary', href: a.url + '?download=1' }, 'Download')));
+    else if (a.kind === 'file') frame.replaceChildren(empty('download', a.entry || a.title, a.description || 'A file to download.', h('a', { class: 'btn primary', href: a.url + '?download=1' }, 'Download')));
     else frame.replaceChildren(h('iframe', { class: 'av-if', src, sandbox: 'allow-scripts allow-forms allow-popups allow-modals allow-downloads', title: a.title }));
   }
   drawHead();
   draw();
-  const stopListen = listen((ev) => {
+  const stopListen = linkId ? null : listen((ev) => {
     if (ev.kind === 'artifact' && ev.data?.id === a.id) {
       if (ev.data.deleted) return frame.replaceChildren(empty('trash', 'This artifact was deleted'));
       a = { ...a, ...ev.data, url: a.url };

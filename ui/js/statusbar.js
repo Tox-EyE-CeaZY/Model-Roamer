@@ -27,9 +27,7 @@ function collect() {
   }
   for (const n of data.conflictNotes || []) {
     out.push({ key: 'note-' + n.id, tone: 'hot', icon: 'flag', label: 'Needs you', text: 'Review conflict note', sub: n.title,
-      go: () => import('./app.js').then((m) => m.go(n.link_id
-        ? '#/settings/join?link=' + encodeURIComponent(n.link_id) + '&inbox=1'
-        : '#/p/' + n.project_id + '?inbox=1')) });
+      go: () => import('./app.js').then((m) => m.go('#/p/' + encodeURIComponent(n.link_id || n.project_id) + '?inbox=1')) });
   }
   // threads that need the person: the same rule (and the same "seen" marks) as Home and the board
   const need = attention(data.threads).need;
@@ -183,6 +181,13 @@ const refresh = debounce(async () => {
   } catch { /* the next event or tick tries again */ }
   setActivity(data); // redraws through watchAttention, and the side rail's count with it
 }, 300);
+
+export function projectAttention(projectId) {
+  const th = (data.threads || []).filter((t) => t.project_id === projectId);
+  const decs = (data.decisions || []).filter((d) => d.project_id === projectId);
+  const notes = (data.conflictNotes || []).filter((n) => (n.link_id || n.project_id) === projectId);
+  return attention(th, decs, notes);
+}
 
 export function initStatusBar() {
   ticker = h('div', { class: 'sb-ticker' });

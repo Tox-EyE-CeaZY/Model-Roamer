@@ -1,14 +1,16 @@
 // Per-person project chats (collaboration Stage 1c, see src/collab_chat.rs):
 // - a guest's own project chat in a joined project: their own lead, running on this machine on their own agents,
-//   with the host's project fed in as short summaries. It replaces the owner's chat on the joined project's page.
+//   with the host's project fed in as short summaries. It sits in the project page's left pane like the owner's lead.
 // - the owner's switch for reading collaborators' chats, and who can read each one.
 
 import { h, ago } from '../util.js';
+import { icon } from '../icons.js';
 import { get, post, patch, listen } from '../api.js';
 import { go } from '../app.js';
+import { popOut } from '../native.js';
 import { toast } from '../ui.js';
 import { mountThread } from './thread.js';
-import { ic, toggle, loading, errorBox, kicker } from '../common.js';
+import { ic, stamp, toggle, loading, errorBox, kicker } from '../common.js';
 
 const enc = encodeURIComponent;
 
@@ -22,7 +24,78 @@ function readersText(readers, host) {
   return names.join(' and ');
 }
 
-/** The guest's own chat, mounted in `el`. Gives back a function that stops it. */
+function buildBar(bar, { readers, host, offline, threadId, showExpand }) {
+  const shared = (readers || []).length > 0;
+  bar.replaceChildren(
+    h('span', {
+      class: 'status ' + (shared ? 'acc' : 'dim'),
+      title: shared ? 'The owner’s rules share this chat' : 'Nobody else can read this chat',
+    }, ic(shared ? 'people' : 'lock', 12), shared ? 'Shared' : 'Private'),
+    h('span', { class: 'cc-note' }, shared
+      ? `${readersText(readers, host)} can read this chat (the owner’s rules). Your agents still run only here.`
+      : 'Only you can read this chat: it stays on this machine. Your lead runs here on your own agents.'),
+    offline ? h('span', { class: 'status dim', title: offline }, 'Host offline') : null,
+    showExpand && threadId ? h('button', { class: 'ibtn sm', title: 'Open as a full thread', onclick: () => go('#/t/' + threadId) }, ic('fullscreen', 14)) : null,
+  );
+}
+
+/**
+ * Mount the guest's own personal project chat inside the project board's left pane (.b-lead).
+ * Matches the owner's board header + adds the Private/Shared privacy bar.
+ */
+export async function mountBoardChat(leadBox, link, { ensured = null, leadAgent = '', leadModel = '' } = {}) {
+  const bar = h('div', { class: 'cc-bar cc-bar-board' });
+  const wrap = h('div', { class: 'cc-board-thread' }, loading('Opening your chat'));
+  leadBox.replaceChildren(wrap);
+
+  let r = ensured;
+  if (!r?.thread?.id) {
+    try {
+      r = await ensureLocal(link);
+    } catch (e) {
+      wrap.replaceChildren(errorBox(e, () => mountBoardChat(leadBox, link, { leadAgent, leadModel })));
+      return { stop: () => {}, setPrivacy: () => {} };
+    }
+  }
+  const host = r.host?.name || link.host_name;
+  const tid = r.thread.id;
+  const agent = r.thread.agent || leadAgent || 'claude';
+  const model = r.thread.model || leadModel || '';
+  const head = h('div', { class: 'b-lead-h' },
+    h('span', { class: 'eyebrow' }, 'Project chat'),
+    stamp(agent, { model, small: true, lead: true }),
+    h('span', { class: 'grow' }),
+    h('button', { class: 'ibtn sm', title: 'Open as a full thread', onclick: () => go('#/t/' + tid), html: icon('fullscreen', 14) }),
+    h('button', { class: 'ibtn sm', title: 'Pop out', onclick: () => popOut('#/t/' + tid, { key: 't:' + tid }), html: icon('popout', 14) }),
+  );
+  leadBox.replaceChildren(head, bar, wrap);
+  let state = { readers: r.readers || [], offline: r.offline || '' };
+  const paintBar = () => buildBar(bar, { readers: state.readers, host, offline: state.offline, threadId: tid, showExpand: false });
+  paintBar();
+
+  const stopThread = await mountThread(wrap, tid, { compact: true });
+  const un = listen(async (ev) => {
+    if (ev.kind !== 'collab-links' || ev.data?.id !== link.id || !('share_chat' in (ev.data || {}))) return;
+    try {
+      const fresh = await ensureLocal(link);
+      state = { readers: fresh.readers || [], offline: fresh.offline || '' };
+      paintBar();
+    } catch { /* keep what we knew */ }
+  });
+  return {
+    stop: () => {
+      un();
+      if (typeof stopThread === 'function') stopThread();
+    },
+    setPrivacy: ({ readers, offline } = {}) => {
+      if (readers !== undefined) state.readers = readers;
+      if (offline !== undefined) state.offline = offline;
+      paintBar();
+    },
+  };
+}
+
+/** Legacy standalone mount (kept for compatibility if called directly). */
 export async function mountChat(el, link) {
   const bar = h('div', { class: 'cc-bar' });
   const box = h('div', { class: 'cc-chat' }, loading('Opening your chat'));
@@ -35,25 +108,15 @@ export async function mountChat(el, link) {
     return () => {};
   }
   const host = r.host?.name || link.host_name;
-  function paintBar() {
-    const shared = (r.readers || []).length > 0;
-    bar.replaceChildren(
-      h('span', { class: 'status ' + (shared ? 'acc' : 'dim'), title: shared ? 'The owner’s rules share this chat' : 'Nobody else can read this chat' }, ic(shared ? 'people' : 'lock', 12), shared ? 'Shared' : 'Private'),
-      h('span', { class: 'cc-note' }, shared
-        ? `${readersText(r.readers, host)} can read this chat (the owner’s rules). Your agents still run only here.`
-        : 'Only you can read this chat: it stays on this machine. Your lead runs here on your own agents and sees the shared project in short summaries.'),
-      r.offline ? h('span', { class: 'status dim', title: r.offline }, 'Host offline: syncs later') : null,
-      h('button', { class: 'ibtn sm', title: 'Open as a full thread', onclick: () => go('#/t/' + r.thread.id) }, ic('fullscreen', 14)));
-  }
+  const paintBar = () => buildBar(bar, { readers: r.readers, host, offline: r.offline, threadId: r.thread.id, showExpand: true });
   paintBar();
   const stop = await mountThread(box, r.thread.id, { compact: true });
-  // the owner changed who may read it: the sync loop noticed
   const un = listen(async (ev) => {
     if (ev.kind !== 'collab-links' || ev.data?.id !== link.id || !('share_chat' in (ev.data || {}))) return;
     try {
       r = { ...r, ...(await ensureLocal(link)) };
       paintBar();
-    } catch { /* the bar keeps what it knew */ }
+    } catch { /* keep what we knew */ }
   });
   return () => {
     un();
@@ -61,7 +124,7 @@ export async function mountChat(el, link) {
   };
 }
 
-/** Owner, Settings › Collaborators: may I read each person's own chat, and who can read whose. */
+/** Owner: may I read each person's own chat, and who can read whose. */
 export async function chatsPanel(box, pid) {
   let d;
   try {
@@ -91,7 +154,15 @@ export async function chatsPanel(box, pid) {
     h('p', { class: 'faint small' }, ic('shield', 12), ' Collaborators can be allowed to read each other’s chats with the rule “see other people’s own project chats” above.'));
 }
 
-/** The joined project's board link: its threads belong to people; the person's own open on this machine. */
+/** Owner label for a thread card on a joined project board. */
+export function threadOwnerLabel(t, me, personName) {
+  if (me && t.user_id && t.user_id === me.user_id) return 'yours';
+  if (t.kind === 'lead') return (personName('') || 'Owner') + '’s lead';
+  if (t.kind === 'chat') return personName(t.user_id) + '’s chat';
+  return t.user_id ? personName(t.user_id) : (personName('') || 'Owner');
+}
+
+/** Legacy helper kept for compatibility. */
 export function threadTag(t, me, personName) {
   if (t.user_id === me.user_id) return ' · yours';
   if (t.kind === 'lead') return ' · ' + personName('') + '’s chat';

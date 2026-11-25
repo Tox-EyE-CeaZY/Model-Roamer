@@ -296,6 +296,7 @@ export async function palette(initial = '') {
     { label: 'Memory', icon: 'memory', run: () => go('#/memory') },
     { label: 'Artifacts', icon: 'artifact', run: () => go('#/artifacts') },
     { label: 'Remote access and devices', icon: 'wifi', run: () => go('#/settings/remote') },
+    { label: 'Local model', icon: 'cpu', run: () => go('#/settings/local-model') },
     { label: 'GitHub', icon: 'branch', run: () => go('#/settings/github') },
     { label: 'Appearance', icon: 'brush', run: () => go('#/settings/look') },
     { label: 'Keyboard shortcuts', hint: '?', icon: 'keyboard', run: () => shortcuts() },

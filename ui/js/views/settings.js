@@ -18,6 +18,7 @@ const SECTIONS = [
   ['remote', 'Remote access', 'wifi'],
   ['collab', 'Collaborators', 'people'],
   ['join', 'Join a project', 'link'],
+  ['local-model', 'Local model', 'cpu'],
   ['about', 'About and updates', 'info'],
 ];
 
@@ -26,9 +27,10 @@ export default async function settings(el, r) {
   const body = h('div', { class: 'set-body' });
   el.append(h('div', { class: 'page-h' }, h('div', {}, h('h1', {}, 'Settings'), h('p', { class: 'lede' }, 'Saved as you change them.'))),
     h('div', { class: 'set' }, h('nav', { class: 'set-nav' }, SECTIONS.map(([k, label, ico]) => h('a', { class: 'set-i' + (k === sec ? ' on' : ''), href: '#/settings/' + k }, ic(ico, 15), label))), body));
-  // collaboration lives in its own module (views/collab.js), loaded only when opened
+  // collaboration and local model live in their own modules, loaded only when opened
   const collab = (fn) => (b) => import('./collab.js').then((m) => m[fn](b, r));
-  return ({ look, windows, github, remote, about, collab: collab('collaborators'), join: collab('joinProject') })[sec](body);
+  const localModel = (b) => import('./local_llm.js').then((m) => m.default(b, r));
+  return ({ look, windows, github, remote, about, collab: collab('collaborators'), join: collab('joinProject'), 'local-model': localModel })[sec](body);
 }
 
 const save = (p) => setSetting(p).catch((e) => toast(e.message, { err: true }));

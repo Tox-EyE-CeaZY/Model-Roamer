@@ -49,7 +49,7 @@ impl AgentAdapter for Antigravity {
         if !spec.model.is_empty() {
             a.extend(["--model".into(), spec.model.clone()]);
         }
-        if !spec.effort.is_empty() {
+        if !spec.effort.is_empty() && model_accepts_effort(&spec.model) {
             a.extend(["--effort".into(), spec.effort.clone()]);
         }
         for d in &spec.extra_dirs {
@@ -189,6 +189,40 @@ impl AgentAdapter for Antigravity {
     }
 }
 
+/// Whether Antigravity's CLI accepts `--effort` for this model.
+/// Models that already bake a thinking level into their name or ID (e.g. "Gemini 4 Neon (High)",
+/// "gemini-4-neon-medium", "gemini-4-neon-xhigh") or orchestrator models reject or conflict with `--effort`.
+/// An empty model (CLI default) or a base model without a level keeps accepting `--effort`.
+pub(crate) fn model_accepts_effort(model: &str) -> bool {
+    let m = model.trim();
+    if m.is_empty() {
+        return true;
+    }
+    let lower = m.to_ascii_lowercase();
+    if lower.contains("orchestrator") {
+        return false;
+    }
+    let mut rest = lower.as_str();
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(')') else { break };
+        if is_effort_level(after[..close].trim()) {
+            return false;
+        }
+        rest = &after[close + 1..];
+    }
+    if let Some((_, tail)) = lower.rsplit_once(['-', '_']) {
+        if is_effort_level(tail) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_effort_level(s: &str) -> bool {
+    matches!(s, "minimal" | "low" | "medium" | "high" | "xhigh" | "extra high" | "extra-high" | "extra_high" | "max" | "ultra")
+}
+
 /// One step of agy's work: the reply streaming in, its thinking, or a tool it used. Your own message comes back as a
 /// `user_input` step and is skipped.
 /// The reply text inside a message that was stored as raw stream-json (by builds before the stream was parsed), or
@@ -301,6 +335,73 @@ mod tests {
         assert_eq!(repair_body(raw).as_deref(), Some("pong"));
         assert_eq!(repair_body("plain text"), None);
     }
+    fn spec(model: &str, effort: &str) -> TurnSpec {
+        TurnSpec {
+            prompt: "hi".into(),
+            system: String::new(),
+            session: None,
+            cwd: PathBuf::from("."),
+            model: model.into(),
+            effort: effort.into(),
+            autonomy: Autonomy::Full,
+            mcp: None,
+            extra_dirs: vec![],
+            scratch: PathBuf::from("."),
+            extra_args: vec![],
+            headless: true,
+            lead: false,
+        }
+    }
+
+    #[test]
+    fn omits_effort_for_models_with_level_or_no_effort_support() {
+        let a = Antigravity;
+        for (model, effort) in [
+            ("Gemini 4 Neon (High)", "high"),
+            ("Gemini 4 Neon (Medium)", "medium"),
+            ("Gemini 4 Neon (Low)", "low"),
+            ("Gemini 4 Neon (XHigh)", "high"),
+            ("gemini-4-neon-high", "low"),
+            ("gemini-4-neon-medium", "high"),
+            ("gemini-4-neon-xhigh", "high"),
+            ("gpt-oss-120b-medium", "high"),
+            ("gemini-pro-orchestrator-neon", "high"),
+            ("Orchestrator (Neon)", "high"),
+        ] {
+            let args = a.launch(&spec(model, effort)).unwrap().args;
+            assert!(args.windows(2).any(|w| w == ["--model", model]), "expected --model {model} in {args:?}");
+            assert!(!args.iter().any(|x| x == "--effort"), "unexpected --effort for {model}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn keeps_effort_for_models_that_accept_it() {
+        let a = Antigravity;
+        for (model, effort) in [
+            ("gemini-4-neon", "high"),
+            ("gemini-3-pro", "medium"),
+            ("Gemini 4 Neon (Preview)", "low"),
+        ] {
+            let args = a.launch(&spec(model, effort)).unwrap().args;
+            assert!(args.windows(2).any(|w| w == ["--model", model]), "expected --model {model} in {args:?}");
+            assert!(args.windows(2).any(|w| w == ["--effort", effort]), "expected --effort {effort} for {model}: {args:?}");
+        }
+        let args = a.launch(&spec("gemini-4-neon", "")).unwrap().args;
+        assert!(!args.iter().any(|x| x == "--effort"));
+    }
+
+    #[test]
+    fn keeps_effort_when_no_model_is_set() {
+        let a = Antigravity;
+        let args = a.launch(&spec("", "high")).unwrap().args;
+        assert!(!args.iter().any(|x| x == "--model"));
+        assert!(args.windows(2).any(|w| w == ["--effort", "high"]), "expected --effort high: {args:?}");
+
+        let args = a.launch(&spec("", "")).unwrap().args;
+        assert!(!args.iter().any(|x| x == "--model"));
+        assert!(!args.iter().any(|x| x == "--effort"));
+    }
+
     #[test]
     fn shows_tool_steps() {
         let a = Antigravity;

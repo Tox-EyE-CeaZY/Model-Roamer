@@ -165,7 +165,8 @@ pub fn asset(path: &str) -> Response {
     match Assets::get(path) {
         Some(f) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            let cache = if path == "index.html" { "no-cache" } else { "public, max-age=300" };
+            // Always revalidate: UI files import each other; a stale cached copy next to a fresh one breaks module loading.
+            let cache = "no-cache";
             Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, cache).body(Body::from(f.data.into_owned())).unwrap()
         }
         None => StatusCode::NOT_FOUND.into_response(),

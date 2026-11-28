@@ -66,6 +66,9 @@ pub fn defaults() -> Value {
         "worktrees": true,
         "auto_push": false,
 
+        // Rust build folders in the app's own worktrees (cleanup.rs). 0 turns that rule off.
+        "build_cleanup": { "enabled": true, "idle_hours": 24, "max_gb": 20 },
+
         // this machine as a server for other devices
         "server": {
             "share": false,

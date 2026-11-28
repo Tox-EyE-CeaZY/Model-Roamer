@@ -48,6 +48,9 @@ need a terminal. Agents › **Install** fetches a CLI for you, and **Sign in** r
 - **Memory**: global and per-project notes that agents read and write. You can search, edit and restore them from the
   trash.
 - **Usage**: turns and tokens per agent per day, failures, and when each one hit its limit.
+- **Disk space**: Rust build folders (`target`) in the app's own worktrees and clones are cleared when a thread is
+  resolved or deleted, after a day unused, or, longest unused first, when together they pass 20 GB. Change or turn this
+  off in Settings › Git and GitHub. Your own project folders are never touched.
 - **Chats**: plain conversations with any agent, outside a project.
 - Undo for deletes, a command palette (Ctrl+K), keyboard shortcuts for everything (press **?**), themes and an accent
   colour, and it **updates itself** from GitHub releases (Windows and Linux; macOS opens the release page).

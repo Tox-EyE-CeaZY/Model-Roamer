@@ -1519,6 +1519,8 @@ pub async fn resolve(core: &CoreRef, thread: &str, on: bool) -> Result<()> {
         if t["merged"] == 1 {
             cleanup_worktree(core, &t).await;
         }
+        // an unmerged one stays, without its build output
+        crate::cleanup::soon(core);
         if let Some(p) = t["project_id"].as_str() {
             release_dependents(core, p);
         }

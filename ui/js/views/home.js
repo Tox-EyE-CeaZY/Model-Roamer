@@ -3,11 +3,12 @@
 import { h, ago, plural } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, listen } from '../api.js';
-import { S, watch, agentList, agentName } from '../store.js';
+import { S, watch, agentList, agentName, allProjects } from '../store.js';
 import { go, openThread, projectMenu, newProject } from '../app.js';
 import { dialog, toast } from '../ui.js';
 import { ic, stamp, statusChip, empty, field, input, textarea, seg, agentModelPicker, pickFolder, folderInput, timeAgo, loading, kicker } from '../common.js';
 import { attention as sortOut, markSeen, unmarkSeen, watchAttention } from '../attention.js';
+import { ROLE_LABEL } from '../collab_perms.js';
 
 export default async function home(el) {
   const attention = h('section', { class: 'h-attn' });
@@ -26,6 +27,7 @@ export default async function home(el) {
         h('p', { class: 'lede' }, 'Give a project to a lead agent and it plans the work, hands pieces to Claude Code, Codex and Antigravity, and keeps them out of each other’s way.')),
       h('div', { class: 'hero-acts' },
         h('button', { class: 'btn primary', onclick: () => newProject() }, ic('plus', 14), 'New project'),
+        h('button', { class: 'btn', onclick: () => go('#/settings/join') }, ic('link', 14), 'Join a project'),
         h('button', { class: 'btn', onclick: () => import('./chats.js').then((m) => m.newChat()) }, ic('chat', 14), 'New chat'))),
     attention, running,
     h('div', { class: 'h-cols' }, projects, h('div', { class: 'h-aside' }, fleet, chats)),
@@ -93,23 +95,39 @@ export default async function home(el) {
   }
 
   function drawProjects() {
-    if (!S.projects.length) {
-      projects.replaceChildren(kicker('Projects'), empty('board', 'No projects yet', 'A project is a folder or a GitHub repository, a lead agent and its threads. The lead keeps memory, history and context for the whole team.', h('button', { class: 'btn primary', onclick: () => newProject() }, 'Make the first project')));
+    const list = allProjects();
+    if (!list.length) {
+      projects.replaceChildren(kicker('Projects'), empty('board', 'No projects yet', 'A project is a folder or a GitHub repository, a lead agent and its threads — or join a project someone invited you to.',
+        h('div', { class: 'row' },
+          h('button', { class: 'btn primary', onclick: () => newProject() }, ic('plus', 14), 'Make the first project'),
+          h('button', { class: 'btn', onclick: () => go('#/settings/join') }, ic('link', 14), 'Join a project'))));
       return;
     }
-    projects.replaceChildren(kicker('Projects', h('button', { class: 'chipbtn', onclick: () => newProject() }, '+ New')),
-      h('div', { class: 'pgrid' }, S.projects.map((p) => {
+    projects.replaceChildren(kicker('Projects', h('div', { class: 'row' },
+      h('button', { class: 'chipbtn', onclick: () => go('#/settings/join') }, 'Join'),
+      h('button', { class: 'chipbtn', onclick: () => newProject() }, '+ New'))),
+      h('div', { class: 'pgrid' }, list.map((p) => {
+        const col = p._collab;
         const mine = threads.filter((t) => t.project_id === p.id && t.kind !== 'lead');
         const done = mine.filter((t) => t.status === 'done' || t.resolved).length;
-        return h('a', { class: 'pcard cut', href: '#/p/' + p.id, style: { '--ph': p.color }, oncontextmenu: (e) => (e.preventDefault(), projectMenu(p, e.clientX, e.clientY)) },
-          h('div', { class: 'pc-top' }, h('i', { class: 'pc-sw' }), h('h3', {}, p.name), p.decisions ? h('b', { class: 'count hot', title: 'Decisions waiting' }, p.decisions) : null),
-          h('div', { class: 'pc-where mono' }, ic(p.repo_url ? 'branch' : 'folder', 13), h('span', {}, p.repo_url ? p.repo_url.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '') : p.folder || 'Kept by Model Roamer')),
+        const where = col
+          ? `Hosted by ${col.host_name} · ${ROLE_LABEL[col.role] || col.role}`
+          : p.repo_url ? p.repo_url.replace(/^https?:\/\/(www\.)?github\.com\//, '').replace(/\.git$/, '') : p.folder || 'Kept by Model Roamer';
+        return h('a', { class: 'pcard cut' + (col ? ' joined' : ''), href: '#/p/' + p.id, style: { '--ph': p.color }, oncontextmenu: (e) => (e.preventDefault(), projectMenu(p, e.clientX, e.clientY)) },
+          h('div', { class: 'pc-top' },
+            h('i', { class: 'pc-sw' }),
+            h('h3', {}, p.name),
+            col ? h('span', { class: 'tag' + (col.status === 'revoked' ? ' hot' : '') }, col.status === 'revoked' ? 'removed' : col.status === 'offline' ? 'offline' : 'joined') : null,
+            p.decisions ? h('b', { class: 'count hot', title: 'Decisions waiting' }, p.decisions) : null),
+          h('div', { class: 'pc-where mono' }, ic(col ? 'people' : p.repo_url ? 'branch' : 'folder', 13), h('span', {}, where)),
           h('div', { class: 'pc-stats' },
             h('span', {}, h('b', {}, p.working || 0), ' working'),
             h('span', {}, h('b', {}, p.open_threads || 0), ' open'),
             h('span', {}, h('b', {}, done), ' done')),
           mine.length ? h('div', { class: 'pc-bar' }, mine.slice(0, 24).map((t) => h('i', { class: 'st-' + (S.running[t.id] ? 'working' : t.status), style: { '--ah': S.agents[t.agent]?.info?.hue ?? 200 }, title: `${t.title} · ${agentName(t.agent)}` }))) : null,
-          h('div', { class: 'pc-foot' }, stamp(p.lead_agent, { model: p.lead_model, small: true, lead: true }), h('small', { class: 'faint' }, 'updated ', timeAgo(p.updated_at))));
+          h('div', { class: 'pc-foot' },
+            p.lead_agent ? stamp(p.lead_agent, { model: p.lead_model, small: true, lead: true }) : h('span', { class: 'tag' }, ROLE_LABEL[col?.role] || 'Joined'),
+            h('small', { class: 'faint' }, 'updated ', timeAgo(p.updated_at))));
       })));
   }
 

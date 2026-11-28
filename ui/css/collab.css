@@ -57,3 +57,49 @@
   .collab-compose { grid-template-columns: minmax(0, 1fr); }
   .collab-member > .dev { flex-wrap: wrap; }
 }
+
+/* Joined projects as real projects: sidebar marker, board integration, collaborator settings, owner People section */
+.sd-p.joined { height: auto; min-height: 36px; padding-block: 5px; align-items: center; }
+.sd-p-meta { flex: 1; min-width: 0; display: grid; gap: 1px; }
+.sd-p-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; line-height: 1.25; }
+.sd-p-host { display: flex; align-items: center; gap: 4px; font: 600 9.5px var(--f-mono); letter-spacing: .04em; text-transform: uppercase; color: var(--faint); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sd-p-host .ico { color: var(--accent); opacity: .8; flex: none; }
+.sd-p.revoked .sd-p-name { opacity: .65; text-decoration: line-through; }
+.sd-dot.dim { background: var(--faint); }
+.sd-empty-box { display: grid; gap: 2px; }
+html.rail-min .sd-p-meta { display: none; }
+@media (max-width: 760px) { .sd-p-meta { display: none; } }
+
+.board.board-chat-only { grid-template-columns: minmax(0, 1fr); }
+.cc-bar-board { padding: 6px 14px; border-bottom: 1px dashed var(--line2); background: color-mix(in oklch, var(--bg2) 65%, transparent); flex: none; }
+.cc-bar .status:has(.ico)::before { display: none; }
+.p-sub .status.live { gap: 8px; }
+.cc-board-thread { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.cc-board-thread > .thread { flex: 1; min-height: 0; }
+
+.tc-owner { max-width: 140px; overflow: hidden; text-overflow: ellipsis; }
+.bp-host-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
+.bp-host-body .collab-msgs { flex: 1; max-height: none; }
+.bp-host-compose:empty { display: none; }
+
+.collab-state-wrap { padding: var(--gut); max-width: 720px; margin: 0 auto; width: 100%; }
+.collab-mem-banner { padding: 0 0 10px; }
+.collab-mem-banner[hidden] { display: none; }
+.mem-scope-wrap { display: inline-flex; }
+
+.collab-perm-ro-list { display: grid; gap: 0; }
+.collab-perm-ro { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.collab-perm-ro:last-child { border-bottom: 0; }
+
+.p-people-head { margin-top: 10px; padding-top: 14px; border-top: 1px dashed var(--line2); }
+.p-people-section { display: grid; gap: 0; }
+.collab-ov-row.on { background: color-mix(in oklch, var(--accent) 8%, transparent); padding-inline: 8px; }
+.collab-detail-host { display: grid; gap: 0; }
+
+.tag.hot { color: var(--hot); border-color: color-mix(in oklch, var(--hot) 55%, transparent); }
+
+@media (max-width: 640px) {
+  .p-title .p-sub { flex-wrap: wrap; }
+  .collab-ov-row { flex-wrap: wrap; }
+  .collab-perm-ro { gap: 8px; font-size: 13px; }
+}

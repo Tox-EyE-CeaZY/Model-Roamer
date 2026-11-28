@@ -12,7 +12,8 @@ import { ic, empty, loading, errorBox, timeAgo, repoSelect } from '../common.js'
 const HOW = { claimed: 'claimed', changed: 'editing', recent: 'just changed' };
 const size = (n) => (n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KB' : (n / 1048576).toFixed(1) + ' MB');
 
-export default async function filesTab(el, p, r) {
+export default async function filesTab(el, p, r, opts = {}) {
+  const apiBase = opts.collab ? opts.collab.viewBase : `projects/${p.id}/`;
   let path = r?.q?.p || '';
   // which of the project's repositories (?repo=), when it has several
   const repo = r?.q?.repo && r.q.repo !== 'primary' ? r.q.repo : '';
@@ -78,7 +79,7 @@ export default async function filesTab(el, p, r) {
     view.hidden = false;
     view.replaceChildren(loading());
     try {
-      const f = await get(`projects/${p.id}/file?path=${encodeURIComponent(rel)}${rq}`);
+      const f = await get(`${apiBase}file?path=${encodeURIComponent(rel)}${rq}`);
       view.replaceChildren(
         h('div', { class: 'fl-view-h' }, h('b', { class: 'mono' }, rel), h('span', { class: 'grow' }), h('small', { class: 'faint mono' }, size(f.size)),
           h('button', { class: 'ibtn sm', title: 'Close', onclick: () => ((sel = null), (view.hidden = true), drawList()), html: icon('close', 14) })),
@@ -91,7 +92,7 @@ export default async function filesTab(el, p, r) {
 
   async function load() {
     try {
-      data = await get(`projects/${p.id}/files?path=${encodeURIComponent(path)}${rq}`);
+      data = await get(`${apiBase}files?path=${encodeURIComponent(path)}${rq}`);
       if (dead) return;
       drawBar();
       drawLive();

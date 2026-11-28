@@ -5,6 +5,7 @@
 use crate::{
     core::CoreRef,
     git, github, runner,
+    memory::{self, Scope, View},
     util::{self, clip},
 };
 use anyhow::{anyhow, bail, Result};
@@ -27,12 +28,15 @@ fn obj(props: Value, req: &[&str]) -> Value {
 }
 
 const DEFS: &[Def] = &[
+    Def { name: "who_is_working_on", roles: ALL, desc: "Read a compact live summary of other collaborators' threads, branches, status and claims. Pass a title or file paths to check a proposed task for overlaps.", schema: || obj(json!({
+        "title": {"type":"string"}, "paths": {"type":"array", "items":{"type":"string"}}
+    }), &[]) },
     // ---------------------------------------------------------------- orchestration (lead)
     Def { name: "spawn_thread", roles: LEAD, desc: "Open a worker thread for one task and hand it to an agent. It starts right away (or after the threads in depends_on finish). Give clear instructions and acceptance criteria. Returns the thread id.", schema: || obj(json!({
         "title": {"type": "string", "description": "Short title, verb first, 3-6 words"},
         "instructions": {"type": "string", "description": "The task: what to do, context, files/areas it owns, what not to touch"},
         "criteria": {"type": "string", "description": "Acceptance criteria: what done looks like and how to verify it"},
-        "agent": {"type": "string", "description": "claude | codex | antigravity | a custom agent id | auto (route by task_kind and headroom)"},
+        "agent": {"type": "string", "description": "claude | codex | antigravity | local | a custom agent id | auto (route by task_kind and headroom)"},
         "task_kind": {"type": "string", "description": "plan | core | refactor | review | docs | design | frontend | creative | research | backend | api | data | infra | scripts | tests | general"},
         "model": {"type": "string", "description": "Optional model for that agent"},
         "effort": {"type": "string", "description": "Optional thinking strength for this thread (low | medium | high | xhigh | max, as the model allows). Use lower for simple edits and higher for hard design or debugging; leave empty for the agent's default."},
@@ -49,7 +53,8 @@ const DEFS: &[Def] = &[
         "status": {"type": "string", "description": "Optional filter: working | waiting | blocked | review | done | failed | paused | limited | open (anything unresolved)"}
     }), &[]) },
     Def { name: "read_thread", roles: LEAD, desc: "Read a thread's recent messages (newest last).", schema: || obj(json!({
-        "thread_id": {"type": "string"}, "limit": {"type": "integer", "description": "Messages to return (default 12)"}
+        "thread_id": {"type": "string"}, "limit": {"type": "integer", "description": "Messages to return (default 12)"},
+        "before": {"type": "integer", "description": "Only messages before this timestamp in milliseconds"}
     }), &["thread_id"]) },
     Def { name: "check_status", roles: LEAD, desc: "Overview: every open thread's state, what each agent is doing, which agents are signed in or out of usage, and pending decisions.", schema: || obj(json!({}), &[]) },
     Def { name: "route_task", roles: LEAD, desc: "Which agent and model should take a task, based on routing rules and available usage.", schema: || obj(json!({
@@ -92,15 +97,16 @@ const DEFS: &[Def] = &[
         "recommended": {"type": "integer", "description": "Index of the recommended option, from 0"}
     }), &["question", "options"]) },
     // ---------------------------------------------------------------- for everyone
-    Def { name: "read_memory", roles: ALL, desc: "Read project and global memory. No arguments: the index (name and description of every entry). name: one entry in full. query: full-text search.", schema: || obj(json!({
-        "name": {"type": "string"}, "query": {"type": "string"}
+    Def { name: "read_memory", roles: ALL, desc: "Read collaborator, project and global memory. No arguments returns the index. Use name for a full entry or query for full-text search.", schema: || obj(json!({
+        "name": {"type": "string"}, "query": {"type": "string"},
+        "scope": {"type": "string", "enum": ["collaborator", "project", "global"]}
     }), &[]) },
-    Def { name: "write_memory", roles: ALL, desc: "Create or update a memory entry (one subject per entry; update rather than duplicate). Visible to every agent and the person.", schema: || obj(json!({
+    Def { name: "write_memory", roles: ALL, desc: "Create or update one memory entry. Use collaborator for personal preferences, machine details and private notes.", schema: || obj(json!({
         "name": {"type": "string", "description": "short-kebab-case"}, "description": {"type": "string", "description": "One line: what this entry is for"},
-        "body": {"type": "string"}, "scope": {"type": "string", "enum": ["project", "global"], "description": "project (default) or global (shared by all projects)"}
+        "body": {"type": "string"}, "scope": {"type": "string", "enum": ["collaborator", "project", "global"], "description": "project (default in a project), global (across projects), collaborator (private)"}
     }), &["name", "body"]) },
     Def { name: "delete_memory", roles: ALL, desc: "Delete a memory entry that turned out to be wrong or obsolete.", schema: || obj(json!({
-        "name": {"type": "string"}, "scope": {"type": "string", "enum": ["project", "global"]}
+        "name": {"type": "string"}, "scope": {"type": "string", "enum": ["collaborator", "project", "global"]}
     }), &["name"]) },
     Def { name: "publish_artifact", roles: ALL, desc: "Publish something to look at (HTML page, markdown, SVG, image, PDF, text) so the person can open it in Model Roamer on any device. Give a file path in your workspace, or the content itself. Same title updates it. It is filed under this project and thread automatically; pass folder to put it somewhere else.", schema: || obj(json!({
         "title": {"type": "string"}, "folder": {"type": "string", "description": "Optional folder path, made if missing, e.g. 'Designs/Mockups' (inside the project's folder; a leading / starts from the top of the library)"}, "path": {"type": "string", "description": "A file (or a folder with index.html) in your workspace"},
@@ -158,14 +164,18 @@ pub fn role_of(thread: &Value) -> &'static str {
 }
 
 /// The MCP tool list for a thread's role.
-pub fn list(role: &str) -> Vec<Value> {
-    DEFS.iter().filter(|d| d.roles.contains(&role)).map(|d| json!({ "name": d.name, "description": d.desc, "inputSchema": (d.schema)() })).collect()
+pub fn list(role: &str, bridged: bool) -> Vec<Value> {
+    DEFS.iter().filter(|d| available(d, role, bridged)).map(|d| json!({ "name": d.name, "description": d.desc, "inputSchema": (d.schema)() })).collect()
+}
+
+fn available(def: &Def, role: &str, bridged: bool) -> bool {
+    def.roles.contains(&role) || (bridged && crate::collab_bridge::shared_tool(def.name))
 }
 
 /// The tools as text, for the instructions (and for agents using the text protocol).
-pub fn describe(role: &str) -> String {
+pub fn describe(role: &str, bridged: bool) -> String {
     let mut out = String::new();
-    for d in DEFS.iter().filter(|d| d.roles.contains(&role)) {
+    for d in DEFS.iter().filter(|d| available(d, role, bridged)) {
         let sch = (d.schema)();
         let props = sch["properties"].as_object().cloned().unwrap_or_default();
         let req: Vec<String> = sch["required"].as_array().cloned().unwrap_or_default().iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
@@ -175,16 +185,204 @@ pub fn describe(role: &str) -> String {
     out
 }
 
+const LOCAL_TOOLS: &[&str] = &[
+    "check_status", "list_threads", "read_thread", "spawn_thread", "read_memory",
+    "write_memory", "send_message", "ask_user", "who_is_working_on", "claim_paths",
+    "release_paths", "list_claims", "set_title",
+];
+
+pub(crate) fn local_writes(name: &str) -> bool {
+    !matches!(name, "check_status" | "list_threads" | "read_thread" | "read_memory" | "who_is_working_on" | "list_claims")
+}
+
+fn local_allowed(core: &CoreRef, thread: &Value, member: Option<&crate::collab::Member>, name: &str) -> bool {
+    if local_writes(name) && crate::agents::Autonomy::parse(core.agent_cfg("local")["autonomy"].as_str().unwrap_or("")) == crate::agents::Autonomy::ReadOnly {
+        return false;
+    }
+    if let Some(m) = member {
+        return match name {
+            "check_status" | "list_threads" | "read_thread" => m.can("view_threads"),
+            "who_is_working_on" => m.can("view_threads") && m.can("view_presence"),
+            "spawn_thread" => m.can("create_threads"),
+            "write_memory" => m.can("edit_memory"),
+            "read_memory" | "post_to_chat" => true,
+            _ => false,
+        };
+    }
+    if !LOCAL_TOOLS.contains(&name) {
+        return false;
+    }
+    let bridged = crate::collab_bridge::bind_row(core, thread).ok().flatten().is_some();
+    let project = thread["project_id"].is_string();
+    match name {
+        "check_status" | "list_threads" | "who_is_working_on" => project,
+        "spawn_thread" | "send_message" | "claim_paths" | "release_paths" | "list_claims" if !project => false,
+        "read_thread" if project => true,
+        _ => DEFS.iter().any(|d| d.name == name && available(d, role_of(thread), bridged)),
+    }
+}
+
+pub(crate) fn local_list(core: &CoreRef, thread: &Value, member: Option<&crate::collab::Member>) -> Vec<Value> {
+    let mut result: Vec<_> = DEFS.iter().filter(|d| local_allowed(core, thread, member, d.name)).map(|d| {
+        let mut parameters = (d.schema)();
+        let mut description = d.desc;
+        if d.name == "check_status" {
+            description = "See the status of open threads in this project.";
+        }
+        if d.name == "spawn_thread" {
+            for key in ["effort", "workspace", "depends_on", "repo", "allow_limited"] {
+                parameters["properties"].as_object_mut().unwrap().remove(key);
+            }
+            if member.is_some() {
+                description = "Save a paused thread draft for the requesting collaborator. It will not run here.";
+            }
+        }
+        if let Some(m) = member {
+            if d.name == "write_memory" || (d.name == "read_memory" && !m.can("read_global_memory")) {
+                parameters["properties"]["scope"]["enum"] = json!(["collaborator", "project"]);
+                parameters["properties"]["scope"].as_object_mut().unwrap().remove("description");
+            }
+            if d.name == "read_memory" && !m.can("read_global_memory") {
+                description = "Read your private notes or shared project memory. Pass name for a full entry or query to search.";
+            }
+        }
+        json!({ "type": "function", "function": { "name": d.name, "description": description, "parameters": parameters } })
+    }).collect();
+    if local_allowed(core, thread, member, "post_to_chat") {
+        result.push(json!({ "type": "function", "function": {
+            "name": "post_to_chat",
+            "description": "Post a note in the requesting collaborator's own project chat. Prefer replying normally.",
+            "parameters": obj(json!({ "text": { "type": "string" } }), &["text"])
+        }}));
+    }
+    result
+}
+
+pub(crate) enum Caller<'a> {
+    Thread(&'a Value),
+    Member { thread: &'a Value, identity: &'a crate::collab::Member },
+}
+
+impl<'a> From<&'a Value> for Caller<'a> {
+    fn from(thread: &'a Value) -> Self {
+        Self::Thread(thread)
+    }
+}
+
+fn local_thread_lines(rows: Vec<Value>, filter: &str) -> String {
+    let lines = rows.iter().filter(|r| match filter {
+        "" => true,
+        "open" => r["resolved"] == 0,
+        "parked" => r["resolved"] == 0 && r["parked_at"].is_i64(),
+        status => r["status"] == status,
+    }).map(thread_line).collect::<Vec<_>>();
+    if lines.is_empty() { "No visible threads.".into() } else { lines.join("\n") }
+}
+
+fn member_local_call(core: &CoreRef, thread: &Value, m: &crate::collab::Member, name: &str, args: &Value) -> Result<String> {
+    use crate::{collab, collab_bridge};
+    let arg = |k: &str| args[k].as_str().unwrap_or("").trim();
+    let thread = collab::visible_thread(core, m, thread["id"].as_str().unwrap_or("")).map_err(|e| anyhow!(e.1))?;
+    if thread["user_id"] != m.user_id || !crate::collab_chat::is_personal_chat(&thread) {
+        bail!("The shared local model needs your own project chat.");
+    }
+    match name {
+        "list_threads" | "check_status" => {
+            let rows = collab::threads_of(core, m, 0).map_err(|e| anyhow!(e.1))?;
+            let rows = rows.into_iter().filter(|r| {
+                !crate::collab_chat::is_personal_chat(r) || r["user_id"] == m.user_id
+            }).collect();
+            Ok(local_thread_lines(rows, if name == "check_status" { "open" } else { arg("status") }))
+        }
+        "read_thread" => {
+            let id = arg("thread_id");
+            let target = collab::visible_thread(core, m, id).map_err(|e| anyhow!(e.1))?;
+            if crate::collab_chat::is_personal_chat(&target) && target["user_id"] != m.user_id {
+                bail!("No such thread.");
+            }
+            let history = collab::thread_history(core, m, id, args["before"].as_i64().unwrap_or(i64::MAX), args["limit"].as_i64().unwrap_or(8).clamp(1, 20))
+                .map_err(|e| anyhow!(e.1))?;
+            Ok(format_history(&history["thread"], history["messages"].as_array().map(Vec::as_slice).unwrap_or_default()))
+        }
+        "read_memory" => {
+            let (name, query) = (arg("name"), arg("query"));
+            let rows = collab_bridge::member_memory(core, m, Scope::parse(arg("scope"))?, name, query).map_err(|e| anyhow!(e.1))?;
+            Ok(memory::render(&rows, name, query))
+        }
+        "write_memory" => {
+            let saved = collab_bridge::save_member_memory(core, m, args).map_err(|e| anyhow!(e.1))?;
+            Ok(format!("Saved memory '{}' ({}).", saved["name"].as_str().unwrap_or(""), saved["scope"].as_str().unwrap_or("")))
+        }
+        "who_is_working_on" => {
+            let mut view = collab::presence::snapshot(core, &m.project_id, Some(m));
+            for person in &mut view.people {
+                person.work.retain(|w| w.kind != "chat");
+            }
+            let work = collab::presence::Work { title: arg("title").into(), kind: "worker".into(), paths: proposed_claims(args), ..Default::default() };
+            let matches = collab::presence::overlaps(&view, &m.user_id, &work);
+            let active: Vec<_> = view.people.iter().filter(|p| p.user_id != m.user_id && p.online).flat_map(|p| {
+                p.work.iter().map(|w| json!({ "person": p.name, "thread": w.thread, "title": w.title, "status": w.status }))
+            }).take(12).collect();
+            Ok(json!({ "active": active, "overlaps": matches }).to_string())
+        }
+        "spawn_thread" => {
+            let draft = collab::create_member_thread(core, m, args).map_err(|e| anyhow!(e.1))?;
+            Ok(format!("Saved paused thread draft {}.", draft["id"].as_str().unwrap_or("")))
+        }
+        "post_to_chat" => {
+            let text = arg("text");
+            if text.is_empty() { bail!("Write a note first."); }
+            runner::post(core, thread["id"].as_str().unwrap_or(""), "agent", "Local Operator", text, json!({ "user_id": m.user_id }), false)?;
+            Ok("Posted to your project chat.".into())
+        }
+        _ => bail!("That tool isn't available to the shared local model."),
+    }
+}
+
 /// Run a tool for the agent working in `caller`. The result is text for the agent.
-pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> Result<String> {
+pub async fn call<'a>(core: &CoreRef, caller: impl Into<Caller<'a>>, name: &str, args: &Value) -> Result<String> {
+    if !args.is_object() {
+        bail!("Tool arguments must be an object.");
+    }
+    let caller = match caller.into() {
+        Caller::Thread(thread) => thread,
+        Caller::Member { thread, identity } => {
+            let member = crate::collab::refresh_member(core, identity.clone()).map_err(|e| anyhow!(e.1))?;
+            if !local_allowed(core, thread, Some(&member), name) {
+                bail!("The project's owner hasn't allowed this local model tool.");
+            }
+            return member_local_call(core, thread, &member, name, args);
+        }
+    };
+    let local = caller["agent"] == "local";
+    if local && !local_allowed(core, caller, None, name) {
+        bail!("This local model tool isn't available in the current thread.");
+    }
     let role = role_of(caller);
+    let binding = crate::collab_bridge::bind_row(core, caller)?;
     let def = DEFS.iter().find(|d| d.name == name).ok_or_else(|| anyhow!("Unknown tool {name}"))?;
-    if !def.roles.contains(&role) {
+    if !local && !available(def, role, binding.is_some()) {
         bail!("{name} is for the lead only. Ask the lead in your reply instead.");
     }
+    crate::collab_chat::guard_tool(core, name, args)?;
+    check_collaboration_overlap(core, caller, name, args)?;
     let tid = caller["id"].as_str().unwrap_or("").to_string();
     let project = caller["project_id"].as_str().map(str::to_string);
     let a = |k: &str| args[k].as_str().unwrap_or("").trim().to_string();
+    if let Some(binding) = binding.as_ref() {
+        let scope = if matches!(name, "read_memory" | "write_memory" | "delete_memory") { Scope::parse(&a("scope"))? } else { None };
+        let project_memory = matches!(scope, None | Some(Scope::Project));
+        if name == "delete_memory" && project_memory {
+            bail!("Only the host owner can delete shared project memory.");
+        }
+        if crate::collab_bridge::shared_tool(name) || name == "read_memory" || (name == "write_memory" && project_memory) {
+            let output = crate::collab_bridge::guest_tool(core, binding, name, args).await?;
+            if name == "set_status" {
+                runner::set_final_status(core, &tid, &a("status"), &a("note"));
+            }
+            return Ok(output);
+        }
+    }
     let need_project = || project.clone().ok_or_else(|| anyhow!("This thread isn't part of a project."));
     let same_project = |t: &Value| -> Result<()> {
         if t["project_id"].as_str() != project.as_deref() {
@@ -194,6 +392,17 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     };
     tracing::info!(thread = %tid, tool = name, "tool call");
     match name {
+        "who_is_working_on" => {
+            let activity = crate::collab::presence::digest(core, caller);
+            let work = crate::collab::presence::Work {
+                title: a("title"), kind: "worker".into(), paths: proposed_claims(args), ..Default::default()
+            };
+            let overlaps = crate::collab::presence::caller_overlaps(core, caller, &work);
+            if !overlaps.is_empty() {
+                return Ok(format!("{activity}\nProposed work overlaps: {}", json!(overlaps)));
+            }
+            Ok(if activity.is_empty() { "No other active collaboration work is visible.".into() } else { activity })
+        }
         "agent_status" => Ok(runner::fleet_now(core)),
         "spawn_thread" => {
             let p = need_project()?;
@@ -230,6 +439,9 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "send_message" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
+            if local && t["id"] == tid {
+                bail!("Reply directly to this chat.");
+            }
             runner::post(core, t["id"].as_str().unwrap(), "user", &format!("Lead ({})", caller["agent"].as_str().unwrap_or("")), &a("text"), json!({ "from_thread": tid }), true)?;
             let id = t["id"].as_str().unwrap();
             if args["interrupt"] != false && runner::turn_active(core, id) {
@@ -241,7 +453,10 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "list_threads" => {
             let p = need_project()?;
             let filter = a("status");
-            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, repo_id, resolved, parked_at, merged, task_kind, updated_at, context FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            let rows = core.db.all("SELECT id, kind, title, agent, model, status, status_note, branch, repo_id, resolved, parked_at, merged, task_kind, updated_at, context, user_id FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' ORDER BY created_at", &[&p])?;
+            if local {
+                return Ok(local_thread_lines(rows.into_iter().filter(|r| !crate::collab_chat::is_personal_chat(r)).collect(), &filter));
+            }
             let rows: Vec<Value> = rows
                 .into_iter()
                 .filter(|r| match filter.as_str() {
@@ -259,19 +474,23 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         "read_thread" => {
             let t = core.thread(&a("thread_id"))?;
             same_project(&t)?;
-            let n = args["limit"].as_i64().unwrap_or(12).clamp(1, 60);
-            let msgs = core.db.all(
-                "SELECT * FROM (SELECT role, author, body, created_at FROM messages WHERE thread_id = ?1 ORDER BY created_at DESC LIMIT ?2) ORDER BY created_at",
-                &[&t["id"].as_str().unwrap(), &n],
-            )?;
-            let mut out = format!("{}\n\n", thread_line(&t));
-            for m in msgs {
-                out.push_str(&format!("[{}] {}: {}\n\n", m["role"].as_str().unwrap_or(""), m["author"].as_str().unwrap_or(""), clip(m["body"].as_str().unwrap_or(""), 6000)));
+            if local && crate::collab_chat::is_personal_chat(&t) {
+                bail!("No such thread.");
             }
-            Ok(out)
+            let n = args["limit"].as_i64().unwrap_or(12).clamp(1, 60);
+            let before = args["before"].as_i64().unwrap_or(i64::MAX);
+            let msgs = core.db.all(
+                "SELECT * FROM (SELECT role, author, body, created_at FROM messages WHERE thread_id = ?1 AND created_at < ?2 ORDER BY created_at DESC LIMIT ?3) ORDER BY created_at",
+                &[&t["id"].as_str().unwrap(), &before, &n],
+            )?;
+            Ok(format_history(&t, &msgs))
         }
         "check_status" => {
             let p = need_project()?;
+            if local {
+                let rows = core.db.all("SELECT * FROM threads WHERE project_id = ?1 AND deleted_at IS NULL AND kind != 'lead' AND resolved = 0 ORDER BY created_at LIMIT 80", &[&p])?;
+                return Ok(local_thread_lines(rows.into_iter().filter(|r| !crate::collab_chat::is_personal_chat(r)).collect(), ""));
+            }
             Ok(runner::overview(core, &p))
         }
         "route_task" => Ok(runner::route(core, project.as_deref(), &a("task_kind"), &a("model")).map(|(agent, model, why)| format!("{agent} ({}): {why}\n\n{}", runner::model_label(&model), runner::fleet_now(core))).unwrap_or_else(|| format!("No agent is available right now.\n\n{}", runner::fleet_now(core)))),
@@ -383,15 +602,19 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
             core.bus.emit("decision", project.as_deref(), Some(&tid), d);
             Ok("The question is in front of the person. Their answer arrives as a wake; keep going on the recommended option meanwhile.".into())
         }
-        "read_memory" => crate::memory::read(core, project.as_deref(), &a("name"), &a("query")),
+        "read_memory" => {
+            let (name, query) = (a("name"), a("query"));
+            let rows = View::local(project.as_deref()).only(Scope::parse(&a("scope"))?).rows(core, &name, &query)?;
+            Ok(memory::render(&rows, &name, &query))
+        }
         "write_memory" => {
-            let scope_project = if a("scope") == "global" { None } else { project.clone() };
-            crate::memory::write(core, scope_project.as_deref(), &a("name"), &a("description"), &a("body"), &format!("{} ({})", caller["agent"].as_str().unwrap_or(""), caller["title"].as_str().unwrap_or("")))?;
-            Ok(format!("Saved memory '{}'.", a("name")))
+            let (project, user) = local_memory_target(Scope::parse(&a("scope"))?, project.as_deref())?;
+            let saved = memory::write(core, project, user, &a("name"), &a("description"), &a("body"), &format!("{} ({})", caller["agent"].as_str().unwrap_or(""), caller["title"].as_str().unwrap_or("")))?;
+            Ok(format!("Saved memory '{}' ({}).", saved["name"].as_str().unwrap_or(""), saved["scope"].as_str().unwrap_or("")))
         }
         "delete_memory" => {
-            let scope_project = if a("scope") == "global" { None } else { project.clone() };
-            crate::memory::delete_by_name(core, scope_project.as_deref(), &a("name"))?;
+            let (project, user) = local_memory_target(Scope::parse(&a("scope"))?, project.as_deref())?;
+            memory::delete_by_name(core, project, user, &a("name"))?;
             Ok("Deleted.".into())
         }
         "publish_artifact" => {
@@ -470,9 +693,7 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         }
         "set_status" => {
             let st = a("status");
-            if !["working", "review", "done", "blocked"].contains(&st.as_str()) {
-                bail!("status must be working, review, done or blocked");
-            }
+            validate_status(&st)?;
             core.db.exec("UPDATE threads SET status_note = ?1 WHERE id = ?2", &[&a("note"), &tid])?;
             // the runner applies it when the turn ends, so the turn itself doesn't look finished early
             runner::set_final_status(core, &tid, &st, &a("note"));
@@ -480,45 +701,16 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
         }
         "claim_paths" => {
             let p = need_project()?;
-            let paths: Vec<String> = args["paths"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(|s| s.trim().trim_start_matches("./").to_string())).collect()).unwrap_or_default();
-            let mut conflicts = vec![];
-            let others = core.db.all("SELECT c.path, c.thread_id, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1 AND c.thread_id != ?2 AND t.resolved = 0 AND t.status NOT IN ('done','cancelled','failed')", &[&p, &tid])?;
-            for path in &paths {
-                for o in &others {
-                    let op = o["path"].as_str().unwrap_or("");
-                    if overlaps(path, op) {
-                        conflicts.push(format!("{path} overlaps {op} (thread {} \"{}\", {})", o["thread_id"].as_str().unwrap_or(""), o["title"].as_str().unwrap_or(""), o["agent"].as_str().unwrap_or("")));
-                    }
-                }
-                let now = util::now_ms();
-                let cid = util::id("cl");
-                core.db.exec("INSERT INTO claims(id, project_id, thread_id, path, note, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", &[&cid, &p, &tid, path, &a("note"), &now])?;
-            }
-            core.bus.emit("claims", Some(&p), Some(&tid), json!({}));
-            if conflicts.is_empty() {
-                Ok(format!("Claimed {} path(s). No conflicts.", paths.len()))
-            } else {
-                Ok(format!("Claimed, but these overlap other threads' claims. Don't edit them; tell the lead:\n{}", conflicts.join("\n")))
-            }
+            let rows = claim_rows(core, &p)?;
+            record_claims(core, &p, &tid, &claim_paths(args), &a("note"), rows.iter())
         }
         "release_paths" => {
-            let paths: Vec<String> = args["paths"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
-            if paths.is_empty() {
-                core.db.exec("DELETE FROM claims WHERE thread_id = ?1", &[&tid])?;
-            } else {
-                for p in paths {
-                    core.db.exec("DELETE FROM claims WHERE thread_id = ?1 AND path = ?2", &[&tid, &p])?;
-                }
-            }
+            release_claims(core, &tid, &claim_paths(args))?;
             Ok("Released.".into())
         }
         "list_claims" => {
             let p = need_project()?;
-            let rows = core.db.all("SELECT c.path, c.note, t.id, t.title, t.agent FROM claims c JOIN threads t ON t.id = c.thread_id WHERE c.project_id = ?1 AND t.resolved = 0 ORDER BY c.created_at", &[&p])?;
-            if rows.is_empty() {
-                return Ok("No claims.".into());
-            }
-            Ok(rows.iter().map(|r| format!("{} — {} \"{}\" ({}) {}", r["path"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or(""), r["title"].as_str().unwrap_or(""), r["agent"].as_str().unwrap_or(""), r["note"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
+            Ok(format_claims(claim_rows(core, &p)?.iter()))
         }
         "git_status" => {
             let ws = runner::workspace_of(core, caller).ok_or_else(|| anyhow!("No workspace yet."))?;
@@ -566,7 +758,108 @@ pub async fn call(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> R
     }
 }
 
-fn thread_line(t: &Value) -> String {
+fn local_memory_target(scope: Option<Scope>, project: Option<&str>) -> Result<(Option<&str>, Option<&'static str>)> {
+    Ok(match scope {
+        Some(Scope::Collaborator) => (None, Some(memory::LOCAL_USER)),
+        Some(Scope::Global) => (None, None),
+        Some(Scope::Project) if project.is_none() => bail!("This thread isn't part of a project."),
+        _ => (project, None),
+    })
+}
+
+pub(crate) fn validate_status(status: &str) -> Result<()> {
+    if !matches!(status, "working" | "review" | "done" | "blocked") {
+        bail!("status must be working, review, done or blocked");
+    }
+    Ok(())
+}
+
+fn proposed_claims(args: &Value) -> Vec<String> {
+    args["paths"].as_array().into_iter().flatten().filter_map(Value::as_str).filter_map(crate::collab::presence::normal_path).collect()
+}
+
+fn check_collaboration_overlap(core: &CoreRef, caller: &Value, name: &str, args: &Value) -> Result<()> {
+    use crate::collab::presence::{preflight, Work};
+    let (proposed, message) = match name {
+        "spawn_thread" => (
+            Work { title: args["title"].as_str().unwrap_or("").trim().into(), kind: "worker".into(), ..Work::default() },
+            "This task overlaps another collaborator's work. The project chat shows the overlap and lets the person send a note. Tell the person before continuing with this task.",
+        ),
+        "claim_paths" => (
+            Work { paths: proposed_claims(args), ..Work::default() },
+            "These paths overlap another collaborator's work. No paths were claimed. The person's thread shows the overlap and offers to send a note.",
+        ),
+        _ => return Ok(()),
+    };
+    if !preflight(core, caller, proposed).is_empty() {
+        bail!("{message}");
+    }
+    Ok(())
+}
+
+pub(crate) fn claim_paths(args: &Value) -> Vec<String> {
+    args["paths"].as_array().into_iter().flatten().filter_map(|x| x.as_str())
+        .map(|s| s.trim().trim_start_matches("./").to_string()).collect()
+}
+
+pub(crate) fn claim_rows(core: &CoreRef, project: &str) -> Result<Vec<Value>> {
+    core.db.all(
+        "SELECT c.path, c.note, t.id, t.title, t.agent, t.project_id, t.kind, t.user_id, t.status
+         FROM claims c JOIN threads t ON t.id = c.thread_id
+         WHERE c.project_id = ?1 AND t.resolved = 0 AND t.deleted_at IS NULL ORDER BY c.created_at",
+        &[&project],
+    )
+}
+
+pub(crate) fn format_claims<'a>(rows: impl Iterator<Item = &'a Value>) -> String {
+    let lines: Vec<_> = rows.map(|r| format!("{} — {} \"{}\" ({}) {}", r["path"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or(""), r["title"].as_str().unwrap_or(""), r["agent"].as_str().unwrap_or(""), r["note"].as_str().unwrap_or(""))).collect();
+    if lines.is_empty() { "No claims.".into() } else { lines.join("\n") }
+}
+
+pub(crate) fn record_claims<'a>(core: &CoreRef, project: &str, tid: &str, paths: &[String], note: &str, rows: impl Iterator<Item = &'a Value>) -> Result<String> {
+    let others: Vec<_> = rows.filter(|r| r["id"] != tid && !matches!(r["status"].as_str(), Some("done" | "cancelled" | "failed"))).collect();
+    let mut conflicts = Vec::new();
+    for path in paths {
+        for o in &others {
+            let other = o["path"].as_str().unwrap_or("");
+            if overlaps(path, other) {
+                conflicts.push(format!("{path} overlaps {other} (thread {} \"{}\", {})", o["id"].as_str().unwrap_or(""), o["title"].as_str().unwrap_or(""), o["agent"].as_str().unwrap_or("")));
+            }
+        }
+        core.db.exec(
+            "INSERT INTO claims(id, project_id, thread_id, path, note, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE NOT EXISTS (SELECT 1 FROM claims WHERE thread_id = ?3 AND path = ?4)",
+            &[&util::id("cl"), &project, &tid, path, &note, &util::now_ms()],
+        )?;
+    }
+    core.bus.emit("claims", Some(project), Some(tid), json!({}));
+    if conflicts.is_empty() {
+        Ok(format!("Claimed {} path(s). No conflicts.", paths.len()))
+    } else {
+        Ok(format!("Claimed, but these overlap other threads' claims. Don't edit them; tell the lead:\n{}", conflicts.join("\n")))
+    }
+}
+
+pub(crate) fn release_claims(core: &CoreRef, tid: &str, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        core.db.exec("DELETE FROM claims WHERE thread_id = ?1", &[&tid])?;
+    } else {
+        for path in paths {
+            core.db.exec("DELETE FROM claims WHERE thread_id = ?1 AND path = ?2", &[&tid, path])?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_history(t: &Value, messages: &[Value]) -> String {
+    let mut out = format!("{}\n\n", thread_line(t));
+    for m in messages {
+        out.push_str(&format!("[{}] {}: {}\n\n", m["role"].as_str().unwrap_or(""), m["author"].as_str().unwrap_or(""), clip(m["body"].as_str().unwrap_or(""), 6000)));
+    }
+    out
+}
+
+pub(crate) fn thread_line(t: &Value) -> String {
     format!(
         "{} · \"{}\" · {} · {}{}{}{}{}",
         t["id"].as_str().unwrap_or(""),
@@ -687,12 +980,14 @@ mod tests {
         assert_eq!(clean_title("**Add dark mode**"), "Add dark mode");
         let long = clean_title(&"word ".repeat(30));
         assert!(long.chars().count() <= 60 && !long.ends_with(' '));
-        assert!(list("chat").iter().any(|t| t["name"] == "set_title"));
+        assert!(list("chat", false).iter().any(|t| t["name"] == "set_title"));
     }
     #[test]
     fn lists_by_role() {
-        assert!(list("lead").iter().any(|t| t["name"] == "spawn_thread"));
-        assert!(!list("worker").iter().any(|t| t["name"] == "spawn_thread"));
-        assert!(list("chat").iter().any(|t| t["name"] == "write_memory"));
+        assert!(list("lead", false).iter().any(|t| t["name"] == "spawn_thread"));
+        assert!(!list("worker", false).iter().any(|t| t["name"] == "spawn_thread"));
+        assert!(list("chat", false).iter().any(|t| t["name"] == "write_memory"));
+        assert!(list("chat", true).iter().any(|t| t["name"] == "read_thread"));
+        assert!(!list("chat", false).iter().any(|t| t["name"] == "read_thread"));
     }
 }

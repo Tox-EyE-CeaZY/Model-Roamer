@@ -1,0 +1,59 @@
+/* Collaboration: Settings › Collaborators (owner) and Settings › Join a project (guest). Built on the panels, lists
+   and toggles in app.css; only what's new lives here. */
+
+.collab-warn { display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px; border: 1px dashed var(--hot); color: var(--ink); font-size: 13px; }
+.collab-warn .ico { color: var(--hot); flex: none; margin-top: 1px; }
+.collab-bad { display: block; color: var(--hot); }
+.pair.collab-pair { grid-template-columns: 180px minmax(0, 1fr); min-width: 0; }
+/* app.css starts the pairing column's items (.pair > div:last-child); the link here should fill the width */
+.pair.collab-pair > .collab-made { display: grid; gap: 10px; align-content: start; justify-items: stretch; min-width: 0; }
+.collab-made > .btn { justify-self: start; }
+.collab-sub { display: grid; gap: 6px; margin-top: 6px; }
+.collab-ask { --c: 8px; --fill: color-mix(in oklch, var(--accent) 10%, var(--bg2)); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; margin-top: 8px; font-size: 13px; }
+.collab-ask > .ico { color: var(--accent); flex: none; }
+.collab-ask > span { flex: 1 1 240px; min-width: 0; }
+
+/* the rules table: a permission per row, a toggle per role */
+.collab-grid { display: grid; gap: 0; }
+.collab-perm { display: grid; grid-template-columns: minmax(0, 1fr) repeat(var(--cols, 2), 92px); align-items: center; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+.collab-perm > .tgl { justify-self: center; }
+.collab-perm.head { border-bottom: 1px solid var(--line2); padding-bottom: 6px; }
+.collab-perm.head b { font: 600 10px var(--f-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); text-align: center; }
+
+.collab-member { border-bottom: 1px solid var(--line); }
+.collab-member > .dev { border-bottom: 0; }
+.collab-member .sel.sm { width: auto; min-width: 128px; }
+.collab-perms { padding: 0 0 10px 27px; display: grid; gap: 8px; }
+.collab-perms > summary { cursor: pointer; font: 600 10.5px var(--f-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+.collab-perms[open] > summary { color: var(--accent); }
+.collab-perms > .btn { justify-self: start; }
+
+.collab-join { display: grid; gap: 12px; }
+.collab-join > .btn { justify-self: start; }
+
+/* a joined project */
+.collab-head { gap: 8px; }
+.collab-head > .linkbtn { justify-self: start; }
+.collab-title { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.collab-title h2, .collab-title h3 { margin: 0; }
+.collab-thread { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); text-align: left; width: 100%; background: none; color: inherit; cursor: pointer; }
+.collab-thread > div { display: grid; gap: 2px; min-width: 0; }
+.collab-thread:hover b { color: var(--accent); }
+.collab-last { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.collab-msgs { display: grid; gap: 10px; max-height: 58vh; overflow-y: auto; padding-right: 4px; }
+.collab-msg { border-left: 2px solid var(--line2); padding: 4px 0 4px 12px; }
+.collab-msg.user { border-left-color: var(--accent); }
+.collab-msg.system, .collab-msg.wake { opacity: .7; }
+.collab-msg-h { display: flex; gap: 10px; align-items: baseline; margin-bottom: 2px; font-size: 12.5px; }
+.collab-compose { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+.collab-mem { border-bottom: 1px solid var(--line); padding: 8px 0; display: grid; gap: 8px; }
+.collab-mem > summary { cursor: pointer; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.collab-mem > .btn { justify-self: start; }
+
+@media (max-width: 640px) {
+  .pair.collab-pair { grid-template-columns: minmax(0, 1fr); }
+  .collab-perm { grid-template-columns: minmax(0, 1fr) repeat(var(--cols, 2), 48px); gap: 6px; font-size: 13px; }
+  .collab-perms { padding-left: 0; }
+  .collab-compose { grid-template-columns: minmax(0, 1fr); }
+  .collab-member > .dev { flex-wrap: wrap; }
+}

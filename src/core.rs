@@ -39,6 +39,7 @@ pub struct TermEntry {
 pub struct Core {
     pub db: Db,
     pub bus: Bus,
+    pub(crate) collab_presence: crate::collab::presence::Presence,
     pub data: PathBuf,
     /// Running as a server with nobody at its screen.
     pub headless: bool,
@@ -93,6 +94,7 @@ impl Core {
         let core = Arc::new(Core {
             db,
             bus: Bus::new(),
+            collab_presence: Default::default(),
             data,
             headless,
             port: AtomicU16::new(0),
@@ -158,6 +160,11 @@ impl Core {
         let s = self.settings();
         let mut base = json!({ "enabled": true, "model": "", "effort": "", "autonomy": "full", "max_parallel": 2, "path": "", "extra_args": [] });
         config::merge(&mut base, &s["agents"][id]);
+        if id == "local" {
+            base["max_parallel"] = json!(1);
+            base["member_turn_limit"] = json!(base["member_turn_limit"].as_u64().unwrap_or(15));
+            base["member_turn_window_secs"] = json!(base["member_turn_window_secs"].as_u64().unwrap_or(600));
+        }
         base
     }
 
@@ -193,6 +200,7 @@ impl Core {
     }
 
     pub fn locate(&self, id: &str) -> Option<Resolved> {
+        if id == "local" { return None; }
         let a = self.adapter(id)?;
         let cfg = self.agent_cfg(id);
         agents::locate(a.as_ref(), cfg["path"].as_str())
@@ -200,6 +208,7 @@ impl Core {
 
     /// The models an agent offers: what its CLI reported last time it was asked, else the built-in list.
     pub fn models_of(&self, a: &dyn AgentAdapter) -> Vec<agents::ModelOpt> {
+        if a.id() == "local" { return a.info().models; }
         let found: Vec<agents::ModelOpt> = serde_json::from_value(self.db.setting(&format!("models.{}", a.id()))["list"].clone()).unwrap_or_default();
         agents::merge_models(&a.info().models, &found)
     }
@@ -236,6 +245,7 @@ impl Core {
 
     /// `agent_status`, asking the CLI for its models even if the list is fresh.
     pub async fn agent_status_with(&self, id: &str, force_models: bool) -> Value {
+        if id == "local" { return agents::local::status(self); }
         let gate = self.checking.lock().map(|mut m| m.entry(id.to_string()).or_default().clone()).unwrap_or_default();
         let started = util::now_ms();
         let _turn = gate.lock().await;
@@ -279,6 +289,7 @@ impl Core {
     /// Whether an agent needs a real check now: never checked, the last check is old, it failed to finish, or its
     /// program moved, appeared or vanished since (finding the program is cheap; running it is not).
     pub fn needs_check(&self, id: &str) -> bool {
+        if id == "local" { return false; }
         let Some(v) = self.status_cache.lock().ok().and_then(|c| c.get(id).cloned()) else { return true };
         let age = util::now_ms() - v["checked_at"].as_i64().unwrap_or(0);
         let found = self.locate(id).map(|r| r.shown);
@@ -335,6 +346,7 @@ impl Core {
             .iter()
             .map(|a| {
                 let id = a.id();
+                if id == "local" { return agents::local::status(self); }
                 cache.get(&id).cloned().map(|mut v| {
                     v["limit"] = self.limit_of(&id);
                     v["config"] = self.agent_cfg(&id);

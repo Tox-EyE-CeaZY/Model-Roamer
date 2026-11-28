@@ -233,6 +233,108 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX repos_project ON repos(project_id);
     ALTER TABLE threads ADD COLUMN repo_id TEXT NOT NULL DEFAULT '';
     "#,
+    // collaboration (see collab.rs and docs/collaboration.md). Host side: the people invited to this machine's
+    // projects, their per-project memberships (each with its own token), invites and each project's rules. Guest
+    // side: the host projects this machine has joined. The owner stays implicit (the local token and paired
+    // devices), so projects nobody joined work exactly as before. threads.user_id says whose agents run a thread:
+    // '' is the owner, as every existing thread.
+    r#"
+    CREATE TABLE collab_users (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        instance_id TEXT NOT NULL DEFAULT '', -- the guest app's instance id: the same app joining again is the same person
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+    );
+    CREATE TABLE collab_members (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'collaborator', -- collaborator | operator | viewer
+        perms TEXT NOT NULL DEFAULT '{}',          -- this person's overrides of the project's rules
+        token_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen INTEGER,
+        last_ip TEXT NOT NULL DEFAULT '',
+        requested_role TEXT NOT NULL DEFAULT '',   -- a role they asked the owner for (operator), until answered
+        requested_at INTEGER,
+        revoked_at INTEGER
+    );
+    CREATE INDEX collab_members_token ON collab_members(token_hash);
+    CREATE INDEX collab_members_project ON collab_members(project_id);
+    CREATE TABLE collab_invites (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'collaborator',
+        perms TEXT NOT NULL DEFAULT '{}',
+        secret_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER,
+        used_by TEXT,
+        revoked_at INTEGER
+    );
+    CREATE TABLE collab_rules (
+        project_id TEXT PRIMARY KEY,
+        rules TEXT NOT NULL DEFAULT '{}',          -- {collaborator: {perm: bool}, viewer: {...}}
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE collab_links (
+        id TEXT PRIMARY KEY,
+        host_url TEXT NOT NULL,
+        host_id TEXT NOT NULL DEFAULT '',
+        host_name TEXT NOT NULL DEFAULT '',
+        project_id TEXT NOT NULL,
+        project_name TEXT NOT NULL DEFAULT '',
+        member_id TEXT NOT NULL DEFAULT '',
+        user_id TEXT NOT NULL DEFAULT '',
+        name TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT '',
+        perms TEXT NOT NULL DEFAULT '{}',
+        token TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ok',         -- ok | offline | revoked
+        error TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        last_sync INTEGER
+    );
+    ALTER TABLE threads ADD COLUMN user_id TEXT NOT NULL DEFAULT '';
+    "#,
+    // 12: private memory and explicit bindings from local agent threads to joined projects
+    r#"
+    ALTER TABLE memory ADD COLUMN user_id TEXT;
+    DROP INDEX memory_name;
+    CREATE UNIQUE INDEX memory_name ON memory(IFNULL(project_id, ''), IFNULL(user_id, ''), name);
+    ALTER TABLE collab_users ADD COLUMN identity_hash TEXT NOT NULL DEFAULT '';
+    CREATE UNIQUE INDEX collab_user_identity ON collab_users(instance_id, identity_hash)
+        WHERE identity_hash != '' AND revoked_at IS NULL;
+    CREATE TABLE collab_agent_threads (
+        thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+        link_id TEXT NOT NULL,
+        host_thread_id TEXT
+    );
+    "#,
+    // 13: conflict notes waiting for a person's approval (Stage 1d). IF NOT EXISTS: pre-merge 1d builds made the
+    // table at startup, so a database from one of those already has it.
+    r#"
+    CREATE TABLE IF NOT EXISTS collab_conflict_notes (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        sender TEXT NOT NULL,
+        sender_name TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        decision TEXT NOT NULL DEFAULT '',
+        decided_by TEXT,
+        deliver_at INTEGER,
+        received_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS collab_notes_project ON collab_conflict_notes(project_id, recipient, decision, created_at);
+    CREATE INDEX IF NOT EXISTS collab_notes_rate ON collab_conflict_notes(project_id, sender, created_at);
+    "#,
 ];
 
 #[derive(Clone)]
@@ -299,7 +401,7 @@ impl Db {
                     ValueRef::Text(t) => {
                         let s = String::from_utf8_lossy(t).into_owned();
                         // JSON columns come back parsed
-                        if (n == "meta" || n == "options" || n == "routing" || n == "context" || n == "buddy") && (s.starts_with('{') || s.starts_with('[')) {
+                        if matches!(n.as_str(), "meta" | "options" | "routing" | "context" | "buddy" | "perms" | "rules") && (s.starts_with('{') || s.starts_with('[')) {
                             serde_json::from_str(&s).unwrap_or(Value::String(s))
                         } else {
                             Value::String(s)
@@ -351,5 +453,36 @@ mod tests {
         db.exec("INSERT INTO memory(id, project_id, name, body, updated_at) VALUES ('m1', NULL, 'design', 'chamfered corners and lime', ?1)", &[&now]).unwrap();
         let hits = db.all("SELECT m.name FROM memory_fts f JOIN memory m ON m.rowid = f.rowid WHERE memory_fts MATCH 'chamfered'", &[]).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn upgrades_v11_memory_and_keeps_private_names_independent() {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..11] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 11;
+             INSERT INTO memory(id, project_id, name, body, updated_at) VALUES
+                 ('global', NULL, 'rules', 'globaltext', 1),
+                 ('shared', 'project', 'rules', 'sharedtext', 1);",
+        ).unwrap();
+        let db = Db { conn: Arc::new(Mutex::new(conn)) };
+        db.migrate().unwrap();
+        assert_eq!(db.scalar_i64("PRAGMA user_version", &[]).unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM memory WHERE user_id IS NULL", &[]).unwrap(), 2);
+        db.exec(
+            "INSERT INTO memory(id, project_id, user_id, name, body, updated_at) VALUES
+                 ('a', 'project', 'user-a', 'rules', 'privatealpha', 2),
+                 ('b', 'project', 'user-b', 'rules', 'privatebravo', 2)",
+            &[],
+        ).unwrap();
+        assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM memory WHERE name = 'rules'", &[]).unwrap(), 4);
+        assert_eq!(db.scalar_i64("SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'sharedtext'", &[]).unwrap(), 1);
+        assert!(db.exec(
+            "INSERT INTO memory(id, project_id, user_id, name, body, updated_at)
+             VALUES ('dup', 'project', 'user-a', 'rules', 'duplicate', 3)",
+            &[],
+        ).is_err());
     }
 }

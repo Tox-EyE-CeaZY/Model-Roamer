@@ -11,6 +11,9 @@ mod agents;
 mod api;
 mod artifacts;
 mod bus;
+mod collab;
+mod collab_bridge;
+mod collab_chat;
 mod config;
 mod core;
 mod db;
@@ -20,6 +23,7 @@ mod files;
 mod forward;
 mod git;
 mod github;
+mod local_llm;
 mod mcp;
 mod memory;
 mod net;
@@ -149,8 +153,8 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
         core.patch_settings(&json!({ "server": { "name": n } }))?;
     }
     // the suite's design language, shared by every agent, the first time round
-    if memory::get_by_name(&core, None, "design-language")?.is_none() {
-        let _ = memory::write(&core, None, "design-language", "The Roamer suite's look and feel: follow it for any UI", prompts::DESIGN_NOTE, "Model Roamer");
+    if memory::View::local(None).only(Some(memory::Scope::Global)).get(&core, "design-language")?.is_none() {
+        let _ = memory::write(&core, None, None, "design-language", "The Roamer suite's look and feel: follow it for any UI", prompts::DESIGN_NOTE, "Model Roamer");
     }
     let port = server::serve_loopback(core.clone(), if headless { 0 } else { o.port.filter(|_| o.browser).unwrap_or(LOCAL_PORT) }).await?;
     core.port.store(port, Ordering::Relaxed);
@@ -189,6 +193,8 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     }
     runner::recover(&core);
     tokio::spawn(runner::watch_limits(core.clone()));
+    // joined projects: this machine's threads in them go up to their hosts (collab_chat.rs)
+    tokio::spawn(collab_chat::run(core.clone()));
     // plan usage for the status bar: now, then every ten minutes (and after every turn, in the runner)
     let cq = core.clone();
     tokio::spawn(async move {

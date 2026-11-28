@@ -98,12 +98,21 @@ fn client_ip(req: &Request) -> String {
 /// (which a page on another site can't add, so cookies alone can't be used against us).
 pub async fn auth(State(core): State<CoreRef>, mut req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
-    let public = matches!(path.as_str(), "/api/hello" | "/api/pair" | "/api/mcp") || !path.starts_with("/api/");
+    let public = matches!(path.as_str(), "/api/hello" | "/api/pair" | "/api/mcp" | "/api/collab/join") || !path.starts_with("/api/");
     if public {
         return next.run(req).await;
     }
     let ip = client_ip(&req);
     let h = req.headers();
+    // collaborators' apps: a member token, accepted here and nowhere else (see collab.rs)
+    if path.starts_with("/api/collab/host/") {
+        let tok = bearer(h).unwrap_or_default();
+        let Some(m) = crate::collab::identify_member(&core, &tok, &ip) else {
+            return ApiErr(StatusCode::UNAUTHORIZED, "This membership isn't valid any more: the owner removed it, or you left the project.".into()).into_response();
+        };
+        req.extensions_mut().insert(m);
+        return next.run(req).await;
+    }
     let (tok, via_cookie) = match bearer(h) {
         Some(t) => (t, false),
         None => match cookie_token(h) {
@@ -163,6 +172,11 @@ pub fn asset(path: &str) -> Response {
     }
 }
 
+/// Everything this server answers: the app's API plus collaboration (its own routes, same auth and headers).
+fn router(core: &CoreRef) -> axum::Router {
+    crate::api::router(core.clone()).merge(crate::collab::router(core.clone()))
+}
+
 /// Open (or reopen) the listener other devices use, from the settings (command-line overrides win). Turning
 /// sharing off, or changing its address, takes effect at once: no restart.
 pub async fn apply_sharing(core: &CoreRef, over: Option<(&str, u16, Option<(String, String)>)>) -> anyhow::Result<Option<String>> {
@@ -181,7 +195,7 @@ pub async fn apply_sharing(core: &CoreRef, over: Option<(&str, u16, Option<(Stri
     };
     let addr: SocketAddr = format!("{bind}:{port}").parse().or_else(|_| format!("[{bind}]:{port}").parse()).map_err(|_| anyhow::anyhow!("'{bind}' isn't an address to listen on"))?;
     let has_tls = tls.is_some();
-    let app = crate::api::router(core.clone()).into_make_service_with_connect_info::<SocketAddr>();
+    let app = router(core).into_make_service_with_connect_info::<SocketAddr>();
     let serve = match tls {
         Some((cert, key)) => {
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -227,7 +241,7 @@ pub async fn serve_loopback(core: CoreRef, port: u16) -> anyhow::Result<u16> {
         Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
     };
     let actual = l.local_addr()?.port();
-    let app = crate::api::router(core.clone());
+    let app = router(&core);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(l, app.into_make_service_with_connect_info::<SocketAddr>()).await {
             tracing::error!("loopback server stopped: {e}");

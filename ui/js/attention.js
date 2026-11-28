@@ -59,19 +59,19 @@ export function unmarkSeen(list) {
  * Sort threads (and open decisions) into what needs the person and what quietly finished.
  * decisions: either a number (a count, as projects carry) or a list. Seen threads drop out of both groups.
  */
-export function attention(threads = [], decisions = 0) {
+export function attention(threads = [], decisions = 0, conflictNotes = []) {
   const fresh = threads.filter((t) => !isSeen(t));
   const need = fresh.filter((t) => needsYou(t));
   const finished = fresh.filter(isFinished);
   const nDecisions = typeof decisions === 'number' ? decisions : decisions.length;
-  return { need, finished, decisions: nDecisions, count: nDecisions + need.length };
+  return { need, finished, decisions: nDecisions, count: nDecisions + need.length + conflictNotes.length };
 }
 
 // The latest app-wide picture (the status bar fetches it), so the side rail can show the same count.
-let last = { threads: [], decisions: [] };
+let last = { threads: [], decisions: [], conflictNotes: [] };
 export function setActivity(a) {
-  last = { threads: a.threads || [], decisions: a.decisions || [] };
+  last = { threads: a.threads || [], decisions: a.decisions || [], conflictNotes: a.conflictNotes || [] };
   changed();
 }
 /** How many things wait on the person right now, app-wide. */
-export const attentionCount = () => attention(last.threads, last.decisions).count;
+export const attentionCount = () => attention(last.threads, last.decisions, last.conflictNotes).count;

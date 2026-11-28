@@ -1,0 +1,296 @@
+# Collaboration: design (Stage 1)
+
+Status: Stage 1 (1a–1d merged), 2026-11-24. Code lives in `src/collab.rs`, `src/collab_bridge.rs` (1b),
+`src/collab_chat.rs` (1c), `src/collab_presence.rs` and `src/collab_notes.rs` (1d); migrations 11–13 in `src/db.rs`; the
+auth hook in `src/server.rs`; the UI in `ui/js/views/collab.js` (Settings › Collaborators and Settings › Join a project),
+`ui/js/views/collab_chat.js` and `ui/js/collab-presence.js`.
+
+## 1. Topology: the owner hosts
+
+- The **owner's** Model Roamer is the project's home. It keeps the project's threads, history, memory, artifacts
+  and rules. Nothing about a project moves to a central service; there is no account server.
+- Each **collaborator** runs their own Model Roamer (Windows or Linux) and joins one host project with a
+  **per-person invite link**. Their agents run on their own machine, under their own Claude / Codex / Antigravity
+  logins. Logins and API keys never cross machines.
+- **Terms of service:** every agent runs only on its own user's account, with prompts that user wrote or approved.
+  The host never runs a collaborator's thread (`collab::runs_here`, checked in `runner::runnable`), and nothing a
+  collaborator sends is injected into the owner's agents: it is a visible message the owner's permissions allowed.
+- Two Model Roamers talk **server to server**: the guest's app calls the host's API with its member token. The
+  guest's browser windows only ever talk to their own local app, which proxies. The host token never reaches a
+  browser, a cookie or an agent's environment.
+- Transport is whatever already reaches the host: LAN, Tailscale, WireGuard, or the owner's domain (Settings ›
+  Remote access). The owner must have sharing turned on.
+
+```
+ guest UI ──loopback──▶ guest Model Roamer ──HTTPS / tailnet, Bearer member token──▶ host Model Roamer
+ guest agents ─MCP──▶ guest Model Roamer ─(Stage 1b bridge)───────────────────────▶ /api/collab/host/*
+```
+
+## 2. Identity
+
+Host side (migration 11):
+
+| table | what |
+|---|---|
+| `collab_users` | a person known to this host: `id` (usr_…), `name`, `instance_id` of their app, `created_at`, `revoked_at` |
+| `collab_members` | that person's membership of one project: `role`, `perms` overrides, `token_hash`, `requested_role` / `requested_at` (a role they asked for), `last_seen`, `last_ip`, `revoked_at` |
+| `collab_invites` | one per person: `project_id`, `name`, `role`, `perms`, `secret_hash`, `expires_at`, `used_at`, `used_by`, `revoked_at` |
+| `collab_rules` | per project: what each role may do (`{ "collaborator": {perm: bool}, "viewer": {...} }`) |
+| `threads.user_id` | who runs the thread: `''` = the owner (every existing thread), else a collab user id |
+
+Guest side: `collab_links` (one row per joined host project: host URL, host id/name, project id/name, member id,
+role, perms, **token**, status, last error, last sync).
+
+- **The owner is implicit.** The local token and the owner's paired devices (`Who::Local`, `Who::Device`) are the
+  owner. No owner row is needed, so a project with no collaborators behaves exactly as before.
+- **Roles:** `owner` (implicit, everything), `collaborator`, `operator`, `viewer`. Role sets the defaults; the
+  owner can override single permissions per person.
+- **Operator:** a collaborator the owner trusts to move work around. A collaborator asks **once**
+  (`POST host/request-role {role: "operator"}`; one open request at a time, a second ask gets 409); the owner
+  approves or declines **once** in Settings › Collaborators (`PATCH members/{id} {approve_request}`). An operator has
+  `transfer_threads`: in Stage 2 they take threads over from the owner or others without per-thread approval;
+  everyone else asks per transfer. The owner can also invite someone straight in as an operator.
+- **Tokens:** one random 256-bit token per membership (so per person *and* per project: least privilege). Only its
+  SHA-256 is stored on the host. The plain token is returned once, at join, and kept in the guest's DB (never sent
+  to the guest's UI).
+- **Revocation:** revoking a member (or the whole person, or a still-unused invite) takes effect on the next request:
+  the token lookup requires `revoked_at IS NULL`. The guest sees 401, marks the link `revoked` and stops syncing.
+  A guest can also leave (`POST host/leave` revokes its own membership).
+- Member tokens are accepted **only** under `/api/collab/host/*`. They are not the local token or a device token,
+  so every other route (`/api/*`, `/api/ws`, `/auth` cookies) rejects them with 401.
+
+## 3. Invite and join
+
+1. Owner: Settings › Collaborators › pick project › **Invite a person** (name, role, expiry, which address). The
+   host makes `inv_<id>.<secret>` (secret hashed in the DB), and shows a link and QR:
+   `https://host.tailnet.ts.net:4630/#/join?invite=inv_x.SECRET`.
+2. The owner sends it to that one person (chat, email). Single use, default expiry 7 days, revocable until used.
+3. Guest: Settings › **Join a project** › paste the link, confirm their display name. Their app probes
+   `GET /api/hello` on the host (must be Model Roamer, must not be itself), then `POST /api/collab/join`
+   `{invite, name, instance_id, identity_proof}`. The proof is private to this pair of installations. An existing
+   identity is reused only when the proof matches. A pre-1b identity is retained by its current membership;
+   its first rejoin creates a new identity because the old installation provided no proof.
+4. Host checks the invite (exists, not used/expired/revoked; 12 failures per 10 minutes per host, like pairing),
+   makes or reuses the `collab_users` row (same `instance_id` = same person), creates the membership with a fresh
+   token, marks the invite used, tells the owner's UI, and posts a short note to the project lead
+   (`<wake reason="collaborator-joined">`, not a turn on its own: no wake cost).
+5. Guest stores the link and opens the host project view.
+
+## 4. How the guest mirrors the host
+
+Host API for members (`/api/collab/host/*`, Bearer member token, every call permission-checked):
+
+| route | perm | what |
+|---|---|---|
+| `GET me` | | member, role, effective perms, project, host |
+| `GET project` | | project summary (no local paths), repos (URLs only), visible threads, a `cursor` |
+| `GET changes?since=&wait=` | | **incremental sync**: threads, messages, memory and artifacts changed after `since`, capped, plus the next cursor. Long-polls up to `wait` seconds (max 25) on the host's event bus, so idle guests cost one parked request, not a polling loop |
+| `GET threads/{id}/messages?before=&limit=` | view | one page of a thread's history |
+| `GET memory`, `GET memory/{name}` | | project memory, global with `read_global_memory`, or the caller's private host notes with `scope=collaborator` |
+| `POST memory` | `edit_memory` for project scope | write shared project memory or private host notes with `scope: "collaborator"` |
+| `GET artifacts` | | project artifacts with signed host URLs |
+| `POST artifacts` | `publish_artifacts` | publish text/markdown/html into the project |
+| `POST threads` | `create_threads` | open a thread that **runs on the guest's machine** (`threads.user_id` = them) |
+| `POST threads/{id}/messages` | own thread, or `message_threads` / `message_lead` | post into a thread. Host threads run on the **owner's** agents, so this is its own permission |
+| `POST threads/{id}/merge` | `merge` | merge a thread's branch into the base branch |
+| `POST request-role` | | ask the owner once to become an operator |
+| `POST leave` | | revoke own membership |
+| `POST mcp` | per tool | invoke one of the bridge tools listed below |
+| `GET/POST presence`, `POST overlaps` | | live presence heartbeat and overlap checks (Stage 1d, §11) |
+| `GET/POST notes`, `POST notes/{id}`, `GET/POST notes-delivery` | `send_conflict_notes` to send | conflict notes (§11) |
+| `POST threads/{id}/transfer` | | named extension point (Stage 2) |
+
+Guest side: `/api/collab/links` (list/join/leave) and `/api/collab/links/{id}/host/{path}`, a narrow proxy that
+adds the token. Proxy rules: connect timeout 6 s, request timeout 20 s (long polls: `wait` + 10 s), two retries with
+backoff for idempotent GETs on connection errors only, never for POSTs. A 401 from the host marks the link
+`revoked`; a network error marks it `offline` with the error and keeps the last-known cursor so it resumes cleanly.
+
+**Live events and offline:** the guest view runs one long-poll loop (`changes?since=cursor&wait=20`). On success it
+applies the delta and loops at once; on failure it backs off 2 s → 4 s → … → 30 s and shows "offline, retrying".
+Nothing is lost while offline: the cursor is a host timestamp and the next call returns everything after it (with a
+1 ms overlap; the client de-duplicates by id). Agents fetch shared data on demand through their tools.
+
+**The guest's runner and the host.** Bind an existing local agent thread with
+`POST /api/collab/links/{link_id}/agent-threads/{local_thread_id}`. Pass `{"host_thread_id":"th_…"}` to associate
+one of the member's own threads on the host. An empty object enables project-level calls without a host thread.
+`DELETE` at the same URL removes the binding. The guest starts the agent with the usual local thread controls.
+
+The guest server sends `{tool, thread_id, arguments}` to `POST host/mcp` with the member token. The host determines
+the project from that token and checks visibility or ownership for thread operations. The supported calls are
+`read_memory`, `write_memory`, `list_threads`, `read_thread`, `check_status`, `list_artifacts`, `publish_artifact`,
+and `set_status`. Publishing accepts inline content and folder paths inside the shared project. Reporting status
+requires a bound host thread owned by the caller and the corresponding permission. The endpoint never starts an
+agent on the host. File claims stay on the guest and are published to the host by the Stage 1d presence preflight
+and heartbeat.
+
+The guest agent's default memory index and search combine local collaborator and global memory with shared host
+project memory. Reads by name prefer collaborator, then project, then global. Explicit collaborator and global
+tool calls stay on the guest installation. The host's private notes and permitted host global memory remain
+available through explicit scoped host API calls. Read-only bridge calls can retry twice within 20 seconds.
+Writes have a 20-second request timeout and are sent once. If the host is unavailable, local memory remains usable.
+
+## 5. Keeping the host responsive and cheap
+
+- **Cursors, not reloads:** `changes` returns only rows with `updated_at`/`created_at` > cursor, capped at 200
+  messages, bodies of list entries clipped to 240 characters. Full message bodies come from paged history.
+- **Long-poll, not websockets, for members:** one parked request per guest, woken by the existing bus. Max 2
+  concurrent long-polls per member (extras return at once). No member ever subscribes to the raw bus (which carries
+  every project's events and the owner's terminals).
+- **Digests for agents:** a guest's agent is never handed the whole host history. Its prompt gets the memory index
+  (names only, as today), its own thread, and a short "since your last turn" digest (who is doing what, threads
+  changed, memory changed: Stage 1d). It reads more with paged tools (`read_thread(id, before)`).
+- **No wake per event:** joins, guest memory writes and guest thread activity reach the owner's lead as batched,
+  non-waking notes (`pending = 0`) or through the existing wake batching; only an explicit `message_lead` wakes it.
+- **Indexes:** migration 11 indexes the token hash and `threads(project_id, updated_at)` already exists.
+
+## 6. Permissions the owner sets (Settings › Collaborators › Rules)
+
+| permission | collaborator | operator | viewer | meaning |
+|---|---|---|---|---|
+| `view_threads` | yes | yes | yes | see the project's shared threads (lead and workers) and their history |
+| `view_others_chats` | no | no | no | see other people's per-person chats (Stage 1c) |
+| `create_threads` | yes | yes | no | open threads of their own (they run on their machine) |
+| `message_threads` | no | no | no | post into threads run by the owner's agents (uses the owner's plan) |
+| `message_lead` | no | no | no | talk to the owner's project lead (wakes it, uses the owner's plan) |
+| `edit_memory` | yes | yes | no | write project memory |
+| `read_global_memory` | no | no | no | read the owner's global memory (it spans all the owner's projects) |
+| `publish_artifacts` | yes | yes | no | publish artifacts into the project |
+| `update_thread_status` | yes | yes | no | report status on the member's own threads |
+| `merge` | no | no | no | merge threads into the base branch |
+| `transfer_threads` | no | yes | no | take threads over from the owner or others without asking each time (Stage 2) |
+
+Always owner-only: inviting, rules, project settings, repositories, deleting anything, agent and machine settings,
+terminals, files outside the project. Effective permissions = built-in role defaults ← project rules for that role ←
+the person's overrides. Unknown keys are ignored, so later stages can add permissions without a migration.
+
+## 7. Data scopes
+
+| scope | lives on | who sees it |
+|---|---|---|
+| global memory | owner's host (`memory.project_id` and `memory.user_id` are NULL) | owner; members only with `read_global_memory`. A guest's own global memory stays on the guest's machine |
+| project memory | host | every member; written with `edit_memory` |
+| collaborator memory | agent's installation, or the host if written via the scoped host API (Stage 1b, §4) | only the caller and their agents. Sharing a note is an explicit write to project memory |
+| per-person project chat | the person's own machine (a local `lead` thread); the host keeps a `chat` row with `user_id` and copies its messages only while someone else may read it (§10) | that person; the owner with the Project chats switch; members with `view_others_chats` |
+| shared threads | host `threads` (`user_id` says whose agents run it) | members with `view_threads` |
+| artifacts | host files + signed URLs | members; publish with `publish_artifacts` |
+
+## 8. Security
+
+- **Auth on every request.** Member routes need the Bearer token; every handler re-checks membership, project and
+  permission. Join is the only public collab route and is rate limited.
+- **No secret leakage across users:** member responses never include settings, `github_token`, the local token,
+  local folder paths (`projects.folder`, `repos.folder`, `threads.workspace`), session ids, terminals, logs,
+  devices or other projects. Message `meta` is reduced to safe keys. Guest tokens are stored only in the guest's DB
+  and never returned by its API.
+- **Artifact links** for members are signed per artifact and membership. Every request, including asset files,
+  checks that the membership and project are active. A re-invite issues a fresh membership and the old links
+  stay invalid. Stage 1b retires the old owner/member URL format, so pre-upgrade bookmarks need fresh links.
+- **Transport:** plain `http://` is fine over Tailscale or WireGuard (already encrypted) and on a trusted LAN.
+  Anywhere else use HTTPS: Tailscale `serve` (one button in Remote access), a TLS cert/key, or a reverse proxy at
+  the owner's domain. The join screen warns when an invite uses plain http to a public address.
+- **Tailscale guidance:** share the host with the collaborator's tailnet (Tailscale "share machine") rather than
+  inviting them into the owner's whole tailnet; set Listen on to the Tailscale IP to keep the host off the LAN.
+- Revocation is immediate; invites are single use and expire; tokens are hashed at rest on the host.
+
+## 9. Later stages plug in here
+
+- **1b collaborator memory and agent bridge (built, §4):** `collab_bridge.rs`; `collab_bridge::bind` ties a guest's
+  local thread to the host so its tools go through `POST host/mcp`.
+- **1c per-person project chats (built, §10):** `collab::personal_chat` makes or finds the `chat` thread with
+  `user_id` for a member; `view_others_chats` gates the others; `collab_chat.rs` runs it on the member's machine and
+  binds the chat and every synced thread to the bridge.
+- **1d presence and conflict notes (built, §11).**
+- **Runner gate (done in 1a):** `collab::runs_here(thread)` is false for threads with a `user_id`, and
+  `runner::runnable` checks it, so a guest's thread is never run on the owner's accounts, even if the owner writes to
+  it. Members' messages only wake threads this machine runs.
+- **Stage 2 thread transfer:** the thread's branch is pushed to the shared GitHub repo by its current runner;
+  `POST host/threads/{id}/transfer {to}` flips `threads.user_id` after the push; the new holder fetches the branch,
+  makes a worktree, and starts from a digest (title, instructions, criteria, last messages, a summary) instead of the
+  full history, which stays readable through paged `read_thread`. Members with `transfer_threads` (operators) take
+  a thread at once; anyone else's request (or an agent's `request_transfer` tool call) becomes a decision for the
+  current holder. The new holder's agents start on prompts that holder approved.
+- **Stage 3 universal chat and operator:** a project `group` thread on the host that every member sees (each message
+  carries `user_id`); `collab_rules.operator` names the operator (a user's local agent or an API agent with their own
+  key). `@operator` routes to that user's runner via the bridge with the group digest; `POST host/threads/{id}/claim`
+  sets `user_id` so only the claimer's agents pick it up; the operator posts the hand-off into the claimer's
+  personal chat.
+
+## 10. Per-person project chats and the guest's threads (Stage 1c)
+
+Code: `src/collab_chat.rs` (+ `prompts/collab.md`, `ui/js/views/collab_chat.js`). Every person in a project talks to
+**their own lead** in **their own project chat**. The owner's is the project's lead thread, as before. A
+collaborator's runs on their own machine, with their own agents, and is private by default.
+
+**One id on both machines.** On the guest, each joined project (a `collab_links` row) has a *local project* whose id
+is the link's id (`lnk_…`), so `collab_chat::link_of(project_id)` tells a joined project from an own one. Every
+thread in it has the same id as its row on the host:
+
+| guest (local) | host | runs on |
+|---|---|---|
+| the person's chat: `kind = lead` | `kind = chat`, `user_id` = member (`personal_chat`) | guest |
+| threads the person or their lead opens: `worker` / `review` | same kind, `user_id` = member, `parent_id` = their chat | guest |
+| the owner's and others' threads | rows as they are | their owners' machines |
+
+The local project carries the host project's name, instructions, repository URL and base branch, so worktrees,
+merges and the runner work unchanged. A joined project shows in the guest's project list; opening it shows the
+joined view with **Your chat** first (in place of the owner's), then Threads, Memory, Artifacts and People.
+
+**Sync, guest → host** (`collab_chat::run`, `push`): after local changes in a joined project (bus events, batched
+over ~1 s, plus a sweep every 5 minutes), the guest's app calls `POST host/sync` with its threads' state and the
+messages the host doesn't have yet (`upto` per thread, from the last answer; at most 200 messages a call, then it
+loops). The host upserts only the member's own threads (new ones need `create_threads`), inserts messages by id
+(never twice), attributes "You" to the member's name and **never wakes an agent**. Offline: retried 5 s → 120 s.
+
+**Context, host → guest** (`collab_chat::before_turn`): before each turn in a joined project the guest's app fetches
+`GET host/context` (8 s timeout; the last snapshot is used when the host can't be reached): people and roles, up to
+60 open and 8 recently finished threads (title, owner, agent, status, a 140-character note), the memory index,
+20 recent artifacts. No message bodies (claims and presence come from 1d's filtered digest). The lead's instructions get it as the "A collaborative
+project you joined" section; each lead turn starts with a `<project-update>` listing only what changed since its
+last turn (threads that changed status, memory added or updated, artifacts, people who joined).
+
+**Private by default.** A person's chat messages leave their machine only while someone else may read them: the
+owner, with Settings › Collaborators › Project chats (`collab_rules.rules.chats.owner`), or a member with
+`view_others_chats`. Then the guest backfills the chat; when that stops, the host deletes its copy on the next sync.
+The host always keeps the chat's row (status), and the guest's chat bar says who can read it. Without the switch the
+owner's own windows and agents don't list or open collaborators' chats (`hidden_from_owner`).
+
+**Prompts.** `prompts/collab.md` holds the collaborative section for the owner's lead (`@host`: the people, their
+open threads, that threads belong to people, where each memory scope lives) and for a guest's lead (`@guest`: whose
+project, their role and permissions, others' threads not to duplicate, memory scopes, the project picture). Workers
+get two lines and the thread list. On the host, lead tools that act on a thread (`send_message`, `reassign_thread`,
+`merge_result`…) refuse a collaborator's thread (`collab_chat::guard_tool`); reading it is fine.
+
+| route | who | what |
+|---|---|---|
+| `GET host/chat` | member | find or make their chat; the project, their perms, who may read it |
+| `POST host/sync` | member | `{threads: [...], messages: [...]}` → `{chat_id, share_chat, upto, errors, perms, role}` |
+| `GET host/context` | member | the compact project picture above |
+| `GET/PATCH /api/collab/projects/{pid}/chats` | owner | each person's chat and who may read it; `{owner: bool}` |
+| `POST /api/collab/links/{id}/chat` | guest | make sure the joined project's local side exists; works offline once made |
+
+Hooks: approved notes reach a guest's local thread through 1d's `notes::deliver` (visible, never wakes a turn);
+claims and presence reach prompts through 1d's digest. Each local thread of a joined project is bound to 1b's tool
+bridge (`collab_chat::bind_bridge` → `collab_bridge::bind`, table `collab_agent_threads`) when the host makes the chat
+and whenever a sync is accepted.
+Not in 1c: thread transfer (Stage 2).
+
+## 11. Presence and conflict notes (Stage 1d)
+
+Code: `src/collab_presence.rs`, `src/collab_notes.rs` (table `collab_conflict_notes`, migration 13), UI
+`ui/js/collab-presence.js` (one compact toolbar row on the project page and the joined view: presence and the
+conflict inbox, details in the shared popover).
+
+- **Presence.** Each guest's app sends a heartbeat (`POST host/presence`, every 15 s) with a summary of its own open
+  work in the joined project: thread, title, status, branch and its local file claims. The host keeps it in memory
+  for 90 s; the host supplies identities, clients only work summaries. Claims stay in the guest's local `claims`
+  table and travel only in this heartbeat; the 1b bridge never forwards `claim_paths`/`release_paths`/`list_claims`.
+- **Overlap checks.** `tools::call` runs `check_collaboration_overlap` right after a tool is authorised and before
+  anything goes to the bridge: `spawn_thread` and `claim_paths` that overlap someone else's work are refused with a
+  message, and the person's view shows the overlap and offers a note. `who_is_working_on` (every role) returns the
+  compact digest and checks a proposed title or paths. Each turn's prompt gets the same filtered digest
+  ("Collaborator activity") after 1c's `<project-update>`.
+- **Conflict notes.** A note is a request: the receiving thread's owner approves or declines each one (no
+  auto-approve). An approved note is delivered by `notes::deliver` only: idempotent (the note id is the message id),
+  a plain visible message queued with `pending = 2`, so it is read by the next turn the owner starts and never
+  schedules one. On a guest, approved notes come down through `GET host/notes-delivery` and are receipted.
+

@@ -11,7 +11,7 @@ export const ic = (name, size = 16) => h('i', { class: 'ico', html: icon(name, s
 /** The skewed route chip that names an agent, in its own colour. */
 export function stamp(id, { model, small, lead } = {}) {
   const a = agent(id);
-  const label = a.info?.name || id;
+  const label = a.info?.name || (id === 'local' ? 'Local model' : id);
   const m = model ? (a.info?.models || []).find((x) => x.id === model)?.label || model : '';
   return h('span', { class: 'stamp' + (small ? ' sm' : '') + (lead ? ' lead' : ''), style: { '--ah': agentHue(id) }, title: label + (m ? ' · ' + m : '') + (lead ? ' (lead)' : '') },
     h('b', {}, lead ? '★ ' + label : label), m ? h('em', {}, m) : null);
@@ -97,8 +97,12 @@ export function modelOptions(id, { withDefault = true } = {}) {
 }
 
 export function agentOptions({ leadOnly, auto, buddies = true } = {}) {
-  const list = Object.values(S.agents).filter((a) => !leadOnly || a.info?.can_lead !== false);
-  const opts = list.map((a) => [a.id, a.info?.name + (a.installed === false ? ' (not installed)' : a.auth?.signed_in === 'no' ? ' (not signed in)' : a.limit?.active ? ' (at its limit)' : '')]);
+  // The local agent appears in thread agent pickers as "Local model" only once installed.
+  const list = Object.values(S.agents).filter((a) => (!leadOnly || a.info?.can_lead !== false) && !(a.id === 'local' && !a.installed));
+  const opts = list.map((a) => {
+    const name = a.id === 'local' ? 'Local model' : (a.info?.name || a.id);
+    return [a.id, name + (a.installed === false ? ' (not installed)' : a.auth?.signed_in === 'no' ? ' (not signed in)' : a.limit?.active ? ' (at its limit)' : '')];
+  });
   // buddy pairs: two agents that take turns, picked like one agent
   const pairs = leadOnly || !buddies ? [] : (S.settings.buddies || []).map((b) => ['buddy:' + b.id, '⇄ ' + b.name]);
   return auto ? [['', 'Let the router choose'], ...opts, ...pairs] : [...opts, ...pairs];

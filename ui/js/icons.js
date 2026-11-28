@@ -48,6 +48,7 @@ const P = {
   muted: '<path d="M4 9h4l5-4v14l-5-4H4zM16 9l5 6M21 9l-5 6"/>',
   desktop: '<rect x="3" y="4" width="8" height="16"/><rect x="13" y="4" width="8" height="7"/><rect x="13" y="13" width="8" height="7"/>',
   group: '<path d="M3 7h6l2 2h10v10H3z"/><path d="M7 4h7"/>',
+  people: '<circle cx="9" cy="8" r="3"/><path d="M3 20v-2a5 5 0 0 1 5-5h2a5 5 0 0 1 5 5v2M16 5a3 3 0 0 1 0 6M18 13a5 5 0 0 1 3 4.500V20"/>',
   tabs: '<rect x="3" y="7" width="18" height="13"/><path d="M3 7l2-3h6l2 3M9 12l3 3 3-3"/>',
   brush: '<path d="M14 4l6 6-8 8-6-6zM6 12l-3 8 8-3"/>',
   window: '<rect x="3" y="4" width="18" height="16"/><path d="M3 9h18M7 6.500h.01"/>',

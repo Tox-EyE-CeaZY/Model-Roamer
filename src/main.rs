@@ -11,6 +11,7 @@ mod agents;
 mod api;
 mod artifacts;
 mod bus;
+mod cleanup;
 mod collab;
 mod collab_bridge;
 mod collab_chat;
@@ -193,6 +194,8 @@ async fn start(headless: bool, o: &Opts) -> anyhow::Result<core::CoreRef> {
     }
     runner::recover(&core);
     tokio::spawn(runner::watch_limits(core.clone()));
+    // build folders in workers' worktrees are cleared once they're no longer needed (cleanup.rs)
+    tokio::spawn(cleanup::watch(core.clone()));
     // joined projects: this machine's threads in them go up to their hosts (collab_chat.rs)
     tokio::spawn(collab_chat::run(core.clone()));
     // plan usage for the status bar: now, then every ten minutes (and after every turn, in the runner)

@@ -12,7 +12,7 @@ android {
         minSdk = 24
         targetSdk = 34
         versionCode = (System.getenv("MR_VERSION_CODE") ?: "1").toInt()
-        versionName = System.getenv("MR_VERSION_NAME") ?: "2.2.0"
+        versionName = System.getenv("MR_VERSION_NAME") ?: "2.2.2"
     }
 
     // Installed by hand (sideloaded), so no store account is involved. One fixed key, kept in the repo (it protects

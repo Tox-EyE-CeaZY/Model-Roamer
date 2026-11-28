@@ -1,6 +1,6 @@
 [package]
 name = "model-roamer"
-version = "2.2.0"
+version = "2.2.2"
 edition = "2021"
 description = "An AI orchestration studio in the Roamer suite: one lead agent runs Claude Code, Codex, Gemini and Antigravity together"
 license = "MIT"

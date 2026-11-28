@@ -704,6 +704,7 @@ async fn delete_thread(State(core): State<CoreRef>, Path(id): Path<String>) -> R
     core.db.exec("UPDATE threads SET deleted_at = ?1 WHERE id = ?2", &[&now, &id])?;
     core.db.exec("DELETE FROM claims WHERE thread_id = ?1", &[&id])?;
     core.bus.emit("thread", t["project_id"].as_str(), Some(&id), json!({ "id": id, "deleted": true }));
+    crate::cleanup::soon(&core);
     Ok(Json(json!({ "ok": true })))
 }
 

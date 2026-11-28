@@ -538,8 +538,11 @@ const PUSH_MAX_MESSAGES: usize = 200;
 /// Push one joined project's changes to the host. Returns whether more is waiting (a capped batch).
 pub async fn push(core: &CoreRef, link_id: &str) -> Result<bool> {
     let Some(link) = link_of(core, link_id) else { return Ok(false) };
-    if link["status"] == "revoked" || core.db.one("SELECT id FROM projects WHERE id = ?1", &[&link_id])?.is_none() {
+    if link["status"] == "revoked" {
         return Ok(false);
+    }
+    if core.db.one("SELECT id FROM projects WHERE id = ?1 AND deleted_at IS NULL", &[&link_id])?.is_none() {
+        let _ = ensure_local(core, link_id).await?;
     }
     let key = state_key(link_id);
     let mut st = core.db.setting(&key);
@@ -609,9 +612,11 @@ pub async fn push(core: &CoreRef, link_id: &str) -> Result<bool> {
     let was_shared = st["share_chat"] == true;
     st["share_chat"] = r["share_chat"].clone();
     core.db.set_setting(&key, &st)?;
+    let prev_role = s(&link, "role");
+    let prev_perms = link["perms"].clone();
     core.db.exec("UPDATE collab_links SET perms = ?1, role = ?2 WHERE id = ?3", &[&r["perms"].to_string(), &s(&r, "role"), &link_id])?;
-    if was_shared != (r["share_chat"] == true) {
-        core.bus.emit("collab-links", None, None, json!({ "id": link_id, "share_chat": r["share_chat"] }));
+    if was_shared != (r["share_chat"] == true) || prev_role != s(&r, "role") || prev_perms != r["perms"] {
+        core.bus.emit("collab-links", None, None, json!({ "id": link_id, "share_chat": r["share_chat"], "role": r["role"], "perms": r["perms"] }));
     }
     // the chat just became shared: its earlier words go up next round
     Ok(more || (!was_shared && r["share_chat"] == true))
@@ -630,6 +635,8 @@ fn on_event(core: &CoreRef, ev: &crate::bus::Event) {
                 if core.db.exec("UPDATE projects SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL", &[&util::now_ms(), &id]).unwrap_or(0) > 0 {
                     core.bus.emit("project", Some(id), None, json!({ "id": id, "deleted": true }));
                 }
+            } else if core.db.one("SELECT id FROM projects WHERE id = ?1 AND deleted_at IS NULL", &[&id]).ok().flatten().is_none() {
+                mark_dirty(id);
             }
         }
     }

@@ -154,7 +154,7 @@ on first use), per-agent **instruction guides** so any lead can run any mix of a
 (**Ctrl+K**), a shortcut for nearly everything (press **?**), themes and an accent colour, and **automatic updates** from
 GitHub releases (Windows and Linux; on macOS it opens the release page).
 
-### 🧹 Disk space (2.2.2 and newer)
+### 🧹 Disk space (2.3.0 and newer)
 
 Rust build folders (`target`) in the app's own worktrees and clones are cleared automatically when a thread is resolved or
 deleted, after a day unused, or, longest unused first, when together they pass 20 GB. Change the limits or turn it off in
@@ -232,6 +232,7 @@ their own copy with their own agent logins. Logins and keys never leave their ma
 - Roles (**collaborator**, **operator**, **viewer**) set the defaults, and you can switch single permissions on or off per
   person.
 - Everyone talks to their own lead in their own project chat, private unless you allow others to read it.
+- A project you join shows up in your own project list like any other project, with your chat first.
 - Shared project memory, threads and artifacts stay in sync, and you see who is working on what, so two people don't open
   overlapping threads. Conflict notes are always a request the other person approves.
 
@@ -243,12 +244,12 @@ are in [docs/collaboration.md](docs/collaboration.md).
 ## ⚠️ Heads-up: older versions and disk space
 
 > [!WARNING]
-> **Versions before 2.2.2 could quietly fill your disk.** Every worker thread builds in its own folder, and each Rust
+> **Versions before 2.3.0 could quietly fill your disk.** Every worker thread builds in its own folder, and each Rust
 > `cargo build` there leaves a `target` folder of several gigabytes that older versions never cleaned up. On one machine
 > this reached about **80 GB**.
 >
-> **The fix:** update to **2.2.2 or newer**. A minute after it starts, Model Roamer clears these folders on its own (see
-> [Disk space](#-disk-space-222-and-newer)).
+> **The fix:** update to **2.3.0 or newer**. A minute after it starts, Model Roamer clears these folders on its own (see
+> [Disk space](#-disk-space-230-and-newer)).
 
 **Already affected? Free the space safely.** Only the `target` folders are safe to delete. They are build output, and the
 next build makes them again (just slower the first time).

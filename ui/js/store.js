@@ -10,6 +10,7 @@ export const S = {
   me: {},
   settings: {},
   projects: [],
+  collabLinks: [],
   agents: {}, // id → status
   running: {}, // thread id → {turn, started}
   taskKinds: [],
@@ -34,12 +35,16 @@ export const watch = (fn) => (subs.add(fn), () => subs.delete(fn));
 const changed = (what) => subs.forEach((f) => f(what));
 
 export async function load() {
-  const st = await get('state');
+  const [st, links] = await Promise.all([
+    get('state'),
+    get('collab/links', { quiet: true }).catch(() => []),
+  ]);
   S.version = st.version;
   S.server = st.server;
   S.me = st.me;
   S.settings = st.settings;
   S.projects = st.projects;
+  S.collabLinks = Array.isArray(links) ? links : [];
   S.agents = byId(st.agents);
   S.running = Object.fromEntries(st.running.map((r) => [r.thread, r]));
   S.taskKinds = st.task_kinds;
@@ -51,8 +56,12 @@ export async function load() {
 
 const reloadProjects = debounce(async () => {
   try {
-    const st = await get('state');
+    const [st, links] = await Promise.all([
+      get('state'),
+      get('collab/links', { quiet: true }).catch(() => S.collabLinks),
+    ]);
     S.projects = st.projects;
+    S.collabLinks = Array.isArray(links) ? links : [];
     S.running = Object.fromEntries(st.running.map((r) => [r.thread, r]));
     changed('projects');
     changed('running');
@@ -68,6 +77,8 @@ listen((ev) => {
     case 'thread':
     case 'decision':
     case 'message':
+    case 'collab-links':
+    case 'conflict-notes':
       reloadProjects();
       break;
     case 'running':
@@ -139,5 +150,41 @@ export function rememberChatPick(agent, model, effort = '') {
 export const agent = (id) => S.agents[id] || { id, info: { id, name: id, hue: 200, models: [] }, config: {} };
 export const agentName = (id) => agent(id).info?.name || id;
 export const agentHue = (id) => agent(id).info?.hue ?? 200;
-export const project = (id) => S.projects.find((p) => p.id === id);
+export const collabLink = (id) => S.collabLinks.find((l) => l.id === id) || null;
+export const isJoinedProject = (id) => String(id || '').startsWith('lnk_') || !!collabLink(id);
+export const project = (id) => {
+  const p = S.projects.find((x) => x.id === id);
+  const link = collabLink(id);
+  if (p) return link ? { ...p, _collab: link } : p;
+  if (link) return { id: link.id, name: link.project_name, color: 128, updated_at: link.last_sync || link.created_at, working: 0, open_threads: 0, unread: 0, decisions: 0, _collab: link };
+  return null;
+};
+/** Every project in the sidebar and Home: own projects plus joined projects (never duplicated). */
+export const allProjects = () => {
+  const byLink = new Map(S.collabLinks.map((l) => [l.id, l]));
+  const seen = new Set();
+  const list = [];
+  for (const p of S.projects) {
+    seen.add(p.id);
+    const link = byLink.get(p.id) || null;
+    // Skip orphaned local lnk_ rows if the link was already left/deleted
+    if (p.id.startsWith('lnk_') && !link) continue;
+    list.push(link ? { ...p, _collab: link } : p);
+  }
+  for (const l of S.collabLinks) {
+    if (seen.has(l.id)) continue;
+    list.push({
+      id: l.id,
+      name: l.project_name,
+      color: 128,
+      updated_at: l.last_sync || l.created_at,
+      working: 0,
+      open_threads: 0,
+      unread: 0,
+      decisions: 0,
+      _collab: l,
+    });
+  }
+  return list;
+};
 export const agentList = () => Object.values(S.agents);

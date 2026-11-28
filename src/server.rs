@@ -142,7 +142,7 @@ pub async fn auth(State(core): State<CoreRef>, mut req: Request, next: Next) -> 
 /// Small security headers on everything we serve.
 pub async fn headers(req: Request, next: Next) -> Response {
     let is_forward = req.uri().path().starts_with("/fwd/");
-    let is_artifact = req.uri().path().starts_with("/a/") || is_forward;
+    let is_artifact = req.uri().path().starts_with("/a/") || req.uri().path().contains("/artifact-file/") || is_forward;
     let mut r = next.run(req).await;
     let h = r.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
@@ -165,7 +165,8 @@ pub fn asset(path: &str) -> Response {
     match Assets::get(path) {
         Some(f) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            let cache = if path == "index.html" { "no-cache" } else { "public, max-age=300" };
+            // Always revalidate: UI files import each other; a stale cached copy next to a fresh one breaks module loading.
+            let cache = "no-cache";
             Response::builder().header(header::CONTENT_TYPE, mime.as_ref()).header(header::CACHE_CONTROL, cache).body(Body::from(f.data.into_owned())).unwrap()
         }
         None => StatusCode::NOT_FOUND.into_response(),
@@ -174,7 +175,9 @@ pub fn asset(path: &str) -> Response {
 
 /// Everything this server answers: the app's API plus collaboration (its own routes, same auth and headers).
 fn router(core: &CoreRef) -> axum::Router {
-    crate::api::router(core.clone()).merge(crate::collab::router(core.clone()))
+    crate::api::router(core.clone())
+        .merge(crate::collab::router(core.clone()))
+        .merge(crate::collab_view::router(core.clone()))
 }
 
 /// Open (or reopen) the listener other devices use, from the settings (command-line overrides win). Turning

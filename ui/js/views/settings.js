@@ -83,6 +83,7 @@ function windows(el) {
 // ------------------------------------------------------------ GitHub
 async function github(el) {
   const s = S.settings;
+  const clean = s.build_cleanup || {};
   const who = h('div', { class: 'gh-who' }, loading('Checking GitHub'));
   const tok = input(s.github_token || '', { type: 'password', placeholder: 'ghp_… or github_pat_…', autocomplete: 'off' });
   const name = input(s.git_name || '', { placeholder: 'Your Name (empty: git’s own setting)' });
@@ -125,7 +126,14 @@ async function github(el) {
     h('section', { class: 'panel cut' }, kicker('Git'),
       h('div', { class: 'row2' }, field('Commit name', name), field('Commit email', email)),
       toggle(s.worktrees !== false, (v) => save({ worktrees: v }), { label: 'Give each worker its own branch and folder (git worktree), so agents never edit the same files at once' }),
-      toggle(!!s.auto_push, (v) => save({ auto_push: v }), { label: 'Push workers’ branches to GitHub as they commit' })));
+      toggle(!!s.auto_push, (v) => save({ auto_push: v }), { label: 'Push workers’ branches to GitHub as they commit' })),
+    h('section', { class: 'panel cut' }, kicker('Disk space'),
+      toggle(clean.enabled !== false, (v) => save({ build_cleanup: { enabled: v } }), { label: 'Clear Rust build folders (target) in Model Roamer’s own worktrees and clones' }),
+      field('Clear one left unused for', seg([[0, 'Never'], [6, '6 hours'], [24, '1 day'], [72, '3 days'], [168, '1 week']], clean.idle_hours ?? 24, (v) => save({ build_cleanup: { idle_hours: v } })),
+        'Resolving or deleting a thread clears its build folder straight away.'),
+      field('Keep all of them under', seg([[0, 'No limit'], [10, '10 GB'], [20, '20 GB'], [50, '50 GB'], [100, '100 GB']], clean.max_gb ?? 20, (v) => save({ build_cleanup: { max_gb: v } })),
+        'Over this, the ones unused longest go first.'),
+      h('p', { class: 'faint small' }, 'The next build makes the folder again, so it takes longer. Folders in use are left alone, and so are your own project folders.')));
   check();
 }
 

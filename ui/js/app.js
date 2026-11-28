@@ -4,11 +4,13 @@ import { h, $, combo, debounce } from './util.js';
 import { icon, MARK } from './icons.js';
 import { initTopo } from './bg.js';
 import { connect, onSocket, onUnauthorized, listen, get, post } from './api.js';
-import { S, load, watch, project as projectOf } from './store.js';
+import { S, load, watch, project as projectOf, allProjects } from './store.js';
 import { isDesktop, isPop, plat, desk, win, native, onNative, setTitle, openExternal } from './native.js';
 import { toast, dialog, showMenu, overlaid, closeMenu } from './ui.js';
 import { ic, stamp, statusChip, loading, errorBox } from './common.js';
 import { attentionCount, watchAttention } from './attention.js';
+import { accessFromStore } from './collab_perms.js';
+import { projectAttention } from './statusbar.js';
 
 const VIEWS = {
   home: () => import('./views/home.js'),
@@ -45,6 +47,7 @@ export function parseRoute(hash = location.hash) {
   if (a === 'p' && b) return { view: 'project', id: b, tab: parts[2] || '', q };
   if (a === 't' && b) return { view: 'thread', id: b, q };
   if (a === 'a' && b) return { view: 'artifact', id: b, q };
+  if (a === 'join') return { view: 'settings', section: 'join', q };
   if (a === 'settings') return { view: 'settings', section: b || '', q };
   if (VIEWS[a]) return { view: a, q };
   return { view: 'home', q };
@@ -174,7 +177,8 @@ function side() {
   const draw = () => {
     const r = parseRoute();
     const cur = r.view === 'project' || r.view === 'thread' ? '' : r.view === 'home' ? '' : r.view === 'artifact' ? 'artifacts' : r.view;
-    const working = S.projects.reduce((n, p) => n + (p.working || 0), 0);
+    const projectList = allProjects();
+    const working = projectList.reduce((n, p) => n + (p.working || 0), 0);
     const needs = attentionCount();
     const items = NAV.map(([path, ico, label, k]) =>
       h('a', { class: 'sd-i' + (cur === path && (path !== '' || r.view === 'home') ? ' on' : ''), href: '#/' + path, title: `${label} (${k.replace('c+', 'Ctrl+').replace(',', ',')})` },
@@ -183,15 +187,58 @@ function side() {
         // Home's number is only for what waits on the person (the same count as the status bar); work in progress
         // is a quiet dot, so a busy fleet never looks like a call for attention
         path === '' && needs ? h('b', { class: 'sd-n hot', title: `${needs} waiting on you` }, needs) : path === '' && working ? h('i', { class: 'sd-dot', title: `${working} working` }) : null));
-    const projects = S.projects.map((p) =>
-      h('a', { class: 'sd-p' + (r.view === 'project' && r.id === p.id ? ' on' : ''), href: '#/p/' + p.id, style: { '--ph': p.color }, title: p.name, oncontextmenu: (e) => (e.preventDefault(), projectMenu(p, e.clientX, e.clientY)) },
-        h('i', { class: 'sd-sw' }),
-        h('span', {}, p.name),
-        p.decisions ? h('b', { class: 'sd-n hot', title: 'Waiting on you' }, p.decisions) : p.working ? h('i', { class: 'pulse', title: `${p.working} working` }) : p.unread ? h('i', { class: 'sd-dot', title: 'Unread' }) : null));
+    const projects = projectList.map((p) => {
+      const col = p._collab;
+      const attn = projectAttention(p.id);
+      const attnCount = Math.max(attn.count || 0, p.decisions || 0);
+      const revoked = col?.status === 'revoked';
+      const offline = col?.status === 'offline';
+      const tip = col ? `${p.name} · hosted by ${col.host_name}${revoked ? ' (removed)' : offline ? ' (offline)' : ''}` : p.name;
+      const badge = revoked
+        ? h('i', { class: 'sd-dot hot', title: 'Removed from this project' })
+        : attnCount
+          ? h('b', { class: 'sd-n hot', title: `${attnCount} waiting on you` }, attnCount)
+          : p.working
+            ? h('i', { class: 'pulse', title: `${p.working} working` })
+            : p.unread
+              ? h('i', { class: 'sd-dot', title: 'Unread' })
+              : offline
+                ? h('i', { class: 'sd-dot dim', title: 'Host offline' })
+                : null;
+      return h('a', {
+        class: 'sd-p' + (col ? ' joined' : '') + (revoked ? ' revoked' : '') + (r.view === 'project' && r.id === p.id ? ' on' : ''),
+        href: '#/p/' + p.id,
+        style: { '--ph': p.color },
+        title: tip,
+        oncontextmenu: (e) => (e.preventDefault(), projectMenu(p, e.clientX, e.clientY)),
+      },
+      h('i', { class: 'sd-sw' }),
+      col
+        ? h('span', { class: 'sd-p-meta' },
+          h('span', { class: 'sd-p-name' }, p.name),
+          h('small', { class: 'sd-p-host' }, ic('people', 10), col.host_name))
+        : h('span', {}, p.name),
+      badge);
+    });
+    const addProjectBtn = h('button', {
+      class: 'ibtn sm',
+      title: 'New or join a project',
+      'aria-label': 'New or join a project',
+      onclick: (e) => {
+        const b = e.currentTarget.getBoundingClientRect();
+        showMenu([
+          { label: 'New project…', icon: 'plus', kbd: 'Ctrl+Shift+N', run: () => newProject() },
+          { label: 'Join a project…', icon: 'link', run: () => go('#/settings/join') },
+        ], b.right, b.bottom + 4, { anchor: e.currentTarget });
+      },
+      html: icon('plus', 14),
+    });
     nav.replaceChildren(
       h('div', { class: 'sd-nav' }, items),
-      h('div', { class: 'sd-head' }, h('span', {}, 'Projects'), h('button', { class: 'ibtn sm', title: 'New project (Ctrl+Shift+N)', onclick: () => newProject(), html: icon('plus', 14) })),
-      h('div', { class: 'sd-projects' }, projects.length ? projects : h('button', { class: 'sd-empty', onclick: () => newProject() }, 'No projects yet. Make one →')),
+      h('div', { class: 'sd-head' }, h('span', {}, 'Projects'), addProjectBtn),
+      h('div', { class: 'sd-projects' }, projects.length ? projects : h('div', { class: 'sd-empty-box' },
+        h('button', { class: 'sd-empty', onclick: () => newProject() }, 'Make a project →'),
+        h('button', { class: 'sd-empty', onclick: () => go('#/settings/join') }, 'Join a project →'))),
       h('div', { class: 'sd-foot' },
         h('button', { class: 'sd-collapse ibtn sm', title: 'Collapse the side rail (Ctrl+B)', onclick: () => toggleRail(), html: icon('left', 14) }),
         h('span', { class: 'mono faint' }, 'v' + (S.version || ''))),
@@ -213,6 +260,18 @@ function toggleRail() {
 }
 
 export function projectMenu(p, x, y) {
+  const access = accessFromStore(p.id);
+  if (access.isJoined) {
+    const items = [
+      { label: 'Open', icon: 'board', run: () => go('#/p/' + p.id) },
+      access.canCreateThread ? { label: 'New thread…', icon: 'plus', run: () => import('./views/project.js').then((m) => m.newThreadDialog(p.id)) } : null,
+      !access.revoked ? { label: 'Project settings…', icon: 'settings', run: () => go('#/p/' + p.id + '/settings') } : null,
+      { sep: true },
+      { label: 'Leave project', icon: 'logout', danger: true, run: () => leaveJoinedProject(p._collab || { id: p.id, project_name: p.name, host_name: 'the host' }) },
+    ].filter(Boolean);
+    showMenu(items, x, y);
+    return;
+  }
   showMenu([
     { label: 'Open', icon: 'board', run: () => go('#/p/' + p.id) },
     { label: 'New thread…', icon: 'plus', run: () => import('./views/project.js').then((m) => m.newThreadDialog(p.id)) },
@@ -220,6 +279,27 @@ export function projectMenu(p, x, y) {
     { sep: true },
     { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
   ], x, y);
+}
+
+export async function leaveJoinedProject(link) {
+  const name = link.project_name || link.name || 'this project';
+  const host = link.host_name || 'the host';
+  const ok = await dialog({
+    title: `Leave ${name}?`,
+    text: `You stop seeing it, and ${host} is told. To come back you need a new invite.`,
+    ok: 'Leave',
+    danger: true,
+  });
+  if (!ok) return false;
+  try {
+    await (await import('./api.js')).del('collab/links/' + encodeURIComponent(link.id));
+    if (location.hash.includes(link.id)) go('#/');
+    toast(`Left ${name}`);
+    return true;
+  } catch (e) {
+    toast(e.message, { err: true });
+    return false;
+  }
 }
 
 export async function deleteProject(p) {
@@ -290,6 +370,7 @@ export async function palette(initial = '') {
   const actions = [
     { label: 'New chat', hint: 'Ctrl+N', icon: 'chat', run: () => import('./views/chats.js').then((m) => m.newChat()) },
     { label: 'New project', hint: 'Ctrl+Shift+N', icon: 'board', run: () => newProject() },
+    { label: 'Join a project', icon: 'link', run: () => go('#/settings/join') },
     { label: 'Agents and sign-in', icon: 'agents', run: () => go('#/agents') },
     { label: 'Routing rules', icon: 'route', run: () => go('#/agents?tab=routing') },
     { label: 'Usage and limits', icon: 'chart', run: () => go('#/usage') },
@@ -328,11 +409,31 @@ export async function palette(initial = '') {
   const search = debounce(async (q) => {
     const ql = q.toLowerCase();
     const acts = actions.filter((a) => !ql || a.label.toLowerCase().includes(ql));
-    const projs = S.projects.filter((p) => !ql || p.name.toLowerCase().includes(ql)).slice(0, 6).map((p) => ({ label: p.name, sub: 'project', icon: 'board', run: () => go('#/p/' + p.id) }));
+    const projs = allProjects()
+      .filter((p) => !ql || p.name.toLowerCase().includes(ql) || (p._collab?.host_name || '').toLowerCase().includes(ql))
+      .slice(0, 8)
+      .map((p) => ({
+        label: p.name,
+        sub: p._collab ? `joined · ${p._collab.host_name}${p._collab.status === 'revoked' ? ' · removed' : ''}` : 'project',
+        icon: p._collab ? 'people' : 'board',
+        run: () => go('#/p/' + p.id),
+      }));
     let found = [];
     if (q.trim().length >= 2) {
       try {
         const r = await get('search?q=' + encodeURIComponent(q));
+        const permitted = (pid) => {
+          if (!pid) return true;
+          const acc = accessFromStore(pid);
+          return !acc.revoked;
+        };
+        const permittedThread = (t) => {
+          if (!t.project_id) return true;
+          const acc = accessFromStore(t.project_id);
+          if (acc.revoked) return false;
+          if (acc.isJoined && t.kind !== 'lead' && !acc.canSeeThreads) return false;
+          return true;
+        };
         // where a thread opens: a chat on its own, anything in a project beside that project's chat
         const open = (t, msg) => {
           try {
@@ -344,11 +445,11 @@ export async function palette(initial = '') {
         const clean = (x) => (x || '').replace(/\s+/g, ' ').trim();
         const where = (t) => (t.kind === 'chat' ? 'chat' : projectOf(t.project_id)?.name || 'thread') + (t.kind === 'lead' ? ' · project chat' : '');
         found = [
-          ...r.projects.map((p) => ({ label: p.name, sub: clean(p.snippet) || 'project', icon: 'board', run: () => go('#/p/' + p.id) })),
-          ...r.threads.map((t) => ({ label: t.title, sub: clean(t.snippet) || where(t), icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => open(t) })),
-          ...r.messages.slice(0, 12).map((m) => ({ label: clean(m.snippet), sub: `${m.role === 'agent' ? 'agent' : m.author || 'you'} · ${where(m)}`, icon: 'hash', run: () => open(m, m.id) })),
-          ...r.artifacts.map((a) => ({ label: a.title, sub: clean(a.description) || a.kind + (projectOf(a.project_id) ? ' · ' + projectOf(a.project_id).name : ''), icon: 'artifact', run: () => go('#/a/' + a.id) })),
-          ...r.memory.slice(0, 6).map((m) => ({ label: m.name, sub: [m.scope === 'collaborator' ? 'private' : m.scope, m.description].filter(Boolean).join(' · '), icon: 'memory', run: () => go('#/memory?open=' + m.id) })),
+          ...r.projects.filter((p) => !p.id.startsWith('lnk_') || projectOf(p.id)).map((p) => ({ label: p.name, sub: clean(p.snippet) || 'project', icon: p.id.startsWith('lnk_') ? 'people' : 'board', run: () => go('#/p/' + p.id) })),
+          ...r.threads.filter(permittedThread).map((t) => ({ label: t.title, sub: clean(t.snippet) || where(t), icon: t.kind === 'chat' ? 'chat' : 'thread', node: statusChip(t), run: () => open(t) })),
+          ...r.messages.filter(permittedThread).slice(0, 12).map((m) => ({ label: clean(m.snippet), sub: `${m.role === 'agent' ? 'agent' : m.author || 'you'} · ${where(m)}`, icon: 'hash', run: () => open(m, m.id) })),
+          ...r.artifacts.filter((a) => permitted(a.project_id)).map((a) => ({ label: a.title, sub: clean(a.description) || a.kind + (projectOf(a.project_id) ? ' · ' + projectOf(a.project_id).name : ''), icon: 'artifact', run: () => go('#/a/' + a.id) })),
+          ...r.memory.filter((m) => permitted(m.project_id)).slice(0, 6).map((m) => ({ label: m.name, sub: [m.scope === 'collaborator' ? 'private' : m.scope, m.description].filter(Boolean).join(' · '), icon: 'memory', run: () => go('#/memory?open=' + m.id) })),
         ];
       } catch { /* offline: actions still work */ }
     }

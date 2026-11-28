@@ -1,20 +1,24 @@
-// A project: the chat with its lead on the left, its threads in lanes on the right, plus git, memory, artifacts
-// and settings tabs.
+// A project: the chat with its lead on the left, its threads in lanes on the right, plus files, git, memory,
+// artifacts and settings tabs. Handles both owner projects and joined collaborative projects with the exact same
+// layout and components, hiding any tab, button, menu item or shortcut the collaborator isn't permitted to use.
 
 import { h, ago } from '../util.js';
 import { icon } from '../icons.js';
 import { get, post, patch, del, listen } from '../api.js';
-import { S, watch, agentName, agentHue, project as projectOf, addRef } from '../store.js';
-import { go, back, openThread, deleteProject } from '../app.js';
+import { S, watch, agentName, agentHue, project as projectOf, isJoinedProject, collabLink, addRef } from '../store.js';
+import { go, back, openThread, deleteProject, leaveJoinedProject, parseRoute } from '../app.js';
 import { popOut, setTitle, openExternal } from '../native.js';
-import { dialog, toast, showMenu } from '../ui.js';
+import { dialog, toast, showMenu, overlaid } from '../ui.js';
+import { md } from '../md.js';
 import { mountThread, decisionCard } from './thread.js';
-import { ic, stamp, statusChip, field, input, textarea, select, seg, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, folderInput, askLine, repoSelect, repoLabel, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
+import { ic, stamp, statusChip, field, input, textarea, select, seg, toggle, agentModelPicker, routeEffort, agentOptions, modelOptions, pickFolder, folderInput, askLine, repoSelect, repoLabel, loading, errorBox, empty, timeAgo, kicker, copyable } from '../common.js';
 import { needsYou, isFinished } from '../attention.js';
 import { scrollStrip } from '../scrollstrip.js';
-import { mountPresence, mountProjectInbox, ownerOverlap } from '../collab-presence.js';
+import { mountPresence, mountProjectInbox, ownerOverlap, drawPresence, drawInbox, clearControl, presenceDot, requestedInbox } from '../collab-presence.js';
+import { mountBoardChat, ensureLocal, threadOwnerLabel } from './collab_chat.js';
+import { projectAccess, accessFromStore, rememberProjectTab, savedProjectTab, collabPrefs, setCollabPref, ROLE_LABEL } from '../collab_perms.js';
 
-const TABS = [['', 'Board', 'board'], ['files', 'Files', 'folder'], ['git', 'Git', 'branch'], ['memory', 'Memory', 'memory'], ['artifacts', 'Artifacts', 'artifact'], ['settings', 'Settings', 'settings']];
+const enc = encodeURIComponent;
 const PANE_KEY = (id) => 'mr-proj-pane-' + id;
 
 function savedPane(id) {
@@ -31,7 +35,19 @@ function rememberPane(id, pane) {
   } catch { /* private window */ }
 }
 
+// Track the last project id we rendered so sidebar/Home navigation restores the saved tab,
+// while clicking the Board tab from within the same project explicitly stays on Board.
+let activeProjectId = '';
+
 export default async function projectView(el, r, ctx) {
+  if (isJoinedProject(r.id)) {
+    return joinedProjectView(el, r, ctx);
+  }
+  return ownerProjectView(el, r, ctx);
+}
+
+// ================================================================================================ owner project
+async function ownerProjectView(el, r, ctx) {
   let p;
   try {
     p = await get('projects/' + r.id);
@@ -39,10 +55,21 @@ export default async function projectView(el, r, ctx) {
     if (e.status === 404 || /no such/i.test(e.message)) return el.replaceChildren(empty('board', 'That project isn’t here', 'It may have been deleted.', h('a', { class: 'btn', href: '#/' }, 'Home')));
     throw e;
   }
+  const access = projectAccess({ isJoined: false });
+  const rawTab = r.tab === 'board' ? '' : (r.tab || '');
+  const entering = activeProjectId !== p.id;
+  activeProjectId = p.id;
+  if (entering && !rawTab && !r.q?.t && !r.q?.inbox) {
+    const saved = savedProjectTab(p.id, access);
+    if (saved) {
+      history.replaceState(history.state, '', `#/p/${p.id}/${saved}`);
+      return ownerProjectView(el, { ...r, tab: saved }, ctx);
+    }
+  }
+  const tab = access.canTab(rawTab) ? rawTab : '';
+  rememberProjectTab(p.id, tab);
+
   setTitle(`${p.name} · Model Roamer`);
-  const tab = r.tab || '';
-  // a project joined from someone else's Model Roamer: its page is the joined view, with the person's own chat
-  if (p.id.startsWith('lnk_') && !tab) return r.q.t ? go('#/t/' + r.q.t) : go('#/settings/join?link=' + encodeURIComponent(p.id));
   const headEl = h('div', { class: 'p-head', style: { '--ph': p.color } });
   const presenceHost = h('div', { class: 'collab-presence-host' });
   const inboxHost = h('div', { class: 'collab-note-host' });
@@ -64,15 +91,15 @@ export default async function projectView(el, r, ctx) {
   function renderThreadBadge() {
     if (!threadsBadgeHost) return;
     const sp = projectOf(p.id);
-    const needsYou = threadBadgeState ? threadBadgeState.needsYou : (p.decisions?.length ?? sp?.decisions ?? 0);
+    const needs = threadBadgeState ? threadBadgeState.needsYou : (p.decisions?.length ?? sp?.decisions ?? 0);
     const unread = threadBadgeState ? threadBadgeState.unread : (sp?.unread ?? 0);
     const extraUnread = threadBadgeState ? threadBadgeState.extraUnread : 0;
     const nodes = [];
-    if (needsYou > 0) {
+    if (needs > 0) {
       nodes.push(h('b', {
         class: 'p-tab-badge hot',
-        title: `${needsYou} need you` + (unread ? ` · ${unread} unread` : ''),
-      }, needsYou));
+        title: `${needs} need you` + (unread ? ` · ${unread} unread` : ''),
+      }, needs));
       if (extraUnread > 0) nodes.push(h('i', { class: 'p-tab-dot', title: `${unread} unread` }));
     } else if (unread > 0) {
       nodes.push(h('b', { class: 'p-tab-badge acc', title: `${unread} unread` }, unread));
@@ -90,6 +117,7 @@ export default async function projectView(el, r, ctx) {
   function pickMobilePane(next, e) {
     mobilePane = next;
     rememberPane(p.id, next);
+    rememberProjectTab(p.id, '');
     if (tab === '' && onPaneChange) {
       e?.preventDefault();
       syncMobileTabHighlight();
@@ -116,9 +144,10 @@ export default async function projectView(el, r, ctx) {
     const nav = h('nav', { class: 'p-tabs', 'aria-label': 'Project sections' },
       leadTabEl,
       threadsTabEl,
-      ...TABS.map(([k, label, ico]) => h('a', {
+      ...access.tabs.map(([k, label, ico]) => h('a', {
         class: 'p-tab' + (k === '' ? ' p-tab-desk' : '') + (k === tab ? ' on' : ''),
         href: '#/p/' + p.id + (k ? '/' + k : ''),
+        onclick: () => rememberProjectTab(p.id, k),
       }, ic(ico, 14), label)));
 
     tabStrip = scrollStrip(nav);
@@ -136,17 +165,21 @@ export default async function projectView(el, r, ctx) {
             const b = e.currentTarget.getBoundingClientRect();
             showMenu([
               { label: 'New thread…', icon: 'plus', run: () => newThreadDialog(p.id) },
+              { label: 'People & collaborators…', icon: 'people', run: () => go(`#/p/${p.id}/settings?section=people`) },
               { label: 'Pop the project chat out', icon: 'popout', run: () => popOut('#/t/' + p.lead.id, { key: 't:' + p.lead.id }) },
               p.home && S.me.local ? { label: 'Show the folder', icon: 'folder', run: () => post('fs/reveal', { path: p.home }) } : null,
               p.repo_url ? { label: 'Open on GitHub', icon: 'external', run: () => openExternal(p.repo_url.replace(/\.git$/, '')) } : null,
               { sep: true },
               { label: 'Delete project', icon: 'trash', danger: true, run: () => deleteProject(p) },
-            ], b.right, b.bottom + 4, { anchor: e.currentTarget });
+            ].filter(Boolean), b.right, b.bottom + 4, { anchor: e.currentTarget });
           }, html: icon('more', 16) }))),
       collabStrip, tabStrip.el);
     renderThreadBadge();
   }
   drawHead();
+
+  const onKey = projectShortcuts(() => access, p.id);
+  document.addEventListener('keydown', onKey);
 
   const unlisten = listen((ev) => {
     if (ev.kind === 'project' && ev.project === p.id && !ev.data?.deleted) {
@@ -171,16 +204,1008 @@ export default async function projectView(el, r, ctx) {
         renderThreadBadge();
       },
     });
-  }
-  else if (tab === 'files') inner = await (await import('./files.js')).default(body, p, r);
+  } else if (tab === 'files') inner = await (await import('./files.js')).default(body, p, r);
   else if (tab === 'git') inner = await gitTab(body, p, r.q?.repo || '');
   else if (tab === 'memory') inner = await (await import('./memory.js')).default(body, { q: {} }, { project: p.id });
   else if (tab === 'artifacts') inner = await (await import('./artifacts.js')).default(body, { q: {} }, { project: p.id });
-  else if (tab === 'settings') inner = await settingsTab(body, p, (np) => ((p = { ...p, ...np }), drawHead()));
-  return () => (unlisten(), unwatch(), inbox.destroy(), stopPresence(), tabStrip?.destroy(), inner?.());
+  else if (tab === 'settings') inner = await settingsTab(body, p, (np) => ((p = { ...p, ...np }), drawHead()), r);
+  return () => {
+    const next = parseRoute();
+    if (next.view !== 'project' || next.id !== p.id) activeProjectId = '';
+    document.removeEventListener('keydown', onKey);
+    unlisten();
+    unwatch();
+    inbox.destroy();
+    stopPresence();
+    tabStrip?.destroy();
+    inner?.();
+  };
 }
 
-// ------------------------------------------------------------ board
+function projectShortcuts(getAccess, projectId) {
+  return (e) => {
+    if (overlaid() || document.querySelector('.pal')) return;
+    if (e.target.matches?.('input, textarea, select, [contenteditable], .xterm-helper-textarea')) return;
+    const acc = getAccess();
+    if (acc.revoked) return;
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key >= '1' && e.key <= '6') {
+      const idx = Number(e.key) - 1;
+      const target = acc.tabs[idx];
+      if (target) {
+        e.preventDefault();
+        rememberProjectTab(projectId, target[0]);
+        go(`#/p/${enc(projectId)}${target[0] ? '/' + target[0] : ''}`);
+      }
+      return;
+    }
+    if (!e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === 'n' && acc.canCreateThread) {
+      e.preventDefault();
+      newThreadDialog(projectId);
+    }
+  };
+}
+
+// ================================================================================================ joined project
+async function joinedProjectView(el, r, ctx) {
+  const linkId = r.id;
+  const base = `collab/links/${enc(linkId)}/host/`;
+  const viewBase = `collab/links/${enc(linkId)}/view/`;
+
+  let link = collabLink(linkId);
+  if (!link) {
+    const links = await get('collab/links').catch(() => []);
+    link = links.find((l) => l.id === linkId) || null;
+  }
+  if (!link) {
+    return el.replaceChildren(empty('people', 'Not joined', 'This project isn’t in your list any more.', h('a', { class: 'btn', href: '#/' }, 'Home')));
+  }
+
+  const headEl = h('div', { class: 'p-head', style: { '--ph': 128 } });
+  const presenceHost = h('div', { class: 'collab-presence-host' });
+  const inboxHost = h('div', { class: 'collab-note-host' });
+  const collabStrip = h('div', { class: 'collab-toolbar' }, presenceHost, inboxHost);
+  const body = h('div', { class: 'p-body' });
+  el.append(headEl, body);
+  body.replaceChildren(loading('Opening ' + link.project_name));
+
+  let alive = true;
+  let live = link.status === 'revoked' ? 'revoked' : 'ok';
+  let ensured = null;
+  let hostState = null;
+  let localProject = null;
+  let hasLocalSource = false;
+  let hasGitSource = false;
+  let perms = link.perms && typeof link.perms === 'object' ? { ...link.perms } : {};
+  let catalog = [];
+  let me = { id: link.member_id, user_id: link.user_id, name: link.name, role: link.role, requested_role: '' };
+  let people = [];
+  let presence = null;
+  let notes = [];
+  let cursor = 0;
+  let openInbox = requestedInbox();
+  const hostThreads = new Map();
+  const hostMsgs = new Map();
+  const liveListeners = new Set();
+  const onLiveChange = (fn) => (liveListeners.add(fn), () => liveListeners.delete(fn));
+  const notifyLive = (ev) => liveListeners.forEach((fn) => { try { fn(ev); } catch (e) { console.error(e); } });
+
+  const isRevokedErr = (e) => e?.status === 403 && /removed|withdrawn|isn’t valid|isn't valid|left it/i.test(e?.message || '');
+  const samePerms = (a, b) => {
+    const ka = Object.keys(a || {}).sort();
+    const kb = Object.keys(b || {}).sort();
+    return ka.length === kb.length && ka.every((k, i) => k === kb[i] && !!a[k] === !!b[k]);
+  };
+  let lastPermToastAt = 0;
+
+  // Bootstrap: ensure local side + fetch host project state (resilient offline/revoked)
+  try {
+    ensured = await post(viewBase + 'ensure', {}, { timeout: 25000 });
+    if (ensured?.link) link = ensured.link;
+    hasLocalSource = !!ensured?.has_local_source;
+    hasGitSource = !!ensured?.has_git_source;
+    if (ensured?.revoked) live = 'revoked';
+    else if (ensured?.offline) live = 'offline';
+  } catch (e) {
+    if (isRevokedErr(e)) live = 'revoked';
+    else live = 'offline';
+  }
+
+  localProject = await get('projects/' + enc(linkId), { quiet: true }).catch(() => null);
+
+  if (live !== 'revoked') {
+    try {
+      hostState = await get(base + 'project', { timeout: 25000 });
+      live = 'ok';
+      perms = { ...(hostState.perms || {}) };
+      catalog = hostState.catalog || [];
+      me = { ...me, ...(hostState.member || {}) };
+      people = hostState.people || [];
+      presence = hostState.presence || null;
+      notes = hostState.notes || [];
+      cursor = hostState.cursor || 0;
+      (hostState.threads || []).forEach((t) => hostThreads.set(t.id, t));
+    } catch (e) {
+      if (isRevokedErr(e)) live = 'revoked';
+      else live = 'offline';
+    }
+  }
+
+  if (!alive) return;
+
+  const projectName = () => hostState?.project?.name || localProject?.name || link.project_name || 'Shared project';
+  const hostName = () => hostState?.host?.name || link.host_name || 'Host';
+  const projectColor = () => hostState?.project?.color ?? localProject?.color ?? 128;
+  const repoUrl = () => hostState?.project?.repo_url || localProject?.repo_url || '';
+  const baseBranch = () => hostState?.project?.base_branch || localProject?.base_branch || '';
+  const hasOwnThreads = () => {
+    for (const t of hostThreads.values()) {
+      if (!t.deleted_at && t.user_id === me.user_id && t.kind !== 'chat' && t.kind !== 'lead') return true;
+    }
+    return false;
+  };
+  const getAccess = () => projectAccess({
+    isJoined: true,
+    perms,
+    role: me.role || link.role,
+    status: live,
+    hasLocalSource,
+    hasGitSource,
+    hasOwnThreads: hasOwnThreads(),
+    userId: me.user_id || link.user_id || '',
+  });
+
+  el.style.setProperty('--ph', projectColor());
+  headEl.style.setProperty('--ph', projectColor());
+  setTitle(`${projectName()} · Model Roamer`);
+
+  // Tab selection & last-tab memory
+  let access = getAccess();
+  const rawTab = r.tab === 'board' ? '' : (r.tab || '');
+  const entering = activeProjectId !== linkId;
+  activeProjectId = linkId;
+  if (!access.revoked && entering && !rawTab && !r.q?.t && !r.q?.inbox) {
+    const saved = savedProjectTab(linkId, access);
+    if (saved) {
+      history.replaceState(history.state, '', `#/p/${enc(linkId)}/${saved}`);
+      r = { ...r, tab: saved };
+    }
+  }
+  let tab = r.tab === 'board' ? '' : (r.tab || '');
+  if (!access.revoked && access.canTab(tab)) rememberProjectTab(linkId, tab);
+
+  let mobilePane = savedPane(linkId);
+  let onPaneChange = null;
+  let threadBadgeState = null;
+  let tabStrip = null;
+  let leadTabEl = null;
+  let threadsTabEl = null;
+  let threadsBadgeHost = null;
+  let innerStop = null;
+  let boardChatHandle = null;
+
+  async function refreshNotes() {
+    try {
+      notes = await get(base + 'notes', { quiet: true });
+      if (alive) drawCoordination();
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+  }
+
+  function drawCoordination() {
+    const acc = getAccess();
+    const prefs = collabPrefs(linkId);
+    if (acc.canViewPresence && prefs.show_presence) {
+      drawPresence(presenceHost, presence, live === 'ok', linkId);
+    } else {
+      clearControl(presenceHost);
+    }
+    if (!acc.revoked) {
+      drawInbox(inboxHost, base, live === 'ok' ? notes : [], refreshNotes, openInbox);
+      if (live === 'ok' && notes.length) openInbox = false;
+    } else {
+      clearControl(inboxHost);
+    }
+  }
+
+  function renderThreadBadge() {
+    if (!threadsBadgeHost) return;
+    const sp = projectOf(linkId);
+    const needs = threadBadgeState ? threadBadgeState.needsYou : (sp?.decisions ?? 0);
+    const unread = threadBadgeState ? threadBadgeState.unread : (sp?.unread ?? 0);
+    const extraUnread = threadBadgeState ? threadBadgeState.extraUnread : 0;
+    const nodes = [];
+    if (needs > 0) {
+      nodes.push(h('b', { class: 'p-tab-badge hot', title: `${needs} need you` + (unread ? ` · ${unread} unread` : '') }, needs));
+      if (extraUnread > 0) nodes.push(h('i', { class: 'p-tab-dot', title: `${unread} unread` }));
+    } else if (unread > 0) {
+      nodes.push(h('b', { class: 'p-tab-badge acc', title: `${unread} unread` }, unread));
+    }
+    threadsBadgeHost.replaceChildren(...nodes);
+    tabStrip?.update();
+  }
+
+  function syncMobileTabHighlight() {
+    leadTabEl?.classList.toggle('on', tab === '' && mobilePane === 'lead');
+    threadsTabEl?.classList.toggle('on', tab === '' && mobilePane === 'threads');
+    tabStrip?.update();
+  }
+
+  function pickMobilePane(next, e) {
+    mobilePane = next;
+    rememberPane(linkId, next);
+    rememberProjectTab(linkId, '');
+    if (tab === '' && onPaneChange) {
+      e?.preventDefault();
+      syncMobileTabHighlight();
+      onPaneChange(next);
+      tabStrip?.revealActive({ smooth: true });
+    }
+  }
+
+  function drawHead() {
+    access = getAccess();
+    tabStrip?.destroy();
+    const liveChip = live === 'ok'
+      ? h('span', { class: 'status live' }, h('i', { class: 'pulse' }), 'Live')
+      : live === 'revoked'
+        ? h('span', { class: 'status hot' }, 'Removed')
+        : h('span', { class: 'status dim' }, 'Offline, retrying');
+
+    threadsBadgeHost = h('span', { class: 'p-tab-badges' });
+    leadTabEl = !access.revoked ? h('a', {
+      class: 'p-tab p-tab-mob' + (tab === '' && mobilePane === 'lead' ? ' on' : ''),
+      href: '#/p/' + enc(linkId),
+      onclick: (e) => pickMobilePane('lead', e),
+    }, ic('chat', 14), 'Your chat') : null;
+    threadsTabEl = !access.revoked && access.canSeeThreads ? h('a', {
+      class: 'p-tab p-tab-mob' + (tab === '' && mobilePane === 'threads' ? ' on' : ''),
+      href: '#/p/' + enc(linkId),
+      onclick: (e) => pickMobilePane('threads', e),
+    }, ic('board', 14), 'Threads', threadsBadgeHost) : null;
+
+    const nav = access.tabs.length ? h('nav', { class: 'p-tabs', 'aria-label': 'Project sections' },
+      leadTabEl,
+      threadsTabEl,
+      ...access.tabs.map(([k, label, ico]) => h('a', {
+        class: 'p-tab' + (k === '' ? ' p-tab-desk' : '') + (k === tab ? ' on' : ''),
+        href: '#/p/' + enc(linkId) + (k ? '/' + k : ''),
+        onclick: () => rememberProjectTab(linkId, k),
+      }, ic(ico, 14), label))) : null;
+
+    tabStrip = nav ? scrollStrip(nav) : null;
+
+    const moreItems = () => [
+      access.canCreateThread ? { label: 'New thread…', icon: 'plus', run: () => newThreadDialog(linkId) } : null,
+      !access.revoked && (ensured?.thread?.id || localProject?.lead?.id) ? { label: 'Pop your project chat out', icon: 'popout', run: () => popOut('#/t/' + (ensured?.thread?.id || localProject.lead.id), { key: 't:' + (ensured?.thread?.id || localProject.lead.id) }) } : null,
+      !access.revoked && repoUrl() ? { label: 'Open on GitHub', icon: 'external', run: () => openExternal(repoUrl().replace(/\.git$/, '')) } : null,
+      { sep: true },
+      { label: 'Leave project', icon: 'logout', danger: true, run: () => leaveJoinedProject({ ...link, project_name: projectName(), host_name: hostName() }) },
+    ].filter(Boolean);
+
+    headEl.replaceChildren(
+      h('div', { class: 'p-title' },
+        h('i', { class: 'p-sw' }),
+        h('h1', {}, projectName()),
+        h('span', { class: 'p-sub mono' },
+          ic('people', 13),
+          h('span', {}, `Hosted by ${hostName()}`),
+          h('span', { class: 'tag' }, ROLE_LABEL[access.role] || access.role),
+          liveChip),
+        h('span', { class: 'grow' }),
+        h('div', { class: 'p-acts' },
+          access.canCreateThread
+            ? h('button', { class: 'btn primary sm', title: 'New thread (N)', 'aria-label': 'New thread', onclick: () => newThreadDialog(linkId) }, ic('plus', 13), h('span', { class: 'p-new-lbl' }, 'New thread'))
+            : null,
+          h('button', {
+            class: 'ibtn',
+            title: 'More',
+            'aria-label': 'More project actions',
+            onclick: (e) => {
+              const b = e.currentTarget.getBoundingClientRect();
+              showMenu(moreItems(), b.right, b.bottom + 4, { anchor: e.currentTarget });
+            },
+            html: icon('more', 16),
+          }))),
+      collabStrip,
+      tabStrip ? tabStrip.el : null,
+    );
+    drawCoordination();
+    renderThreadBadge();
+  }
+
+  function drawRevokedState() {
+    innerStop?.();
+    innerStop = null;
+    drawHead();
+    body.replaceChildren(
+      h('div', { class: 'collab-state-wrap' },
+        h('section', { class: 'panel cut collab-removed' },
+          empty(
+            'lock',
+            `You were removed from ${projectName()}`,
+            `The owner (${hostName()}) removed your access to this project, or your membership ended. Ask them for a new invite link if you need access again.`,
+            h('div', { class: 'row' },
+              h('button', { class: 'btn danger', onclick: () => leaveJoinedProject({ ...link, project_name: projectName(), host_name: hostName() }) }, ic('logout', 14), 'Remove from my list'),
+              h('a', { class: 'btn', href: '#/' }, 'Back to Home')),
+          ))),
+    );
+  }
+
+  function drawForbiddenTab(tabName) {
+    innerStop?.();
+    innerStop = null;
+    body.replaceChildren(
+      h('div', { class: 'collab-state-wrap' },
+        h('section', { class: 'panel cut' },
+          empty(
+            'shield',
+            `${tabName} isn’t available`,
+            'You don’t have permission to view this section in this shared project, or there is no local repository available for it.',
+            h('a', { class: 'btn primary', href: '#/p/' + enc(linkId) }, 'Go to Board'),
+          ))),
+    );
+  }
+
+  const collabCtx = {
+    linkId,
+    link,
+    base,
+    viewBase,
+    getAccess,
+    onLiveChange,
+    getMe: () => me,
+    getPeople: () => people,
+    getPresence: () => presence,
+    getCatalog: () => catalog,
+    getLive: () => live,
+    getHostName: hostName,
+    getProjectName: projectName,
+    redrawHead: drawHead,
+    redrawCoordination: drawCoordination,
+  };
+
+  async function mountBody() {
+    innerStop?.();
+    innerStop = null;
+    boardChatHandle = null;
+    access = getAccess();
+    if (access.revoked) return drawRevokedState();
+
+    if (!access.canTab(tab)) {
+      const label = tab ? tab[0].toUpperCase() + tab.slice(1) : 'Section';
+      return drawForbiddenTab(label);
+    }
+
+    body.replaceChildren();
+    if (tab === '') {
+      innerStop = await joinedBoard(body, {
+        linkId,
+        link,
+        base,
+        ensured,
+        localProject,
+        hostThreads,
+        hostMsgs,
+        getAccess,
+        getMe: () => me,
+        getPeople: () => people,
+        getLive: () => live,
+        onLiveChange,
+        onChatReady: (hnd) => (boardChatHandle = hnd),
+      }, r, {
+        ...ctx,
+        onRoute: (update) => ctx?.onRoute?.((next) => {
+          if (next.q?.inbox) {
+            openInbox = true;
+            refreshNotes();
+          }
+          return update(next);
+        }),
+      }, {
+        getPane: () => (access.canSeeThreads ? mobilePane : 'lead'),
+        onPane: (fn) => (onPaneChange = fn),
+        onBadge: (info) => {
+          threadBadgeState = info;
+          renderThreadBadge();
+        },
+      });
+    } else if (tab === 'files') {
+      const projObj = localProject || { id: linkId, name: projectName(), repos: [] };
+      innerStop = await (await import('./files.js')).default(body, projObj, r, { collab: collabCtx });
+    } else if (tab === 'git') {
+      const projObj = localProject || { id: linkId, name: projectName(), repo_url: repoUrl(), base_branch: baseBranch(), repos: [] };
+      innerStop = await gitTab(body, projObj, r.q?.repo || '', { collab: collabCtx });
+    } else if (tab === 'memory') {
+      innerStop = await (await import('./memory.js')).default(body, { q: {} }, { project: linkId, collab: collabCtx });
+    } else if (tab === 'artifacts') {
+      innerStop = await (await import('./artifacts.js')).default(body, { q: {} }, { project: linkId, collab: collabCtx });
+    } else if (tab === 'settings') {
+      innerStop = await collabSettingsTab(body, collabCtx);
+    }
+  }
+
+  drawHead();
+  await mountBody();
+
+  const onKey = projectShortcuts(getAccess, linkId);
+  document.addEventListener('keydown', onKey);
+
+  // Live host changes long-poll: updates permissions, role, threads, messages, memory, artifacts, presence, notes, and removal.
+  async function pump() {
+    let delay = 2000;
+    while (alive && live !== 'revoked') {
+      try {
+        const c = await get(base + `changes?since=${cursor}&wait=20`, { timeout: 45000, quiet: true });
+        if (!alive) return;
+        cursor = c.cursor ?? cursor;
+        const prevPerms = { ...perms };
+        const prevRole = me.role;
+        const prevViewThreads = !!perms.view_threads;
+        const prevViewChats = !!perms.view_others_chats;
+
+        if (c.people) {
+          people = c.people;
+          const selfRow = people.find((x) => x.user_id === me.user_id);
+          if (selfRow?.role) me.role = selfRow.role;
+        }
+        if (c.presence) presence = c.presence;
+        if (c.notes) notes = c.notes;
+        if (c.perms && typeof c.perms === 'object') perms = { ...c.perms };
+
+        const permsChanged = !samePerms(perms, prevPerms) || me.role !== prevRole;
+        const wasOffline = live !== 'ok';
+        live = 'ok';
+        delay = 2000;
+
+        if (Array.isArray(c.threads)) {
+          c.threads.forEach((t) => hostThreads.set(t.id, { ...hostThreads.get(t.id), ...t }));
+        }
+        if (Array.isArray(c.messages)) {
+          for (const m of c.messages) {
+            if (!hostMsgs.has(m.thread_id)) hostMsgs.set(m.thread_id, new Map());
+            hostMsgs.get(m.thread_id).set(m.id, m);
+          }
+        }
+
+        if (permsChanged) {
+          // Sync guest server's local link cache so server-side 403 checks, sidebar, and command palette match immediately.
+          const ref = await post(viewBase + 'refresh', {}, { quiet: true, timeout: 12000 }).catch(() => null);
+          if (ref) {
+            if (ref.member) me = { ...me, ...ref.member };
+            if (ref.perms) perms = { ...ref.perms };
+            if (ref.catalog) catalog = ref.catalog;
+            hasLocalSource = !!ref.has_local_source;
+            hasGitSource = !!ref.has_git_source;
+          }
+          // If thread visibility toggled on or off, resync the full visible thread snapshot so threads appear/disappear immediately.
+          if (prevViewThreads !== !!perms.view_threads || prevViewChats !== !!perms.view_others_chats) {
+            const snap = await get(base + 'project', { quiet: true, timeout: 15000 }).catch(() => null);
+            if (snap && alive) {
+              hostThreads.clear();
+              (snap.threads || []).forEach((t) => hostThreads.set(t.id, t));
+              if (snap.people) people = snap.people;
+              if (snap.presence) presence = snap.presence;
+            }
+          }
+          access = getAccess();
+          drawHead();
+          if (collabPrefs(linkId).notify_updates && Date.now() - lastPermToastAt > 4000) {
+            lastPermToastAt = Date.now();
+            toast('Your project permissions were updated', { ms: 2800 });
+          }
+          // If current tab just became forbidden, move back to Board cleanly.
+          if (tab && !access.canTab(tab)) {
+            tab = '';
+            rememberProjectTab(linkId, '');
+            history.replaceState(history.state, '', '#/p/' + enc(linkId));
+            await mountBody();
+            continue;
+          }
+        } else if (wasOffline) {
+          drawHead();
+          boardChatHandle?.setPrivacy({ offline: '' });
+        }
+
+        drawCoordination();
+        notifyLive({
+          permsChanged,
+          threadsChanged: permsChanged || (c.threads?.length > 0) || (c.messages?.length > 0),
+          messages: c.messages || [],
+          memoryChanged: c.memory?.length > 0,
+          artifactsChanged: c.artifacts?.length > 0,
+          peopleChanged: !!c.people,
+        });
+        if (c.more) continue;
+      } catch (e) {
+        if (!alive) return;
+        if (isRevokedErr(e)) {
+          live = 'revoked';
+          drawRevokedState();
+          return;
+        }
+        if (live !== 'offline') {
+          live = 'offline';
+          drawHead();
+          boardChatHandle?.setPrivacy({ offline: e.message || 'Host offline' });
+          notifyLive({ offline: true });
+        }
+        await new Promise((res) => setTimeout(res, delay));
+        delay = Math.min(30000, delay * 2);
+      }
+    }
+  }
+  if (live !== 'revoked') pump();
+
+  return () => {
+    alive = false;
+    const next = parseRoute();
+    if (next.view !== 'project' || next.id !== linkId) activeProjectId = '';
+    document.removeEventListener('keydown', onKey);
+    innerStop?.();
+    tabStrip?.destroy();
+    clearControl(presenceHost);
+    clearControl(inboxHost);
+  };
+}
+
+// ================================================================================================ joined board
+async function joinedBoard(el, state, r, ctx, mobile = {}) {
+  const { linkId, link, base, ensured, localProject, hostThreads, hostMsgs, getAccess, getMe, getPeople, onLiveChange, onChatReady } = state;
+  const leadBox = h('div', { class: 'b-lead' });
+  const lanes = h('div', { class: 'b-lanes' });
+  const decisionsEl = h('div', { class: 'b-decisions' });
+  const claimsEl = h('div', { class: 'b-claims' });
+  const boardEl = h('div', { class: 'b-right' }, decisionsEl, lanes, claimsEl);
+  const peekEl = h('div', { class: 'b-peek', hidden: true });
+  const split = h('div', { class: 'board', dataset: { pane: mobile.getPane?.() || 'lead' } }, leadBox, boardEl, peekEl);
+  el.append(split);
+
+  let localThreads = [];
+  let localDecisions = [];
+  let localClaims = [];
+  let doneOpen = false;
+  let finOpen = false;
+  try {
+    doneOpen = localStorage.getItem('mr-done-' + linkId) === '1';
+    finOpen = localStorage.getItem('mr-fin-' + linkId) === '1';
+  } catch { /* fine */ }
+
+  const chatHandle = await mountBoardChat(leadBox, link, {
+    ensured,
+    leadAgent: localProject?.lead_agent || '',
+    leadModel: localProject?.lead_model || '',
+  });
+  onChatReady?.(chatHandle);
+
+  const personName = (uid) => {
+    const p = getPeople().find((x) => x.user_id === uid);
+    return p?.name || (uid === '' ? link.host_name : 'someone');
+  };
+
+  function mergedThreads() {
+    const acc = getAccess();
+    const me = getMe();
+    const byId = new Map();
+    // Host threads (filtered by current permissions)
+    for (const t of hostThreads.values()) {
+      if (t.deleted_at) continue;
+      if (t.kind === 'chat' && t.user_id === me.user_id) continue; // own chat is in left pane
+      const isOwn = t.user_id && t.user_id === me.user_id;
+      if (!isOwn) {
+        if (t.user_id && t.kind === 'chat' && !acc.canViewOthersChats) continue;
+        if (!acc.canViewSharedThreads) continue;
+      }
+      byId.set(t.id, { ...t, _own: !!isOwn, _host: true });
+    }
+    // Merge guest's own local worker/review threads (authoritative for live running/unread state)
+    for (const lt of localThreads) {
+      if (lt.kind === 'lead') continue;
+      const existing = byId.get(lt.id);
+      byId.set(lt.id, { ...(existing || {}), ...lt, user_id: me.user_id, _own: true, _local: true });
+    }
+    return [...byId.values()].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  }
+
+  async function loadLocal() {
+    try {
+      const [ts, full] = await Promise.all([
+        get(`projects/${enc(linkId)}/threads`, { quiet: true }).catch(() => []),
+        get(`projects/${enc(linkId)}`, { quiet: true }).catch(() => null),
+      ]);
+      localThreads = Array.isArray(ts) ? ts : [];
+      localDecisions = full?.decisions || [];
+      localClaims = full?.claims || [];
+      draw();
+    } catch {
+      draw();
+    }
+  }
+
+  function card(t) {
+    const me = getMe();
+    const ownerLbl = threadOwnerLabel(t, me, personName);
+    return h('div', {
+      class: 'tcard cut' + (t.unread ? ' unread' : '') + (t.running ? ' running' : ''),
+      style: { '--ah': agentHue(t.agent) },
+      tabindex: '0',
+      onclick: (e) => !e.target.closest('button') && peek(t.id),
+      onkeydown: (e) => e.key === 'Enter' && peek(t.id),
+      onauxclick: (e) => e.button === 1 && t._own && openThread(t.id, { pop: true }),
+      oncontextmenu: (e) => (e.preventDefault(), cardMenu(t, e.clientX, e.clientY)),
+    },
+    h('div', { class: 'tc-top' },
+      stamp(t.agent || 'guest', { model: t.model, small: true, lead: t.kind === 'lead' }),
+      h('span', { class: 'tag tc-owner' + (t._own ? ' acc' : '') }, ownerLbl),
+      t.kind === 'review' ? h('span', { class: 'tag' }, 'review') : null,
+      h('span', { class: 'grow' }),
+      statusChip(t)),
+    h('h4', {}, t.title),
+    t.status_note ? h('p', { class: 'tc-note' }, t.status_note) : t.last_body ? h('p', { class: 'tc-last' }, t.last_body.replace(/[#*_`>]/g, '').slice(0, 160)) : null,
+    h('div', { class: 'tc-foot mono' },
+      t.branch ? h('span', { title: t.branch }, ic(t.merged ? 'merge' : 'branch', 11), t.merged ? 'merged' : t.branch.replace(/^roamer\//, '')) : null,
+      h('span', { class: 'grow' }),
+      timeAgo(t.updated_at),
+      t._own ? h('button', { class: 'ibtn xs', title: 'Pop out', onclick: () => openThread(t.id, { pop: true }), html: icon('popout', 12) }) : null));
+  }
+
+  function cardMenu(t, x, y) {
+    const acc = getAccess();
+    if (t._own) {
+      const a = (action) => post(`threads/${t.id}/action`, { action }).then(loadLocal).catch((e) => toast(e.message, { err: true }));
+      showMenu([
+        { label: 'Open beside your chat', icon: 'thread', run: () => peek(t.id) },
+        { label: 'Open full view', icon: 'fullscreen', run: () => go('#/t/' + t.id) },
+        { label: 'Open in its own window', icon: 'popout', run: () => openThread(t.id, { pop: true }) },
+        { sep: true },
+        t.running ? { label: 'Pause', icon: 'pause', run: () => a('pause') } : null,
+        t.running ? { label: 'Stop', icon: 'stop', run: () => a('stop') } : null,
+        ['paused', 'limited', 'cancelled'].includes(t.status) && !t.running ? { label: 'Resume', icon: 'play', run: () => a('resume') } : null,
+        t.status === 'failed' ? { label: 'Retry', icon: 'refresh', run: () => a('retry') } : null,
+        { label: t.resolved ? 'Reopen' : 'Resolve', icon: t.resolved ? 'undo' : 'check', run: () => a(t.resolved ? 'reopen' : 'resolve') },
+        { sep: true },
+        { label: 'Delete', icon: 'trash', danger: true, run: async () => {
+          await del('threads/' + t.id);
+          loadLocal();
+          toast('Thread deleted', { action: 'Undo', ms: 9000, run: () => post(`threads/${t.id}/restore`).then(loadLocal) });
+        } },
+      ].filter(Boolean), x, y);
+      return;
+    }
+    showMenu([
+      { label: 'Open beside your chat', icon: 'thread', run: () => peek(t.id) },
+      acc.canMerge && t.branch && !t.merged ? { label: 'Merge branch on host…', icon: 'merge', run: () => mergeHostThread(t) } : null,
+    ].filter(Boolean), x, y);
+  }
+
+  async function mergeHostThread(t) {
+    const ok = await dialog({ title: `Merge "${t.title}"?`, text: `Merges branch ${t.branch} into the host’s base branch.`, ok: 'Merge' });
+    if (!ok) return;
+    try {
+      const res = await post(base + `threads/${enc(t.id)}/merge`, {});
+      toast(`Merged (${String(res.sha || '').slice(0, 7)})`);
+    } catch (e) {
+      toast(e.message, { err: true });
+    }
+  }
+
+  function draw() {
+    const acc = getAccess();
+    const list = mergedThreads();
+    const showRight = acc.canSeeThreads || list.length > 0;
+    split.classList.toggle('board-chat-only', !showRight);
+    boardEl.hidden = !showRight || !!peeked;
+    if (!showRight) {
+      split.dataset.pane = 'lead';
+      mobile.onBadge?.({ needsYou: 0, unread: 0, extraUnread: 0 });
+      return;
+    }
+
+    decisionsEl.replaceChildren(...localDecisions.map((d) => h('div', { class: 'b-dec' },
+      h('button', { class: 'linkbtn small', onclick: () => peek(d.thread_id) }, 'from ' + (list.find((t) => t.id === d.thread_id)?.title || 'your thread')),
+      decisionCard(d, (i) => post('decisions/' + d.id, { choice: i }).then(loadLocal).catch((e) => toast(e.message, { err: true }))))));
+
+    if (!list.length) {
+      lanes.replaceChildren(empty(
+        'thread',
+        'No threads yet',
+        acc.canCreateThread
+          ? 'Tell your lead what you want in your project chat, or open a thread yourself (it runs on your machine and syncs to the project).'
+          : 'No shared threads to display yet.',
+        acc.canCreateThread ? h('button', { class: 'btn', onclick: () => newThreadDialog(linkId) }, ic('plus', 13), 'New thread') : null,
+      ));
+    } else {
+      lanes.replaceChildren(...LANES.map(([k, label, test]) => {
+        const items = list.filter(test);
+        if (!items.length && k !== 'work') return null;
+        const folds = k === 'done' || k === 'fin';
+        const collapsed = folds && !(k === 'done' ? doneOpen : finOpen);
+        return h('section', { class: 'lane l-' + k },
+          h('button', {
+            class: 'lane-h',
+            onclick: folds ? () => {
+              if (k === 'fin') finOpen = !finOpen;
+              else doneOpen = !doneOpen;
+              try { localStorage.setItem(`mr-${k}-` + linkId, (k === 'fin' ? finOpen : doneOpen) ? '1' : ''); } catch { /* fine */ }
+              draw();
+            } : null,
+          }, h('span', {}, label), h('b', { class: 'count' + (k === 'attn' ? ' hot' : '') }, items.length), folds ? h('i', { class: 'lane-chev' + (collapsed ? '' : ' open'), html: icon('chevDown', 12) }) : null),
+          collapsed ? null : h('div', { class: 'lane-cards' }, items.length ? items.map(card) : h('p', { class: 'faint small lane-empty' }, 'Nothing running right now.')));
+      }));
+    }
+
+    claimsEl.replaceChildren(...(localClaims.length ? [
+      kicker('Your claimed files', h('small', { class: 'faint' }, 'shared with the team via presence')),
+      h('div', { class: 'claims' }, localClaims.map((c) => h('span', { class: 'claim', style: { '--ah': agentHue(c.agent) }, title: `${c.title}${c.note ? ' — ' + c.note : ''}` }, h('code', {}, c.path), h('small', {}, agentName(c.agent))))),
+    ] : []));
+
+    const attnList = list.filter(LANES[0][2]);
+    const extraDecs = localDecisions.filter((d) => !attnList.some((t) => t.id === d.thread_id)).length;
+    const unread = list.filter((t) => t.unread).length;
+    const extraUnread = list.filter((t) => t.unread && !attnList.includes(t)).length;
+    mobile.onBadge?.({ needsYou: attnList.length + extraDecs, unread, extraUnread });
+  }
+
+  // Peek pane: own threads open with full local mountThread; others' host threads open with live host viewer + permission-gated composer.
+  const peek = (id) => go('#/p/' + enc(linkId) + '?t=' + enc(id));
+  let peeked = null;
+  let stopPeek = null;
+  let hostPeekPainter = null;
+
+  mobile.onPane?.((next) => {
+    split.dataset.pane = next;
+    if (peeked) go('#/p/' + enc(linkId));
+  });
+
+  async function showPeek(id) {
+    if (id === peeked) return;
+    stopPeek?.();
+    stopPeek = null;
+    hostPeekPainter = null;
+    peeked = id;
+    const showRight = getAccess().canSeeThreads || mergedThreads().length > 0;
+    boardEl.hidden = !showRight || !!id;
+    peekEl.hidden = !id;
+    split.classList.toggle('peeking', !!id);
+    if (!id) return peekEl.replaceChildren();
+
+    const list = mergedThreads();
+    const t = list.find((x) => x.id === id) || hostThreads.get(id);
+    const isOwn = t?._own || localThreads.some((x) => x.id === id);
+
+    if (isOwn) {
+      const title = h('b', { class: 'bp-title' }, t?.title || 'Thread');
+      const pbody = h('div', { class: 'bp-body' });
+      peekEl.replaceChildren(
+        h('div', { class: 'b-lead-h bp-h' },
+          h('button', { class: 'ibtn sm', title: 'Back to the board (Alt+Left)', onclick: () => back('#/p/' + enc(linkId)), html: icon('back', 14) }),
+          title,
+          h('span', { class: 'grow' }),
+          h('button', { class: 'ibtn sm', title: 'Expand to the full view', onclick: () => go('#/t/' + id), html: icon('fullscreen', 14) }),
+          h('button', { class: 'ibtn sm', title: 'Pop out', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 14) }),
+          h('button', { class: 'ibtn sm', title: 'Close', onclick: () => back('#/p/' + enc(linkId)), html: icon('close', 14) })),
+        pbody,
+      );
+      const stop = await mountThread(pbody, id, { compact: true, ctx: { setPopTitle: (nt) => (title.textContent = nt) } });
+      if (peeked !== id) return stop?.();
+      stopPeek = stop;
+      return;
+    }
+
+    // Host thread (read-only unless message_threads / message_lead is permitted)
+    if (!t || !getAccess().canViewSharedThreads) {
+      peekEl.replaceChildren(
+        h('div', { class: 'b-lead-h bp-h' },
+          h('button', { class: 'ibtn sm', title: 'Back to the board', onclick: () => back('#/p/' + enc(linkId)), html: icon('back', 14) }),
+          h('b', { class: 'bp-title' }, 'Thread unavailable'),
+          h('span', { class: 'grow' }),
+          h('button', { class: 'ibtn sm', title: 'Close', onclick: () => back('#/p/' + enc(linkId)), html: icon('close', 14) })),
+        h('div', { class: 'bp-body bp-host-body' }, empty('shield', 'Thread unavailable', 'You don’t have permission to view this thread, or it was deleted.')),
+      );
+      return;
+    }
+
+    const msgBox = h('div', { class: 'collab-msgs' }, loading());
+    const composeHost = h('div', { class: 'bp-host-compose' });
+    const ownerLbl = threadOwnerLabel(t, getMe(), personName);
+
+    function drawCompose() {
+      const acc = getAccess();
+      if (!acc.canMessageThread(t)) {
+        composeHost.replaceChildren();
+        return;
+      }
+      const text = textarea('', { rows: 2, placeholder: t.kind === 'lead' ? 'Write to the owner’s lead (uses their plan)' : 'Write to this thread (uses the owner’s plan)' });
+      const send = h('button', {
+        class: 'btn primary sm',
+        onclick: async () => {
+          if (!text.value.trim()) return;
+          send.disabled = true;
+          try {
+            const m = await post(base + `threads/${enc(id)}/messages`, { text: text.value });
+            if (!hostMsgs.has(id)) hostMsgs.set(id, new Map());
+            hostMsgs.get(id).set(m.id, m);
+            text.value = '';
+            paintMsgs();
+          } catch (e) {
+            toast(e.message, { err: true });
+          } finally {
+            send.disabled = false;
+          }
+        },
+      }, ic('send', 13), 'Send');
+      text.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+          e.preventDefault();
+          send.click();
+        }
+      });
+      composeHost.replaceChildren(h('div', { class: 'collab-compose' }, text, send));
+    }
+
+    function paintMsgs() {
+      const rows = [...(hostMsgs.get(id)?.values() || [])].sort((a, b) => a.created_at - b.created_at);
+      msgBox.replaceChildren(...(rows.length ? rows.map((m) => h('div', { class: 'collab-msg ' + m.role },
+        h('div', { class: 'collab-msg-h' }, h('b', {}, m.author || m.role), h('small', { class: 'faint' }, ago(m.created_at))),
+        h('div', { class: 'md', html: md(m.body || '') }))) : [h('p', { class: 'faint small' }, 'No messages yet.')]));
+      msgBox.scrollTop = msgBox.scrollHeight;
+    }
+
+    peekEl.replaceChildren(
+      h('div', { class: 'b-lead-h bp-h' },
+        h('button', { class: 'ibtn sm', title: 'Back to the board (Alt+Left)', onclick: () => back('#/p/' + enc(linkId)), html: icon('back', 14) }),
+        h('b', { class: 'bp-title' }, t.title),
+        h('span', { class: 'tag tc-owner' }, ownerLbl),
+        statusChip(t),
+        h('span', { class: 'grow' }),
+        getAccess().canMerge && t.branch && !t.merged ? h('button', { class: 'btn xs', onclick: () => mergeHostThread(t) }, ic('merge', 12), 'Merge') : null,
+        h('button', { class: 'ibtn sm', title: 'Close', onclick: () => back('#/p/' + enc(linkId)), html: icon('close', 14) })),
+      h('div', { class: 'bp-body bp-host-body' },
+        t.instructions ? h('details', { class: 'adv' }, h('summary', {}, 'Instructions'), h('div', { class: 'md', html: md(t.instructions) })) : null,
+        msgBox,
+        composeHost),
+    );
+    drawCompose();
+    hostPeekPainter = ({ permsChanged }) => {
+      if (permsChanged) {
+        if (!getAccess().canViewSharedThreads) return back('#/p/' + enc(linkId));
+        drawCompose();
+      }
+      paintMsgs();
+    };
+
+    try {
+      const res = await get(base + `threads/${enc(id)}/messages?limit=120`);
+      if (peeked !== id) return;
+      if (!hostMsgs.has(id)) hostMsgs.set(id, new Map());
+      (res.messages || []).forEach((m) => hostMsgs.get(id).set(m.id, m));
+      paintMsgs();
+    } catch (e) {
+      if (peeked === id) msgBox.replaceChildren(errorBox(e, () => showPeek(id)));
+    }
+  }
+
+  ctx?.onRoute?.((nr) => showPeek(nr.q.t || null));
+  await loadLocal();
+  await showPeek(r.q?.t || null);
+
+  let timer = 0;
+  const soon = () => (clearTimeout(timer), (timer = setTimeout(loadLocal, 300)));
+  const unlisten = listen((ev) => {
+    if (ev.kind === 'resync') return loadLocal();
+    if (ev.project !== linkId && !(ev.kind === 'running' && localThreads.some((t) => t.id === ev.thread))) return;
+    if (['thread', 'turn', 'running', 'decision', 'claims', 'message', 'progress'].includes(ev.kind)) soon();
+  });
+  const unlive = onLiveChange((ev) => {
+    if (ev.threadsChanged || ev.permsChanged) draw();
+    if (peeked && hostPeekPainter && (ev.permsChanged || ev.messages?.some((m) => m.thread_id === peeked))) {
+      hostPeekPainter(ev);
+    }
+  });
+  return () => (clearTimeout(timer), unlisten(), unlive(), stopPeek?.(), chatHandle.stop());
+}
+
+// ================================================================================================ collaborator settings tab
+async function collabSettingsTab(el, collabCtx) {
+  const { linkId, link, base, getAccess, getMe, getPeople, getPresence, getCatalog, getLive, getHostName, getProjectName, onLiveChange, redrawHead, redrawCoordination } = collabCtx;
+  const wrap = h('div', { class: 'p-settings' });
+  el.replaceChildren(wrap);
+
+  function draw() {
+    const acc = getAccess();
+    const me = getMe();
+    const live = getLive();
+    const people = getPeople();
+    const presence = getPresence();
+    const catalog = getCatalog();
+    const prefs = collabPrefs(linkId);
+    const online = new Set((presence?.people || []).filter((p) => p.online).map((p) => p.user_id));
+
+    const askOp = () => {
+      if (!acc.canAskOperator) return null;
+      if (me.requested_role) {
+        return h('div', { class: 'collab-ask cut' }, ic('flag', 14), h('span', {}, 'Your request to become an operator has been sent to ', h('b', {}, getHostName()), '.'));
+      }
+      return h('div', { class: 'collab-ask cut' },
+        ic('flag', 14),
+        h('span', {}, 'Need to take threads over without asking each time? Ask the owner once to make you an operator.'),
+        h('button', {
+          class: 'btn sm primary',
+          type: 'button',
+          onclick: async () => {
+            if (!(await dialog({ title: 'Ask to become an operator?', text: `${getHostName()} decides once. As an operator you can take threads over from them or others without asking each time.`, ok: 'Ask' }))) return;
+            try {
+              await post(base + 'request-role', { role: 'operator' });
+              me.requested_role = 'operator';
+              toast('Asked. You’ll see your role change here once they answer.');
+              draw();
+            } catch (e) {
+              toast(e.message, { err: true });
+            }
+          },
+        }, ic('flag', 12), 'Ask to be an operator'));
+    };
+
+    const permRows = (catalog.length ? catalog : Object.keys(acc.perms).map((id) => ({ id, label: id }))).map((p) => {
+      const allowed = !!acc.perms[p.id];
+      return h('div', { class: 'collab-perm-ro' },
+        h('span', {}, p.label),
+        h('span', { class: 'tag' + (allowed ? ' acc' : '') }, allowed ? 'Allowed' : 'Hidden'));
+    });
+
+    wrap.replaceChildren(
+      h('section', { class: 'panel cut' },
+        kicker('Your membership', h('span', { class: 'tag acc' }, ROLE_LABEL[acc.role] || acc.role)),
+        h('dl', { class: 'facts' },
+          h('dt', {}, 'Project'), h('dd', {}, getProjectName()),
+          h('dt', {}, 'Hosted by'), h('dd', {}, getHostName()),
+          h('dt', {}, 'Signed in as'), h('dd', {}, me.name || link.name),
+          h('dt', {}, 'Status'), h('dd', {}, live === 'ok' ? h('span', { class: 'status live' }, h('i', { class: 'pulse' }), 'Live') : h('span', { class: 'status dim' }, 'Offline, retrying')),
+        ),
+        link.insecure ? h('div', { class: 'collab-warn' }, ic('warn', 14), h('span', {}, 'Plain http over the internet: ask the owner for a Tailscale or https address.')) : null,
+        askOp(),
+      ),
+      h('section', { class: 'panel cut' },
+        kicker('Effective permissions', h('small', { class: 'faint' }, 'set by the project owner (read-only)')),
+        h('div', { class: 'collab-perm-ro-list' }, permRows),
+      ),
+      h('section', { class: 'panel cut' },
+        kicker('People in this project', h('b', { class: 'count' }, people.length)),
+        people.length
+          ? h('div', { class: 'dev-list' }, people.map((p) => h('div', { class: 'dev' },
+            acc.canViewPresence ? presenceDot(live === 'ok' && online.has(p.user_id)) : ic('people', 15),
+            h('div', {},
+              h('b', {}, p.name, p.user_id === me.user_id ? h('span', { class: 'tag' }, 'you') : null),
+              h('small', { class: 'faint' }, (ROLE_LABEL[p.role] || p.role) + (p.last_seen ? ' · seen ' + ago(p.last_seen) : ''))))))
+          : h('p', { class: 'faint small' }, 'People list will appear once connected to the host.'),
+      ),
+      h('section', { class: 'panel cut' },
+        kicker('Notification & presence preferences', h('small', { class: 'faint' }, 'saved on this machine')),
+        acc.canViewPresence ? toggle(prefs.show_presence, (v) => {
+          setCollabPref(linkId, { show_presence: v });
+          redrawCoordination();
+        }, { label: 'Show the presence toolbar on this project' }) : null,
+        toggle(prefs.notify_notes, (v) => setCollabPref(linkId, { notify_notes: v }), { label: 'Highlight conflict notes in the status bar' }),
+        toggle(prefs.notify_updates, (v) => setCollabPref(linkId, { notify_updates: v }), { label: 'Show a toast when your role or permissions change' }),
+        h('p', { class: 'faint small' }, ic('info', 12), acc.canSharePresence
+          ? ' Your active threads and file claims in this project are shared with the team via presence heartbeats.'
+          : ' Sharing your presence is turned off by the owner’s rules for your role.'),
+      ),
+      h('section', { class: 'panel cut' },
+        kicker('Leave project'),
+        h('p', { class: 'faint small' }, `Leaving removes ${getProjectName()} from your sidebar and tells ${getHostName()}. To rejoin later you will need a new invite link.`),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn danger', type: 'button', onclick: () => leaveJoinedProject({ ...link, project_name: getProjectName(), host_name: getHostName() }) }, ic('logout', 13), 'Leave project')),
+      ),
+    );
+    redrawHead();
+  }
+
+  draw();
+  return onLiveChange(() => draw());
+}
+
+// ================================================================================================ owner board
 const LANES = [
   ['attn', 'Needs you', (t) => !!needsYou(t)], // one rule for every screen: attention.js
   ['work', 'Working', (t) => t.running || (!t.resolved && ['working', 'queued', 'waiting', 'idle'].includes(t.status))],
@@ -304,8 +1329,6 @@ async function board(el, p, r, ctx, mobile = {}) {
     mobile.onBadge?.({ needsYou: attnList.length + extraDecs, unread, extraUnread });
   }
 
-  // A thread opened from the board sits beside the project chat, in place of the board; the address carries it
-  // (#/p/<id>?t=<thread>), so Back closes it and Expand's full view comes back here.
   const peek = (id) => go('#/p/' + p.id + '?t=' + id);
   let peeked = null, stopPeek = null;
   mobile.onPane?.((next) => {
@@ -322,15 +1345,15 @@ async function board(el, p, r, ctx, mobile = {}) {
     split.classList.toggle('peeking', !!id);
     if (!id) return peekEl.replaceChildren();
     const title = h('b', { class: 'bp-title' }, 'Thread');
-    const body = h('div', { class: 'bp-body' });
+    const pbody = h('div', { class: 'bp-body' });
     peekEl.replaceChildren(h('div', { class: 'b-lead-h bp-h' },
       h('button', { class: 'ibtn sm', title: 'Back to the board (Alt+Left)', onclick: () => back('#/p/' + p.id), html: icon('back', 14) }),
       title,
       h('span', { class: 'grow' }),
       h('button', { class: 'ibtn sm', title: 'Expand to the full view', onclick: () => go('#/t/' + id), html: icon('fullscreen', 14) }),
       h('button', { class: 'ibtn sm', title: 'Pop out', onclick: () => popOut('#/t/' + id, { key: 't:' + id }), html: icon('popout', 14) }),
-      h('button', { class: 'ibtn sm', title: 'Close', onclick: () => back('#/p/' + p.id), html: icon('close', 14) })), body);
-    const stop = await mountThread(body, id, { compact: true, ctx: { setPopTitle: (t) => (title.textContent = t) } });
+      h('button', { class: 'ibtn sm', title: 'Close', onclick: () => back('#/p/' + p.id), html: icon('close', 14) })), pbody);
+    const stop = await mountThread(pbody, id, { compact: true, ctx: { setPopTitle: (t) => (title.textContent = t) } });
     if (peeked !== id) return stop?.();
     stopPeek = stop;
   }
@@ -345,11 +1368,24 @@ async function board(el, p, r, ctx, mobile = {}) {
     if (ev.project !== p.id && !(ev.kind === 'running' && threads.some((t) => t.id === ev.thread))) return;
     if (['thread', 'turn', 'running', 'decision', 'claims', 'message', 'progress'].includes(ev.kind)) soon();
   });
-  return () => (unlisten(), stopPeek?.(), stopLead?.());
+  return () => (clearTimeout(timer), unlisten(), stopPeek?.(), stopLead?.());
 }
 
 // ------------------------------------------------------------ new thread (by hand)
 export async function newThreadDialog(projectId, { repo = '' } = {}) {
+  const access = accessFromStore(projectId);
+  if (access.isJoined && !access.canCreateThread) {
+    toast('The project’s owner hasn’t allowed you to open threads here.', { err: true });
+    return;
+  }
+  if (access.isJoined) {
+    try {
+      await ensureLocal({ id: projectId });
+    } catch (e) {
+      toast(e.message, { err: true });
+      return;
+    }
+  }
   const repos = await get(`projects/${projectId}/repos`).catch(() => []);
   let repoV = repo || 'primary';
   const repoPick = repoSelect(repos, repoV, (v) => (repoV = v));
@@ -366,7 +1402,9 @@ export async function newThreadDialog(projectId, { repo = '' } = {}) {
   title.addEventListener('input', () => { matches.replaceChildren(); reviewedTitle = ''; });
   const ok = await dialog({
     title: 'New thread',
-    text: 'Opens a worker thread yourself. The lead hears about it and plans around it.',
+    text: access.isJoined
+      ? 'Opens a thread you own on this machine and syncs it to the shared project.'
+      : 'Opens a worker thread yourself. The lead hears about it and plans around it.',
     wide: true,
     body: h('div', { class: 'dlg-fields' }, field('Title', title), matches, field('Instructions', instr), field('Done when', crit),
       h('div', { class: 'row2' }, field('Kind of work', kinds, 'Routing picks the agent for the kind.'), field('Agent', pick.el)),
@@ -396,43 +1434,55 @@ export async function newThreadDialog(projectId, { repo = '' } = {}) {
   if (ok && made) toast(`Started ${made.title} with ${agentName(made.agent)}`, { action: 'Open', run: () => go('#/p/' + projectId + '?t=' + made.id) });
 }
 
-// ------------------------------------------------------------ git
-async function gitTab(el, p, repo = '') {
-  el.replaceChildren(loading('Reading the repository'));
-  const rq = repo ? '?repo=' + encodeURIComponent(repo) : '';
-  const [g, prs] = await Promise.all([get(`projects/${p.id}/git${rq}`).catch((e) => ({ error: e.message })), get(`projects/${p.id}/prs${rq}`).catch((e) => ({ error: e.message }))]);
-  const pickRepo = repoSelect(p.repos, repo, (v) => go(`#/p/${p.id}/git` + (v && v !== 'primary' ? '?repo=' + encodeURIComponent(v) : '')));
-  const top = pickRepo ? h('div', { class: 'repo-bar' }, h('span', { class: 'eyebrow' }, 'Repository'), pickRepo) : null;
-  if (g.error) return el.replaceChildren(...[top, errorBox({ message: g.error })].filter(Boolean));
-  if (!g.repo) {
-    return el.replaceChildren(...[top].filter(Boolean), empty('branch', 'Not a git repository', g.git ? `${g.folder} has no git history. Agents still work there, but in place (no branches, no merging). Ask the lead to run “git init” if you want branches.` : 'Git isn’t installed on this machine. Install it under Agents › Tools.', g.git ? null : h('a', { class: 'btn', href: '#/agents?tab=tools' }, 'Install Git')));
+// ------------------------------------------------------------ git (owner + permitted joined project)
+async function gitTab(el, p, repo = '', opts = {}) {
+  const collab = opts.collab || null;
+  const apiBase = collab ? collab.viewBase : `projects/${p.id}/`;
+  const canMerge = () => (!collab || collab.getAccess().canMerge);
+
+  async function renderGit() {
+    el.replaceChildren(loading('Reading the repository'));
+    const rq = repo ? '?repo=' + encodeURIComponent(repo) : '';
+    const [g, prs] = await Promise.all([
+      get(`${apiBase}git${rq}`).catch((e) => ({ error: e.message })),
+      get(`${apiBase}prs${rq}`).catch((e) => ({ error: e.message })),
+    ]);
+    const pickRepo = repoSelect(p.repos, repo, (v) => go(`#/p/${p.id}/git` + (v && v !== 'primary' ? '?repo=' + encodeURIComponent(v) : '')));
+    const top = pickRepo ? h('div', { class: 'repo-bar' }, h('span', { class: 'eyebrow' }, 'Repository'), pickRepo) : null;
+    if (g.error) return el.replaceChildren(...[top, errorBox({ message: g.error }, renderGit)].filter(Boolean));
+    if (!g.repo) {
+      return el.replaceChildren(...[top].filter(Boolean), empty('branch', 'Not a git repository', g.git ? `${g.folder} has no git history. Agents still work there, but in place (no branches, no merging).` : 'Git isn’t installed on this machine. Install it under Agents › Tools.', g.git ? null : h('a', { class: 'btn', href: '#/agents?tab=tools' }, 'Install Git')));
+    }
+    const changes = (g.status || '').split('\n').filter((l) => l && !l.startsWith('##'));
+    el.replaceChildren(...[top].filter(Boolean), h('div', { class: 'git-grid' },
+      h('section', { class: 'panel cut' }, kicker('Repository'),
+        h('dl', { class: 'facts' },
+          h('dt', {}, 'Folder'), h('dd', {}, copyable(g.folder)),
+          h('dt', {}, 'Branch'), h('dd', { class: 'mono' }, g.branch || '—'),
+          h('dt', {}, 'Remote'), h('dd', { class: 'mono' }, g.remote || 'none')),
+        changes.length ? [kicker('Uncommitted', h('b', { class: 'count' }, changes.length)), h('pre', { class: 'mono small status-pre' }, changes.slice(0, 40).join('\n'))] : h('p', { class: 'faint small' }, 'Working tree clean.')),
+      h('section', { class: 'panel cut' }, kicker('Recent commits'),
+        h('div', { class: 'commits' }, (g.log || []).map((c) => h('div', { class: 'commit' }, h('code', {}, String(c.sha || '').slice(0, 7)), h('span', {}, c.subject), h('small', { class: 'faint' }, c.author + ' · ' + (c.when || '')))))),
+      h('section', { class: 'panel cut wide' }, kicker('Pull requests', prs.repo ? h('a', { class: 'chipbtn', href: `https://github.com/${prs.repo}/pulls` }, 'On GitHub') : null),
+        !prs.github ? h('p', { class: 'faint small' }, 'The remote isn’t on GitHub.')
+          : prs.error ? h('p', { class: 'faint small' }, prs.error + ' — sign in under Settings › GitHub.')
+            : prs.prs?.length ? h('div', { class: 'prs' }, prs.prs.map((r) => h('a', { class: 'pr-i', href: r.url }, ic('pr', 14), h('b', {}, '#' + r.number), h('span', {}, r.title), h('code', { class: 'faint' }, r.branch),
+              r.draft ? h('span', { class: 'tag' }, 'draft') : r.merged ? h('span', { class: 'tag' }, 'merged') : r.state === 'closed' ? h('span', { class: 'tag' }, 'closed') : null,
+              h('small', { class: 'faint' }, r.user),
+              canMerge() && r.state === 'open' && !r.draft ? h('button', { class: 'btn xs', onclick: (e) => (e.preventDefault(), mergePr(apiBase, r, renderGit, repo)) }, 'Merge') : null)))
+              : h('p', { class: 'faint small' }, 'No pull requests yet.'))));
   }
-  const changes = (g.status || '').split('\n').filter((l) => l && !l.startsWith('##')); // "## branch" is a header, not a change
-  el.replaceChildren(...[top].filter(Boolean), h('div', { class: 'git-grid' },
-    h('section', { class: 'panel cut' }, kicker('Repository'),
-      h('dl', { class: 'facts' },
-        h('dt', {}, 'Folder'), h('dd', {}, copyable(g.folder)),
-        h('dt', {}, 'Branch'), h('dd', { class: 'mono' }, g.branch || '—'),
-        h('dt', {}, 'Remote'), h('dd', { class: 'mono' }, g.remote || 'none')),
-      changes.length ? [kicker('Uncommitted', h('b', { class: 'count' }, changes.length)), h('pre', { class: 'mono small status-pre' }, changes.slice(0, 40).join('\n'))] : h('p', { class: 'faint small' }, 'Working tree clean.')),
-    h('section', { class: 'panel cut' }, kicker('Recent commits'),
-      h('div', { class: 'commits' }, (g.log || []).map((c) => h('div', { class: 'commit' }, h('code', {}, String(c.sha || '').slice(0, 7)), h('span', {}, c.subject), h('small', { class: 'faint' }, c.author + ' · ' + (c.when || '')))))),
-    h('section', { class: 'panel cut wide' }, kicker('Pull requests', prs.repo ? h('a', { class: 'chipbtn', href: `https://github.com/${prs.repo}/pulls` }, 'On GitHub') : null),
-      !prs.github ? h('p', { class: 'faint small' }, 'The remote isn’t on GitHub.')
-        : prs.error ? h('p', { class: 'faint small' }, prs.error + ' — sign in under Settings › GitHub.')
-          : prs.prs?.length ? h('div', { class: 'prs' }, prs.prs.map((r) => h('a', { class: 'pr-i', href: r.url }, ic('pr', 14), h('b', {}, '#' + r.number), h('span', {}, r.title), h('code', { class: 'faint' }, r.branch),
-            r.draft ? h('span', { class: 'tag' }, 'draft') : r.merged ? h('span', { class: 'tag' }, 'merged') : r.state === 'closed' ? h('span', { class: 'tag' }, 'closed') : null,
-            h('small', { class: 'faint' }, r.user),
-            r.state === 'open' && !r.draft ? h('button', { class: 'btn xs', onclick: (e) => (e.preventDefault(), mergePr(p, r, () => gitTab(el, p, repo), repo)) }, 'Merge') : null)))
-            : h('p', { class: 'faint small' }, 'No pull requests yet.'))));
+
+  await renderGit();
+  return collab?.onLiveChange?.(({ permsChanged }) => permsChanged && renderGit()) || (() => {});
 }
 
-async function mergePr(p, r, after, repo = '') {
+async function mergePr(apiBase, r, after, repo = '') {
   const method = select([['merge', 'Merge commit'], ['squash', 'Squash into one commit'], ['rebase', 'Rebase onto ' + (r.base || 'the base')]], 'merge');
   const okd = await dialog({ title: `Merge pull request #${r.number}?`, text: `Merges ${r.branch} into ${r.base} on GitHub. GitHub refuses if checks or reviews it requires haven't passed.`, body: field('How', method), ok: 'Merge' });
   if (!okd) return;
   try {
-    await post(`projects/${p.id}/prs/${r.number}/merge`, { method: method.value, repo });
+    await post(`${apiBase}prs/${r.number}/merge`, { method: method.value, repo });
     toast(`Merged #${r.number}`, { action: 'View', run: () => openExternal(r.url) });
     after();
   } catch (e) {
@@ -440,8 +1490,8 @@ async function mergePr(p, r, after, repo = '') {
   }
 }
 
-// ------------------------------------------------------------ settings
-async function settingsTab(el, p, onSaved) {
+// ------------------------------------------------------------ owner settings (+ People & Collaborators)
+async function settingsTab(el, p, onSaved, r) {
   const name = input(p.name);
   const folder = input(p.folder, { placeholder: 'Empty: Model Roamer keeps the files' });
   const repo = input(p.repo_url, { placeholder: 'https://github.com/you/repo' });
@@ -472,6 +1522,8 @@ async function settingsTab(el, p, onSaved) {
       toast(e.message, { err: true });
     }
   };
+
+  const peopleSection = h('div', { class: 'p-people-section', id: 'project-people' });
   el.replaceChildren(h('div', { class: 'p-settings' },
     h('section', { class: 'panel cut' }, kicker('Project'),
       field('Name', name),
@@ -487,12 +1539,19 @@ async function settingsTab(el, p, onSaved) {
       field('Lead agent', lead.el, 'Switching the lead keeps the history: the new lead reads a recap on its next turn.'),
       field('Project instructions', instr, 'Every agent in the project reads these.')),
     h('section', { class: 'panel cut' }, kicker('Routing for this project', h('small', { class: 'faint' }, 'which agent gets which kind of work')), h('div', { class: 'routes' }, routeRows)),
-    h('div', { class: 'save-bar' }, h('button', { class: 'btn primary', onclick: save }, 'Save changes'), h('span', { class: 'grow' }), h('button', { class: 'btn danger', onclick: () => deleteProject(p) }, ic('trash', 13), 'Delete project'))));
+    h('div', { class: 'save-bar' }, h('button', { class: 'btn primary', onclick: save }, 'Save changes'), h('span', { class: 'grow' }), h('button', { class: 'btn danger', onclick: () => deleteProject(p) }, ic('trash', 13), 'Delete project')),
+    h('div', { class: 'p-people-head' }, kicker('People & Collaborators', h('a', { class: 'chipbtn', href: '#/settings/collab?project=' + enc(p.id) }, 'All projects overview'))),
+    peopleSection));
+
+  const { projectPeoplePanel } = await import('./collab.js');
+  const stopPeople = await projectPeoplePanel(peopleSection, p.id);
+  if (r?.q?.section === 'people') {
+    requestAnimationFrame(() => peopleSection.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+  }
+  return () => stopPeople?.();
 }
 
 // ------------------------------------------------------------ repositories
-// The project's repositories: the primary (its own folder / repository, set above) and any added beside it, each a
-// GitHub repository Model Roamer clones or a folder on the machine it runs on. Threads choose which one they work on.
 function reposPanel(p) {
   const box = h('section', { class: 'panel cut repos' });
   const here = S.server?.headless || !S.me?.local ? 'the server' : 'this computer';
@@ -609,7 +1668,6 @@ function reposPanel(p) {
 
   draw();
   load();
-  // reload when a clone finishes or another window changes the list; stop once the settings tab is gone
   const unlisten = listen((ev) => {
     if (!box.isConnected) return ((dead = true), unlisten());
     if (ev.kind === 'repos' && ev.project === p.id && !adding) load();
